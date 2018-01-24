@@ -470,7 +470,7 @@ class IronicDriver(virt_driver.ComputeDriver):
 
     def _cleanup_deploy(self, node, instance, network_info):
         self._cleanup_volume_target_info(instance)
-        self._unplug_vifs(node, instance, network_info)
+        self._unplug_vifs(node, instance, network_info, unplug_all=True)
         self._stop_firewall(instance, network_info)
 
     def _wait_for_active(self, instance):
@@ -1421,7 +1421,7 @@ class IronicDriver(virt_driver.ComputeDriver):
                 # NOTE (vsaienko) Pass since VIF already attached.
                 pass
 
-    def _unplug_vifs(self, node, instance, network_info):
+    def _unplug_vifs(self, node, instance, network_info, unplug_all=False):
         # NOTE(PhilDay): Accessing network_info will block if the thread
         # it wraps hasn't finished, so do this ahead of time so that we
         # don't block while holding the logging lock.
@@ -1439,6 +1439,18 @@ class IronicDriver(virt_driver.ComputeDriver):
             except ironic.exc.BadRequest:
                 LOG.debug("VIF %(vif)s isn't attached to Ironic node %(node)s",
                           {'vif': port_id, 'node': node.uuid})
+
+        if unplug_all:
+            # NOTE(mgoddard): In some rare cases nova can lose track of some of
+            # an instance's VIFs, causing them to not be detached from the
+            # ironic node on tear down.  To work around this, we list any
+            # remaining attached VIFs and detach them. See
+            # https://bugs.launchpad.net/nova/+bug/1733861.
+            vifs = self.ironicclient.call("node.vif_list", node.uuid)
+            for vif in vifs:
+                LOG.info("Detaching unexpected VIF %(vif)s from Ironic node "
+                         "%(node)s", {'vif': vif.id, 'node': node.uuid})
+                self.ironicclient.call("node.vif_detach", node.uuid, vif.id)
 
     def plug_vifs(self, instance, network_info):
         """Plug VIFs into networks.

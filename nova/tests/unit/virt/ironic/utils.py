@@ -81,6 +81,11 @@ def get_test_portgroup(**kw):
                 'updated_at': kw.get('updated_at')})()
 
 
+def get_test_node_vif(**kw):
+    return type('vif', (object,),
+                {'id': kw.get('id', 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')})()
+
+
 def get_test_vif(**kw):
     return {
         'profile': kw.get('profile', {}),

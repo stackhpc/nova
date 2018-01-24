@@ -1917,6 +1917,7 @@ class IronicDriverTestCase(test.NoDBTestCase):
         mock_node.get.assert_called_once_with(
             node_uuid, fields=ironic_driver._NODE_FIELDS)
         mock_node.vif_detach.assert_called_once_with(node.uuid, vif_id)
+        self.assertFalse(mock_node.vif_list.called)
 
     @mock.patch.object(FAKE_CLIENT, 'node')
     def test_unplug_vifs_port_not_associated(self, mock_node):
@@ -1931,6 +1932,7 @@ class IronicDriverTestCase(test.NoDBTestCase):
         mock_node.get.assert_called_once_with(
             node_uuid, fields=ironic_driver._NODE_FIELDS)
         self.assertEqual(len(network_info), mock_node.vif_detach.call_count)
+        self.assertFalse(mock_node.vif_list.called)
 
     @mock.patch.object(FAKE_CLIENT.node, 'vif_detach')
     def test_unplug_vifs_no_network_info(self, mock_vdet):
@@ -1938,6 +1940,39 @@ class IronicDriverTestCase(test.NoDBTestCase):
         network_info = []
         self.driver.unplug_vifs(instance, network_info)
         self.assertFalse(mock_vdet.called)
+
+    @mock.patch.object(FAKE_CLIENT, 'node')
+    def test__unplug_vifs_unplug_all_no_orphans(self, mock_node):
+        node_uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        node = ironic_utils.get_test_node(uuid=node_uuid)
+        mock_node.vif_list.return_value = []
+
+        instance = fake_instance.fake_instance_obj(self.ctx, node=node_uuid)
+        network_info = utils.get_test_network_info()
+        vif_id = six.text_type(network_info[0]['id'])
+        self.driver._unplug_vifs(node, instance, network_info, unplug_all=True)
+
+        # asserts
+        mock_node.vif_detach.assert_called_once_with(node.uuid, vif_id)
+        mock_node.vif_list.assert_called_once_with(node.uuid)
+
+    @mock.patch.object(FAKE_CLIENT, 'node')
+    def test__unplug_vifs_unplug_all_with_orphan(self, mock_node):
+        node_uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        node = ironic_utils.get_test_node(uuid=node_uuid)
+        orphan_vif = ironic_utils.get_test_node_vif()
+        mock_node.vif_list.return_value = [orphan_vif]
+
+        instance = fake_instance.fake_instance_obj(self.ctx, node=node_uuid)
+        network_info = utils.get_test_network_info()
+        vif_id = six.text_type(network_info[0]['id'])
+        self.driver._unplug_vifs(node, instance, network_info, unplug_all=True)
+
+        # asserts
+        mock_node.vif_detach.assert_has_calls(
+            [mock.call(node.uuid, vif_id),
+             mock.call(node.uuid, orphan_vif.id)])
+        mock_node.vif_list.assert_called_once_with(node.uuid)
 
     @mock.patch.object(ironic_driver.IronicDriver, 'plug_vifs')
     def test_attach_interface(self, mock_pv):
