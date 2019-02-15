@@ -1,0 +1,14 @@
+---
+fixes:
+  - |
+    Ironic instances have had their embedded flavor data migrated since the
+    16.0.0 Pike in order to report custom resource class allocations to the
+    Placement service. However, that data migration did not zero out the
+    standard resource classes (``VCPU``, ``MEMORY_MB``, ``DISK_GB``) on the
+    embedded flavor which meant trying to report allocations for those classes
+    to Placement would fail if the ironic compute node resource provider itself
+    no longer reported inventory for those resource classes. A fix has been
+    made for `bug 1816034 <https://bugs.launchpad.net/nova/+bug/1816034>`_
+    which will zero out standard resource class reporting for existing ironic
+    instances even if those instances have already been migrated once to
+    account for the custom resource class allocations.

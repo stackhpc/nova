@@ -2773,9 +2773,15 @@ class IronicDriverSyncTestCase(IronicDriverTestCase):
 
         self.driver._refresh_cache()
         self.assertEqual(2, mock_save.call_count)
-        expected_specs = {"resources:CUSTOM_FIRST": "1"}
+        expected_specs = {"resources:CUSTOM_FIRST": "1",
+                          "resources:VCPU": "0",
+                          "resources:MEMORY_MB": "0",
+                          "resources:DISK_GB": "0"}
         self.assertEqual(expected_specs, inst1.flavor.extra_specs)
-        expected_specs = {"resources:CUSTOM_SECOND": "1"}
+        expected_specs = {"resources:CUSTOM_SECOND": "1",
+                          "resources:VCPU": "0",
+                          "resources:MEMORY_MB": "0",
+                          "resources:DISK_GB": "0"}
         self.assertEqual(expected_specs, inst2.flavor.extra_specs)
 
     @mock.patch.object(ironic_driver.IronicDriver, '_get_node_list')
@@ -2790,7 +2796,10 @@ class IronicDriverSyncTestCase(IronicDriverTestCase):
         node2_uuid = uuidutils.generate_uuid()
         hostname = "ironic-compute"
         fake_flavor1 = objects.Flavor()
-        fake_flavor1.extra_specs = {"resources:CUSTOM_FIRST": "1"}
+        fake_flavor1.extra_specs = {"resources:CUSTOM_FIRST": "1",
+                                    "resources:VCPU": "0",
+                                    "resources:MEMORY_MB": "0",
+                                    "resources:DISK_GB": "0"}
         fake_flavor2 = objects.Flavor()
         fake_flavor2.extra_specs = {}
         inst1 = fake_instance.fake_instance_obj(self.ctx,
@@ -2829,10 +2838,66 @@ class IronicDriverSyncTestCase(IronicDriverTestCase):
         # custom resource_class, only the other one should be updated and
         # saved.
         self.assertEqual(1, mock_save.call_count)
-        expected_specs = {"resources:CUSTOM_FIRST": "1"}
+        expected_specs = {"resources:CUSTOM_FIRST": "1",
+                          "resources:VCPU": "0",
+                          "resources:MEMORY_MB": "0",
+                          "resources:DISK_GB": "0"}
         self.assertEqual(expected_specs, inst1.flavor.extra_specs)
-        expected_specs = {"resources:CUSTOM_SECOND": "1"}
+        expected_specs = {"resources:CUSTOM_SECOND": "1",
+                          "resources:VCPU": "0",
+                          "resources:MEMORY_MB": "0",
+                          "resources:DISK_GB": "0"}
         self.assertEqual(expected_specs, inst2.flavor.extra_specs)
+
+    @mock.patch.object(ironic_driver.IronicDriver, '_get_node_list')
+    @mock.patch.object(objects.ServiceList, 'get_all_computes_by_hv_type')
+    @mock.patch.object(objects.InstanceList, 'get_uuids_by_host')
+    @mock.patch.object(objects.Instance, 'get_by_uuid')
+    @mock.patch.object(objects.Instance, 'save')
+    def test_pike_flavor_migration_partial_migrated(self, mock_save,
+                                                    mock_get_by_uuid,
+                                                    mock_get_uuids_by_host,
+                                                    mock_svc_by_hv,
+                                                    mock_get_node_list):
+        """Tests the case that the instance embedded flavor was partially
+        migrated to set the "resources:CUSTOM_FIRST" extra spec but the
+        standard resource classes were not overridden.
+        """
+        node_uuid = uuidutils.generate_uuid()
+        hostname = "ironic-compute"
+        fake_flavor = objects.Flavor()
+        fake_flavor.extra_specs = {"resources:CUSTOM_FIRST": "1"}
+        inst = fake_instance.fake_instance_obj(self.ctx,
+                                               node=node_uuid,
+                                               host=hostname,
+                                               flavor=fake_flavor)
+        node = _get_cached_node(
+            uuid=node_uuid,
+            instance_uuid=inst.uuid,
+            instance_type_id=1,
+            resource_class="first",
+            network_interface="flat")
+        inst_dict = {inst.uuid: inst}
+        mock_get_uuids_by_host.return_value = [inst.uuid]
+        self.driver.node_cache = {}
+        mock_get_node_list.return_value = [node]
+        mock_svc_by_hv.return_value = []
+
+        def fake_inst_by_uuid(ctx, uuid, expected_attrs=None):
+            return inst_dict.get(uuid)
+
+        mock_get_by_uuid.side_effect = fake_inst_by_uuid
+
+        self.driver._refresh_cache()
+        # The instance already had the custom resource class extra spec set
+        # but not the standard resource class overrides so it should have been
+        # updatd.
+        self.assertEqual(1, mock_save.call_count)
+        expected_specs = {"resources:CUSTOM_FIRST": "1",
+                          "resources:VCPU": "0",
+                          "resources:MEMORY_MB": "0",
+                          "resources:DISK_GB": "0"}
+        self.assertEqual(expected_specs, inst.flavor.extra_specs)
 
     @mock.patch.object(ironic_driver.LOG, 'warning')
     @mock.patch.object(ironic_driver.IronicDriver, '_get_node_list')
@@ -2887,7 +2952,10 @@ class IronicDriverSyncTestCase(IronicDriverTestCase):
         self.assertEqual(1, mock_save.call_count)
         expected_specs = {}
         self.assertEqual(expected_specs, inst1.flavor.extra_specs)
-        expected_specs = {"resources:CUSTOM_SECOND": "1"}
+        expected_specs = {"resources:CUSTOM_SECOND": "1",
+                          "resources:VCPU": "0",
+                          "resources:MEMORY_MB": "0",
+                          "resources:DISK_GB": "0"}
         self.assertEqual(expected_specs, inst2.flavor.extra_specs)
         # Verify that the LOG.warning was called correctly
         self.assertEqual(1, mock_warning.call_count)

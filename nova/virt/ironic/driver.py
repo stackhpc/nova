@@ -25,6 +25,7 @@ import shutil
 import tempfile
 import time
 
+import os_resource_classes as orc
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_service import loopingcall
@@ -535,12 +536,27 @@ class IronicDriver(virt_driver.ComputeDriver):
         instance = objects.Instance.get_by_uuid(ctx, instance_uuid,
                                                 expected_attrs=["flavor"])
         specs = instance.flavor.extra_specs
-        resource_key = "resources:%s" % normalized_rc
-        if resource_key in specs:
+        # We need to look for both the custom resource class and a standard
+        # resource class, so we'll use VCPU.
+        custom_rc_resource_key = "resources:%s" % normalized_rc
+        vcpu_resource_key = "resources:%s" % orc.VCPU
+        # Are both the custom and standard resource class handled?
+        if custom_rc_resource_key in specs and vcpu_resource_key in specs:
             # The compute must have been restarted, and the instance.flavor
             # has already been migrated
             return False
-        specs[resource_key] = "1"
+        # Has the custom resource class been handled?
+        if custom_rc_resource_key not in specs:
+            specs[custom_rc_resource_key] = "1"
+        # Have the standard resource classes been handled?
+        if vcpu_resource_key not in specs:
+            # We override the standard resource classes so that we can still
+            # display the embedded instance.flavor attributes to the user like
+            # vcpus, ram and disk, but override the actual allocated value to
+            # 0 which is what the ResourceTracker will report to placement.
+            specs[vcpu_resource_key] = "0"
+            specs["resources:%s" % orc.MEMORY_MB] = "0"
+            specs["resources:%s" % orc.DISK_GB] = "0"
         instance.save()
         return True
 
@@ -553,9 +569,7 @@ class IronicDriver(virt_driver.ComputeDriver):
         extra_specs, the periodic call to update_available_resources() will add
         an allocation against the custom resource class, and prevent placement
         from thinking that that node is available. This code can be removed in
-        Queens, and will need to be updated to also alter extra_specs to
-        zero-out the old-style standard resource classes of VCPU, MEMORY_MB,
-        and DISK_GB.
+        Queens.
         """
         ctx = nova_context.get_admin_context()
 
@@ -574,7 +588,8 @@ class IronicDriver(virt_driver.ComputeDriver):
                                                  node.instance_uuid)
             self._migrated_instance_uuids.add(node.instance_uuid)
             LOG.debug("The flavor extra_specs for Ironic instance %(inst)s "
-                      "have been updated for custom resource class '%(rc)s'.",
+                      "have been updated for custom resource class '%(rc)s' "
+                      "and standard resource classes have been zeroed out.",
                       {"inst": node.instance_uuid, "rc": node_rc})
         return
 
