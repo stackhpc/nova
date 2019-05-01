@@ -2357,7 +2357,7 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
         self.assertFlavorMatchesAllocation(self.flavor1, dest_allocation)
 
         # restart the source compute
-        self.restart_compute_service(self.compute1)
+        self.compute1 = self.restart_compute_service(self.compute1)
 
         self.admin_api.put_service(
             source_compute_id, {'forced_down': 'false'})
@@ -2434,7 +2434,7 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
         self.assertFlavorMatchesAllocation(self.flavor1, dest_allocation)
 
         # restart the source compute
-        self.restart_compute_service(self.compute1)
+        self.compute1 = self.restart_compute_service(self.compute1)
         self.admin_api.put_service(
             source_compute_id, {'forced_down': 'false'})
 
@@ -2520,7 +2520,7 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
         self.assertFlavorMatchesAllocation(self.flavor1, source_allocation)
 
         # restart the source compute
-        self.restart_compute_service(self.compute1)
+        self.compute1 = self.restart_compute_service(self.compute1)
         self.admin_api.put_service(
             source_compute_id, {'forced_down': 'false'})
 
@@ -2593,7 +2593,7 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
         self.assertFlavorMatchesAllocation(self.flavor1, source_allocation)
 
         # restart the source compute
-        self.restart_compute_service(self.compute1)
+        self.compute1 = self.restart_compute_service(self.compute1)
         self.admin_api.put_service(
             source_compute_id, {'forced_down': 'false'})
 
