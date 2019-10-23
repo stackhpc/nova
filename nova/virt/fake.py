@@ -675,6 +675,13 @@ class MediumFakeDriver(FakeDriver):
     local_gb = 1028
 
 
+class FakeFinishMigrationFailDriver(FakeDriver):
+    """FakeDriver variant that will raise an exception from finish_migration"""
+
+    def finish_migration(self, *args, **kwargs):
+        raise exception.VirtualInterfaceCreateException()
+
+
 class PredictableNodeUUIDDriver(SmallFakeDriver):
     """SmallFakeDriver variant that reports a predictable node uuid in
     get_available_resource, like IronicDriver.

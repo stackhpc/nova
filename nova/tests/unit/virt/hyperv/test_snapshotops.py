@@ -37,8 +37,7 @@ class SnapshotOpsTestCase(test_base.HyperVBaseTestCase):
 
     @mock.patch('nova.image.glance.get_remote_image_service')
     def test_save_glance_image(self, mock_get_remote_image_service):
-        image_metadata = {"is_public": False,
-                          "disk_format": "vhd",
+        image_metadata = {"disk_format": "vhd",
                           "container_format": "bare"}
         glance_image_service = mock.MagicMock()
         mock_get_remote_image_service.return_value = (glance_image_service,
@@ -102,12 +101,15 @@ class SnapshotOpsTestCase(test_base.HyperVBaseTestCase):
         else:
             mock_save_glance_image.assert_called_once_with(
                 self.context, mock.sentinel.IMAGE_ID, dest_vhd_path)
-        self._snapshotops._pathutils.copyfile.has_calls(expected)
+        self.assertEqual(len(expected),
+                         self._snapshotops._pathutils.copyfile.call_count)
+        self._snapshotops._pathutils.copyfile.assert_has_calls(expected)
+        self.assertEqual(2, mock_update.call_count)
         expected_update = [
             mock.call(task_state=task_states.IMAGE_PENDING_UPLOAD),
             mock.call(task_state=task_states.IMAGE_UPLOADING,
                       expected_state=task_states.IMAGE_PENDING_UPLOAD)]
-        mock_update.has_calls(expected_update)
+        mock_update.assert_has_calls(expected_update)
         self._snapshotops._vmutils.remove_vm_snapshot.assert_called_once_with(
             fake_snapshot_path)
         self._snapshotops._pathutils.rmtree.assert_called_once_with(
