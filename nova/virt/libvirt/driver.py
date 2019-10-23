@@ -75,6 +75,7 @@ from nova import block_device
 from nova.compute import power_state
 from nova.compute import task_states
 from nova.compute import utils as compute_utils
+from nova.compute import vm_states
 import nova.conf
 from nova.console import serial as serial_console
 from nova.console import type as ctype
@@ -293,6 +294,11 @@ MIN_QEMU_FILE_BACKED_VERSION = (2, 6, 0)
 MIN_LIBVIRT_FILE_BACKED_DISCARD_VERSION = (4, 4, 0)
 MIN_QEMU_FILE_BACKED_DISCARD_VERSION = (2, 10, 0)
 
+# If the host has this libvirt version, then we skip the retry loop of
+# instance destroy() call, as libvirt itself increased the wait time
+# before the SIGKILL signal takes effect.
+MIN_LIBVIRT_BETTER_SIGKILL_HANDLING = (4, 7, 0)
+
 VGPU_RESOURCE_SEMAPHORE = "vgpu_resources"
 
 
@@ -483,6 +489,8 @@ class LibvirtDriver(driver.ComputeDriver):
 
         self._check_file_backed_memory_support()
 
+        self._check_my_ip()
+
         if (CONF.libvirt.virt_type == 'lxc' and
                 not (CONF.libvirt.uid_maps and CONF.libvirt.gid_maps)):
             LOG.warning("Running libvirt-lxc without user namespaces is "
@@ -616,6 +624,13 @@ class LibvirtDriver(driver.ComputeDriver):
                 raise exception.InternalError(
                     'Running Nova with file_backed_memory requires '
                     'ram_allocation_ratio configured to 1.0')
+
+    def _check_my_ip(self):
+        ips = compute_utils.get_machine_ips()
+        if CONF.my_ip not in ips:
+            LOG.warning('my_ip address (%(my_ip)s) was not found on '
+                        'any of the interfaces: %(ifaces)s',
+                        {'my_ip': CONF.my_ip, 'ifaces': ", ".join(ips)})
 
     def _prepare_migration_flags(self):
         migration_flags = 0
@@ -907,18 +922,36 @@ class LibvirtDriver(driver.ComputeDriver):
                         # steal time from the cloud host. ie 15 wallclock
                         # seconds may have passed, but the VM might have only
                         # have a few seconds of scheduled run time.
-                        LOG.warning('Error from libvirt during destroy. '
-                                    'Code=%(errcode)s Error=%(e)s; '
-                                    'attempt %(attempt)d of 3',
-                                    {'errcode': errcode, 'e': e,
-                                     'attempt': attempt},
-                                    instance=instance)
+                        #
+                        # TODO(kchamart): Once MIN_LIBVIRT_VERSION
+                        # reaches v4.7.0, (a) rewrite the above note,
+                        # and (b) remove the following code that retries
+                        # _destroy() API call (which gives SIGKILL 30
+                        # seconds to take effect) -- because from v4.7.0
+                        # onwards, libvirt _automatically_ increases the
+                        # timeout to 30 seconds.  This was added in the
+                        # following libvirt commits:
+                        #
+                        #   - 9a4e4b942 (process: wait longer 5->30s on
+                        #     hard shutdown)
+                        #
+                        #   - be2ca0444 (process: wait longer on kill
+                        #     per assigned Hostdev)
                         with excutils.save_and_reraise_exception() as ctxt:
-                            # Try up to 3 times before giving up.
-                            if attempt < 3:
-                                ctxt.reraise = False
-                                self._destroy(instance, attempt + 1)
-                                return
+                            if not self._host.has_min_version(
+                                    MIN_LIBVIRT_BETTER_SIGKILL_HANDLING):
+                                LOG.warning('Error from libvirt during '
+                                            'destroy. Code=%(errcode)s '
+                                            'Error=%(e)s; attempt '
+                                            '%(attempt)d of 6 ',
+                                            {'errcode': errcode, 'e': e,
+                                             'attempt': attempt},
+                                            instance=instance)
+                                # Try up to 6 times before giving up.
+                                if attempt < 6:
+                                    ctxt.reraise = False
+                                    self._destroy(instance, attempt + 1)
+                                    return
 
                 if not is_okay:
                     with excutils.save_and_reraise_exception():
@@ -1389,6 +1422,14 @@ class LibvirtDriver(driver.ComputeDriver):
             return self._host.delete_secret('volume', volume_id)
         if encryption is None:
             encryption = self._get_volume_encryption(context, connection_info)
+        # NOTE(lyarwood): Handle bug #1821696 where volume secrets have been
+        # removed manually by returning if native LUKS decryption is available
+        # and device_path is not present in the connection_info. This avoids
+        # VolumeEncryptionNotSupported being thrown when we incorrectly build
+        # the encryptor below due to the secrets not being present above.
+        if (encryption and self._use_native_luks(encryption) and
+            not connection_info['data'].get('device_path')):
+            return
         if encryption:
             encryptor = self._get_volume_encryptor(connection_info,
                                                    encryption)
@@ -1800,8 +1841,7 @@ class LibvirtDriver(driver.ComputeDriver):
 
     def _create_snapshot_metadata(self, image_meta, instance,
                                   img_fmt, snp_name):
-        metadata = {'is_public': False,
-                    'status': 'active',
+        metadata = {'status': 'active',
                     'name': snp_name,
                     'properties': {
                                    'kernel_id': instance.kernel_id,
@@ -3190,11 +3230,6 @@ class LibvirtDriver(driver.ComputeDriver):
         return self._get_console_output_file(instance, console_log)
 
     def get_host_ip_addr(self):
-        ips = compute_utils.get_machine_ips()
-        if CONF.my_ip not in ips:
-            LOG.warning('my_ip address (%(my_ip)s) was not found on '
-                        'any of the interfaces: %(ifaces)s',
-                        {'my_ip': CONF.my_ip, 'ifaces': ", ".join(ips)})
         return CONF.my_ip
 
     def get_vnc_console(self, context, instance):
@@ -5608,14 +5643,15 @@ class LibvirtDriver(driver.ComputeDriver):
                                    block_device_info=None, power_on=True,
                                    vifs_already_plugged=False,
                                    post_xml_callback=None,
-                                   destroy_disks_on_failure=False):
+                                   destroy_disks_on_failure=False,
+                                   external_events=None):
 
         """Do required network setup and create domain."""
         timeout = CONF.vif_plugging_timeout
-        if (self._conn_supports_start_paused and
-            utils.is_neutron() and not
-            vifs_already_plugged and power_on and timeout):
-            events = self._get_neutron_events(network_info)
+        if (self._conn_supports_start_paused and utils.is_neutron() and not
+                vifs_already_plugged and power_on and timeout):
+            events = (external_events if external_events
+                      else self._get_neutron_events(network_info))
         else:
             events = []
 
@@ -5819,22 +5855,23 @@ class LibvirtDriver(driver.ComputeDriver):
         hypervisor is capable of hosting.  Each tuple consists
         of the triplet (arch, hypervisor_type, vm_mode).
 
-        Supported hypervisor_type is filtered by virt_type,
-        a parameter set by operators via `nova.conf`.
-
         :returns: List of tuples describing instance capabilities
         """
         caps = self._host.get_capabilities()
         instance_caps = list()
         for g in caps.guests:
             for dt in g.domtype:
-                if dt != CONF.libvirt.virt_type:
-                    continue
-                instance_cap = (
-                    fields.Architecture.canonicalize(g.arch),
-                    fields.HVType.canonicalize(dt),
-                    fields.VMMode.canonicalize(g.ostype))
-                instance_caps.append(instance_cap)
+                try:
+                    instance_cap = (
+                        fields.Architecture.canonicalize(g.arch),
+                        fields.HVType.canonicalize(dt),
+                        fields.VMMode.canonicalize(g.ostype))
+                    instance_caps.append(instance_cap)
+                except exception.InvalidArchitectureName:
+                    # NOTE(danms): Libvirt is exposing a guest arch that nova
+                    # does not even know about. Avoid aborting here and
+                    # continue to process the rest.
+                    pass
 
         return instance_caps
 
@@ -7809,8 +7846,28 @@ class LibvirtDriver(driver.ComputeDriver):
                                          dest=target,
                                          host=fallback_from_host,
                                          receive=True)
-            image.cache(fetch_func=copy_from_host,
+            image.cache(fetch_func=copy_from_host, size=size,
                         filename=filename)
+
+        # NOTE(lyarwood): If the instance vm_state is shelved offloaded then we
+        # must be unshelving for _try_fetch_image_cache to be called.
+        if instance.vm_state == vm_states.SHELVED_OFFLOADED:
+            # NOTE(lyarwood): When using the rbd imagebackend the call to cache
+            # above will attempt to clone from the shelved snapshot in Glance
+            # if available from this compute. We then need to flatten the
+            # resulting image to avoid it still referencing and ultimately
+            # blocking the removal of the shelved snapshot at the end of the
+            # unshelve. This is a no-op for all but the rbd imagebackend.
+            try:
+                image.flatten()
+                LOG.debug('Image %s flattened successfully while unshelving '
+                          'instance.', image.path, instance=instance)
+            except NotImplementedError:
+                # NOTE(lyarwood): There's an argument to be made for logging
+                # our inability to call flatten here, however given this isn't
+                # implemented for most of the backends it may do more harm than
+                # good, concerning operators etc so for now just pass.
+                pass
 
     def _create_images_and_backing(self, context, instance, instance_dir,
                                    disk_info, fallback_from_host=None):
@@ -8151,14 +8208,19 @@ class LibvirtDriver(driver.ComputeDriver):
                     # should ignore this instance and move on.
                     if guest.uuid in local_instances:
                         inst = local_instances[guest.uuid]
-                        if inst.task_state is not None:
+                        # bug 1774249 indicated when instance is in RESIZED
+                        # state it might also can't find back disk
+                        if (inst.task_state is not None or
+                            inst.vm_state == vm_states.RESIZED):
                             LOG.info('Periodic task is updating the host '
                                      'stats; it is trying to get disk info '
                                      'for %(i_name)s, but the backing disk '
                                      'was removed by a concurrent operation '
-                                     '(task_state=%(task_state)s)',
+                                     '(task_state=%(task_state)s) and '
+                                     '(vm_state=%(vm_state)s)',
                                      {'i_name': guest.name,
-                                      'task_state': inst.task_state},
+                                      'task_state': inst.task_state,
+                                      'vm_state': inst.vm_state},
                                      instance=inst)
                             err_ctxt.reraise = False
 
@@ -8486,9 +8548,24 @@ class LibvirtDriver(driver.ComputeDriver):
         xml = self._get_guest_xml(context, instance, network_info, disk_info,
                                   instance.image_meta,
                                   block_device_info=block_device_info)
-        self._create_domain_and_network(context, xml, instance, network_info,
-                                        block_device_info=block_device_info,
-                                        power_on=power_on)
+        # NOTE(artom) In some Neutron or port configurations we've already
+        # waited for vif-plugged events in the compute manager's
+        # _finish_revert_resize_network_migrate_finish(), right after updating
+        # the port binding. For any ports not covered by those "bind-time"
+        # events, we wait for "plug-time" events here.
+        # TODO(artom) This DB lookup is done for backportability. A subsequent
+        # patch will remove it and change the finish_revert_migration() method
+        # signature to pass is the migration object.
+        migration = objects.Migration.get_by_id_and_instance(
+            context, instance.migration_context.migration_id, instance.uuid)
+        events = network_info.get_plug_time_events(migration)
+        if events:
+            LOG.debug('Instance is using plug-time events: %s', events,
+                      instance=instance)
+        self._create_domain_and_network(
+            context, xml, instance, network_info,
+            block_device_info=block_device_info, power_on=power_on,
+            external_events=events)
 
         if power_on:
             timer = loopingcall.FixedIntervalLoopingCall(
@@ -8634,28 +8711,37 @@ class LibvirtDriver(driver.ComputeDriver):
                                errors_count=stats[4])
             except libvirt.libvirtError:
                 pass
-        for interface in dom_io["ifaces"]:
+
+        for interface in xml_doc.findall('./devices/interface'):
+            mac_address = interface.find('mac').get('address')
+            target = interface.find('./target')
+
+            # add nic that has no target (therefore no stats)
+            if target is None:
+                diags.add_nic(mac_address=mac_address)
+                continue
+
+            # add nic with stats
+            dev = target.get('dev')
             try:
-                # interfaceStats might launch an exception if the method
-                # is not supported by the underlying hypervisor being
-                # used by libvirt
-                stats = domain.interfaceStats(interface)
-                diags.add_nic(rx_octets=stats[0],
-                              rx_errors=stats[2],
-                              rx_drop=stats[3],
-                              rx_packets=stats[1],
-                              tx_octets=stats[4],
-                              tx_errors=stats[6],
-                              tx_drop=stats[7],
-                              tx_packets=stats[5])
+                if dev:
+                    # interfaceStats might launch an exception if the
+                    # method is not supported by the underlying hypervisor
+                    # being used by libvirt
+                    stats = domain.interfaceStats(dev)
+                    diags.add_nic(mac_address=mac_address,
+                                  rx_octets=stats[0],
+                                  rx_errors=stats[2],
+                                  rx_drop=stats[3],
+                                  rx_packets=stats[1],
+                                  tx_octets=stats[4],
+                                  tx_errors=stats[6],
+                                  tx_drop=stats[7],
+                                  tx_packets=stats[5])
+
             except libvirt.libvirtError:
                 pass
 
-        # Update mac addresses of interface if stats have been reported
-        if diags.nic_details:
-            nodes = xml_doc.findall('./devices/interface/mac')
-            for index, node in enumerate(nodes):
-                diags.nic_details[index].mac_address = node.get('address')
         return diags
 
     @staticmethod

@@ -847,8 +847,10 @@ class LibvirtVifTestCase(test.NoDBTestCase):
         mock_set.assert_called_once_with(mock.ANY, 'ca:fe:de:ad:be:ef',
                                          'virtio', None, None, None)
 
-    @mock.patch.object(vif.designer, 'set_vif_guest_frontend_config')
-    def test_model_sriov_direct_multi_queue_not_set(self, mock_set):
+    @mock.patch.object(vif.designer, 'set_vif_guest_frontend_config',
+                       wraps=vif.designer.set_vif_guest_frontend_config)
+    def test_model_sriov_direct(self, mock_set):
+        """Direct attach vNICs shouldn't retrieve info from image_meta."""
         self.flags(use_virtio_for_bridges=True,
                    virt_type='kvm',
                    group='libvirt')
@@ -857,8 +859,8 @@ class LibvirtVifTestCase(test.NoDBTestCase):
             fakelibosinfo))
         d = vif.LibvirtGenericVIFDriver()
         hostimpl = host.Host("qemu:///system")
-        image_meta = {'properties': {'os_name': 'fedora22'}}
-        image_meta = objects.ImageMeta.from_dict(image_meta)
+        image_meta = objects.ImageMeta.from_dict(
+            {'properties': {'hw_vif_model': 'virtio'}})
         conf = d.get_base_config(None, 'ca:fe:de:ad:be:ef', image_meta,
                                  None, 'kvm', network_model.VNIC_TYPE_DIRECT,
                                  hostimpl)
@@ -866,6 +868,7 @@ class LibvirtVifTestCase(test.NoDBTestCase):
                                          None, None, None, None)
         self.assertIsNone(conf.vhost_queues)
         self.assertIsNone(conf.driver_name)
+        self.assertIsNone(conf.model)
 
     def _test_model_qemu(self, *vif_objs, **kw):
         libvirt_version = kw.get('libvirt_version')
@@ -1045,7 +1048,7 @@ class LibvirtVifTestCase(test.NoDBTestCase):
                     'tap', run_as_root=True, check_exit_code=[0, 2, 254]),
                 mock.call('ip', 'link', 'set', 'tap-xxx-yyy-zzz', 'up',
                     run_as_root=True, check_exit_code=[0, 2, 254])])
-            mock_plug_contrail.called_once_with(
+            mock_plug_contrail.assert_called_once_with(
                 instance.project_id, instance.uuid, instance.display_name,
                 self.vif_vrouter['id'], self.vif_vrouter['network']['id'],
                 'NovaVMPort', self.vif_vrouter['devname'],
@@ -1068,7 +1071,7 @@ class LibvirtVifTestCase(test.NoDBTestCase):
         mock_create_tap_dev.assert_called_once_with('tap-xxx-yyy-zzz',
                                                     multiqueue=True)
 
-        mock_plug_contrail.called_once_with(
+        mock_plug_contrail.assert_called_once_with(
                 instance.project_id, instance.uuid, instance.display_name,
                 self.vif_vrouter['id'], self.vif_vrouter['network']['id'],
                 'NovaVMPort', self.vif_vrouter['devname'],

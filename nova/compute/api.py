@@ -2908,7 +2908,7 @@ class API(base.Base):
         properties.update(extra_properties or {})
 
         image_meta = self._initialize_instance_snapshot_metadata(
-            instance, name, properties)
+            context, instance, name, properties)
         # if we're making a snapshot, omit the disk and container formats,
         # since the image may have been converted to another format, and the
         # original values won't be accurate.  The driver will populate these
@@ -2918,7 +2918,7 @@ class API(base.Base):
             image_meta.pop('container_format', None)
         return self.image_api.create(context, image_meta)
 
-    def _initialize_instance_snapshot_metadata(self, instance, name,
+    def _initialize_instance_snapshot_metadata(self, context, instance, name,
                                                extra_properties=None):
         """Initialize new metadata for a snapshot of the given instance.
 
@@ -2930,8 +2930,27 @@ class API(base.Base):
         """
         image_meta = utils.get_image_from_system_metadata(
             instance.system_metadata)
-        image_meta.update({'name': name,
-                           'is_public': False})
+        image_meta['name'] = name
+
+        # If the user creating the snapshot is not in the same project as
+        # the owner of the instance, then the image visibility should be
+        # "shared" so the owner of the instance has access to the image, like
+        # in the case of an admin creating a snapshot of another user's
+        # server, either directly via the createImage API or via shelve.
+        extra_properties = extra_properties or {}
+        if context.project_id != instance.project_id:
+            # The glance API client-side code will use this to add the
+            # instance project as a member of the image for access.
+            image_meta['visibility'] = 'shared'
+            extra_properties['instance_owner'] = instance.project_id
+            # TODO(mriedem): Should owner_project_name and owner_user_name
+            # be removed from image_meta['properties'] here, or added to
+            # [DEFAULT]/non_inheritable_image_properties? It is confusing
+            # otherwise to see the owner project not match those values.
+        else:
+            # The request comes from the owner of the instance so make the
+            # image private.
+            image_meta['visibility'] = 'private'
 
         # Delete properties that are non-inheritable
         properties = image_meta['properties']
@@ -2939,7 +2958,7 @@ class API(base.Base):
             properties.pop(key, None)
 
         # The properties in extra_properties have precedence
-        properties.update(extra_properties or {})
+        properties.update(extra_properties)
 
         return image_meta
 
@@ -2958,7 +2977,7 @@ class API(base.Base):
         :returns: the new image metadata
         """
         image_meta = self._initialize_instance_snapshot_metadata(
-            instance, name, extra_properties)
+            context, instance, name, extra_properties)
         # the new image is simply a bucket of properties (particularly the
         # block device mapping, kernel and ramdisk IDs) with no image data,
         # hence the zero size
@@ -3019,10 +3038,15 @@ class API(base.Base):
                 if strutils.bool_from_string(instance.system_metadata.get(
                         'image_os_require_quiesce')):
                     raise
-                else:
+
+                if isinstance(err, exception.NovaException):
                     LOG.info('Skipping quiescing instance: %(reason)s.',
-                             {'reason': err},
+                             {'reason': err.format_message()},
                              instance=instance)
+                else:
+                    LOG.info('Skipping quiescing instance because the '
+                             'operation is not supported by the underlying '
+                             'compute driver.', instance=instance)
             # NOTE(tasker): discovered that an uncaught exception could occur
             #               after the instance has been frozen. catch and thaw.
             except Exception as ex:
@@ -4268,6 +4292,52 @@ class API(base.Base):
         else:
             self._detach_volume(context, instance, volume)
 
+    def _count_attachments_for_swap(self, ctxt, volume):
+        """Counts the number of attachments for a swap-related volume.
+
+        Attempts to only count read/write attachments if the volume attachment
+        records exist, otherwise simply just counts the number of attachments
+        regardless of attach mode.
+
+        :param ctxt: nova.context.RequestContext - user request context
+        :param volume: nova-translated volume dict from nova.volume.cinder.
+        :returns: count of attachments for the volume
+        """
+        # This is a dict, keyed by server ID, to a dict of attachment_id and
+        # mountpoint.
+        attachments = volume.get('attachments', {})
+        # Multiattach volumes can have more than one attachment, so if there
+        # is more than one attachment, attempt to count the read/write
+        # attachments.
+        if len(attachments) > 1:
+            count = 0
+            for attachment in attachments.values():
+                attachment_id = attachment['attachment_id']
+                # Get the attachment record for this attachment so we can
+                # get the attach_mode.
+                # TODO(mriedem): This could be optimized if we had
+                # GET /attachments/detail?volume_id=volume['id'] in Cinder.
+                try:
+                    attachment_record = self.volume_api.attachment_get(
+                        ctxt, attachment_id)
+                    # Note that the attachment record from Cinder has
+                    # attach_mode in the top-level of the resource but the
+                    # nova.volume.cinder code translates it and puts the
+                    # attach_mode in the connection_info for some legacy
+                    # reason...
+                    if attachment_record.get(
+                            'connection_info', {}).get(
+                                # attachments are read/write by default
+                                'attach_mode', 'rw') == 'rw':
+                        count += 1
+                except exception.VolumeAttachmentNotFound:
+                    # attachments are read/write by default so count it
+                    count += 1
+        else:
+            count = len(attachments)
+
+        return count
+
     @check_instance_lock
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
                                     vm_states.RESIZED])
@@ -4290,6 +4360,20 @@ class API(base.Base):
             self.volume_api.begin_detaching(context, old_volume['id'])
         except exception.InvalidInput as exc:
             raise exception.InvalidVolume(reason=exc.format_message())
+
+        # Disallow swapping from multiattach volumes that have more than one
+        # read/write attachment. We know the old_volume has at least one
+        # attachment since it's attached to this server. The new_volume
+        # can't have any attachments because of the attach_status check above.
+        # We do this count after calling "begin_detaching" to lock against
+        # concurrent attachments being made while we're counting.
+        try:
+            if self._count_attachments_for_swap(context, old_volume) > 1:
+                raise exception.MultiattachSwapVolumeNotSupported()
+        except Exception:  # This is generic to handle failures while counting
+            # We need to reset the detaching status before raising.
+            with excutils.save_and_reraise_exception():
+                self.volume_api.roll_detaching(context, old_volume['id'])
 
         # Get the BDM for the attached (old) volume so we can tell if it was
         # attached with the new-style Cinder 3.44 API.

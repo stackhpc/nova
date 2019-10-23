@@ -288,6 +288,11 @@ class MultiattachToShelvedNotSupported(Invalid):
                 "shelved-offloaded instances.")
 
 
+class MultiattachSwapVolumeNotSupported(Invalid):
+    msg_fmt = _('Swapping multi-attach volumes with more than one read/write '
+                'attachment is not supported.')
+
+
 class VolumeNotCreated(NovaException):
     msg_fmt = _("Volume %(volume_id)s did not finish being created"
                 " even after we waited %(seconds)s seconds or %(attempts)s"
@@ -336,6 +341,10 @@ class InvalidVolume(Invalid):
 
 class InvalidVolumeAccessMode(Invalid):
     msg_fmt = _("Invalid volume access mode: %(access_mode)s")
+
+
+class StaleVolumeMount(InvalidVolume):
+    msg_fmt = _("The volume mount at %(mount_path)s is unusable.")
 
 
 class InvalidMetadata(Invalid):

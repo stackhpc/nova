@@ -31,6 +31,7 @@ import binascii
 # comes from the py3 standard library.
 from concurrent import futures
 import contextlib
+import copy
 import functools
 import inspect
 import sys
@@ -1273,7 +1274,7 @@ class ComputeManager(manager.Manager):
         """Retrieve the power state for the given instance."""
         LOG.debug('Checking state', instance=instance)
         try:
-            return self.driver.get_info(instance).state
+            return self.driver.get_info(instance, use_cache=False).state
         except exception.InstanceNotFound:
             return power_state.NOSTATE
 
@@ -3897,11 +3898,45 @@ class ComputeManager(manager.Manager):
                     # Whether an error occurred or not, at this point the
                     # instance is on the dest host so to avoid leaking
                     # allocations in placement, delete them here.
-                    self._delete_allocation_after_move(
-                        context, instance, migration, old_instance_type,
-                        migration.source_node)
+                    # NOTE(mriedem): _delete_allocation_after_move is tightly
+                    # coupled to the migration status on the confirm step so
+                    # we unfortunately have to mutate the migration status to
+                    # have _delete_allocation_after_move cleanup the allocation
+                    # held by the migration consumer.
+                    with utils.temporary_mutation(
+                            migration, status='confirmed'):
+                        self._delete_allocation_after_move(
+                            context, instance, migration, old_instance_type,
+                            migration.source_node)
 
         do_confirm_resize(context, instance, migration.id)
+
+    def _get_updated_nw_info_with_pci_mapping(self, nw_info, pci_mapping):
+        # NOTE(adrianc): This method returns a copy of nw_info if modifications
+        # are made else it returns the original nw_info.
+        updated_nw_info = nw_info
+        if nw_info and pci_mapping:
+            updated_nw_info = copy.deepcopy(nw_info)
+            for vif in updated_nw_info:
+                if vif['vnic_type'] in network_model.VNIC_TYPES_SRIOV:
+                    try:
+                        vif_pci_addr = vif['profile']['pci_slot']
+                        new_addr = pci_mapping[vif_pci_addr].address
+                        vif['profile']['pci_slot'] = new_addr
+                        LOG.debug("Updating VIF's PCI address for VIF %(id)s. "
+                                  "Original value %(orig_val)s, "
+                                  "new value %(new_val)s",
+                                  {'id': vif['id'],
+                                   'orig_val': vif_pci_addr,
+                                   'new_val': new_addr})
+                    except (KeyError, AttributeError):
+                        with excutils.save_and_reraise_exception():
+                            # NOTE(adrianc): This should never happen. If we
+                            # get here it means there is some inconsistency
+                            # with either 'nw_info' or 'pci_mapping'.
+                            LOG.error("Unexpected error when updating network "
+                                      "information with PCI mapping.")
+        return updated_nw_info
 
     def _confirm_resize(self, context, instance, migration=None):
         """Destroys the source instance."""
@@ -3921,9 +3956,16 @@ class ComputeManager(manager.Manager):
         # NOTE(tr3buchet): tear down networks on source host
         self.network_api.setup_networks_on_host(context, instance,
                            migration.source_compute, teardown=True)
-
         network_info = self.network_api.get_instance_nw_info(context,
                                                              instance)
+
+        # NOTE(adrianc): Populate old PCI device in VIF profile
+        # to allow virt driver to properly unplug it from Hypervisor.
+        pci_mapping = (instance.migration_context.
+                       get_pci_mapping_for_migration(True))
+        network_info = self._get_updated_nw_info_with_pci_mapping(
+            network_info, pci_mapping)
+
         # TODO(mriedem): Get BDMs here and pass them to the driver.
         self.driver.confirm_migration(context, migration, instance,
                                       network_info)
@@ -4102,6 +4144,49 @@ class ComputeManager(manager.Manager):
             self.compute_rpcapi.finish_revert_resize(context, instance,
                     migration, migration.source_compute)
 
+    def _finish_revert_resize_network_migrate_finish(self, context, instance,
+                                                     migration):
+        """Causes port binding to be updated. In some Neutron or port
+        configurations - see NetworkModel.get_bind_time_events() - we
+        expect the vif-plugged event from Neutron immediately and wait for it.
+        The rest of the time, the event is expected further along in the
+        virt driver, so we don't wait here.
+
+        :param context: The request context.
+        :param instance: The instance undergoing the revert resize.
+        :param migration: The Migration object of the resize being reverted.
+        :raises: eventlet.timeout.Timeout or
+                 exception.VirtualInterfacePlugException.
+        """
+        network_info = instance.get_network_info()
+        events = []
+        deadline = CONF.vif_plugging_timeout
+        if deadline and utils.is_neutron() and network_info:
+            events = network_info.get_bind_time_events(migration)
+            if events:
+                LOG.debug('Will wait for bind-time events: %s', events)
+        error_cb = self._neutron_failed_migration_callback
+        try:
+            with self.virtapi.wait_for_instance_event(instance, events,
+                                                      deadline=deadline,
+                                                      error_callback=error_cb):
+                # NOTE(hanrong): we need to change migration.dest_compute to
+                # source host temporarily.
+                # "network_api.migrate_instance_finish" will setup the network
+                # for the instance on the destination host. For revert resize,
+                # the instance will back to the source host, the setup of the
+                # network for instance should be on the source host. So set
+                # the migration.dest_compute to source host at here.
+                with utils.temporary_mutation(
+                        migration, dest_compute=migration.source_compute):
+                    self.network_api.migrate_instance_finish(context,
+                                                             instance,
+                                                             migration)
+        except eventlet.timeout.Timeout:
+            with excutils.save_and_reraise_exception():
+                LOG.error('Timeout waiting for Neutron events: %s', events,
+                          instance=instance)
+
     @wrap_exception()
     @reverts_task_state
     @wrap_instance_event(prefix='compute')
@@ -4140,17 +4225,8 @@ class ComputeManager(manager.Manager):
 
             self.network_api.setup_networks_on_host(context, instance,
                                                     migration.source_compute)
-            # NOTE(hanrong): we need to change migration.dest_compute to
-            # source host temporarily. "network_api.migrate_instance_finish"
-            # will setup the network for the instance on the destination host.
-            # For revert resize, the instance will back to the source host, the
-            # setup of the network for instance should be on the source host.
-            # So set the migration.dest_compute to source host at here.
-            with utils.temporary_mutation(
-                    migration, dest_compute=migration.source_compute):
-                self.network_api.migrate_instance_finish(context,
-                                                         instance,
-                                                         migration)
+            self._finish_revert_resize_network_migrate_finish(
+                context, instance, migration)
             network_info = self.network_api.get_instance_nw_info(context,
                                                                  instance)
 
@@ -4651,12 +4727,50 @@ class ComputeManager(manager.Manager):
         new host machine.
 
         """
+        # _finish_resize sets instance.old_flavor to instance.flavor and
+        # changes instance.flavor to instance.new_flavor (if doing a resize
+        # rather than a cold migration). We save off the old_flavor here in
+        # case we need it for error handling below.
+        old_flavor = instance.flavor
         try:
             self._finish_resize_helper(context, disk_info, image, instance,
                                        migration)
         except Exception:
             with excutils.save_and_reraise_exception():
-                self._revert_allocation(context, instance, migration)
+                # At this point, resize_instance (which runs on the source) has
+                # already updated the instance host/node values to point to
+                # this (the dest) compute, so we need to leave the allocations
+                # against the dest node resource provider intact and drop the
+                # allocations against the source node resource provider. If the
+                # user tries to recover the server by hard rebooting it, it
+                # will happen on this host so that's where the allocations
+                # should go.
+                LOG.info('Deleting allocations for old flavor on source node '
+                         '%s after finish_resize failure. You may be able to '
+                         'recover the instance by hard rebooting it.',
+                         migration.source_compute, instance=instance)
+                # NOTE(mriedem): We can't use _delete_allocation_after_move
+                # because it relies on the resource tracker to look up the
+                # node uuid and since we are on the dest host, passing the
+                # source nodename won't work since the RT isn't tracking that
+                # node here. So we just try to remove the migration-based
+                # allocations directly and handle the case they don't exist.
+                if not self.reportclient.delete_allocation_for_instance(
+                        context, migration.uuid):
+                    # No migration-based allocation. Try to cleanup directly.
+                    cn = objects.ComputeNode.get_by_host_and_nodename(
+                        context, migration.source_compute,
+                        migration.source_node)
+                    if not scheduler_utils.remove_allocation_from_compute(
+                            context, instance, cn.uuid, self.reportclient,
+                            flavor=old_flavor):
+                        LOG.error('Failed to delete allocations for old '
+                                  'flavor %s against source node %s. The '
+                                  'instance is now on the dest node %s. The '
+                                  'allocations against the source node need '
+                                  'to be manually cleaned up in Placement.',
+                                  old_flavor.flavorid, migration.source_node,
+                                  migration.dest_node, instance=instance)
 
     def _finish_resize_helper(self, context, disk_info, image, instance,
                               migration):
@@ -6280,8 +6394,8 @@ class ComputeManager(manager.Manager):
         return migrate_data
 
     @staticmethod
-    def _neutron_failed_live_migration_callback(event_name, instance):
-        msg = ('Neutron reported failure during live migration '
+    def _neutron_failed_migration_callback(event_name, instance):
+        msg = ('Neutron reported failure during migration '
                'with %(event)s for instance %(uuid)s')
         msg_args = {'event': event_name, 'uuid': instance.uuid}
         if CONF.vif_plugging_is_fatal:
@@ -6299,7 +6413,7 @@ class ComputeManager(manager.Manager):
             return []
 
     def _cleanup_pre_live_migration(self, context, dest, instance,
-                                    migration, migrate_data):
+                                    migration, migrate_data, source_bdms):
         """Helper method for when pre_live_migration fails
 
         Sets the migration status to "error" and rolls back the live migration
@@ -6316,13 +6430,18 @@ class ComputeManager(manager.Manager):
         :param migrate_data: Data about the live migration, populated from
                              the destination host.
         :type migrate_data: Subclass of nova.objects.LiveMigrateData
+        :param source_bdms: BDMs prior to modification by the destination
+                            compute host. Set by _do_live_migration and not
+                            part of the callback interface, so this is never
+                            None
         """
         self._set_migration_status(migration, 'error')
         # Make sure we set this for _rollback_live_migration()
         # so it can find it, as expected if it was called later
         migrate_data.migration = migration
         self._rollback_live_migration(context, instance, dest,
-                                      migrate_data)
+                                      migrate_data=migrate_data,
+                                      source_bdms=source_bdms)
 
     def _do_live_migration(self, context, dest, instance, block_migration,
                            migration, migrate_data):
@@ -6354,7 +6473,7 @@ class ComputeManager(manager.Manager):
                 disk = None
 
             deadline = CONF.vif_plugging_timeout
-            error_cb = self._neutron_failed_live_migration_callback
+            error_cb = self._neutron_failed_migration_callback
             # In order to avoid a race with the vif plugging that the virt
             # driver does on the destination host, we register our events
             # to wait for before calling pre_live_migration. Then if the
@@ -6391,20 +6510,23 @@ class ComputeManager(manager.Manager):
                               'to be plugged on the destination host %s.',
                               dest, instance=instance)
                 self._cleanup_pre_live_migration(
-                    context, dest, instance, migration, migrate_data)
+                    context, dest, instance, migration, migrate_data,
+                    source_bdms)
         except eventlet.timeout.Timeout:
             msg = 'Timed out waiting for events: %s'
             LOG.warning(msg, events, instance=instance)
             if CONF.vif_plugging_is_fatal:
                 self._cleanup_pre_live_migration(
-                    context, dest, instance, migration, migrate_data)
+                    context, dest, instance, migration, migrate_data,
+                    source_bdms)
                 raise exception.MigrationError(reason=msg % events)
         except Exception:
             with excutils.save_and_reraise_exception():
                 LOG.exception('Pre live migration failed at %s',
                               dest, instance=instance)
                 self._cleanup_pre_live_migration(
-                    context, dest, instance, migration, migrate_data)
+                    context, dest, instance, migration, migrate_data,
+                    source_bdms)
 
         # NOTE(Kevin_Zheng): Pop the migration from the waiting queue
         # if it exist in the queue, then we are good to moving on, if
@@ -6417,7 +6539,8 @@ class ComputeManager(manager.Manager):
                       migration.uuid, instance=instance)
             migrate_data.migration = migration
             self._rollback_live_migration(context, instance, dest,
-                                          migrate_data, 'cancelled')
+                                          migrate_data, 'cancelled',
+                                          source_bdms=source_bdms)
             self._notify_live_migrate_abort_end(context, instance)
             return
 
@@ -6432,12 +6555,14 @@ class ComputeManager(manager.Manager):
         # cleanup.
         post_live_migration = functools.partial(self._post_live_migration,
                                                 source_bdms=source_bdms)
+        rollback_live_migration = functools.partial(
+            self._rollback_live_migration, source_bdms=source_bdms)
 
         LOG.debug('live_migration data is %s', migrate_data)
         try:
             self.driver.live_migration(context, instance, dest,
                                        post_live_migration,
-                                       self._rollback_live_migration,
+                                       rollback_live_migration,
                                        block_migration, migrate_data)
         except Exception:
             LOG.exception('Live migration failed.', instance=instance)
@@ -6924,7 +7049,8 @@ class ComputeManager(manager.Manager):
     @wrap_instance_fault
     def _rollback_live_migration(self, context, instance,
                                  dest, migrate_data=None,
-                                 migration_status='error'):
+                                 migration_status='error',
+                                 source_bdms=None):
         """Recovers Instance/volume state from migrating -> running.
 
         :param context: security context
@@ -6936,6 +7062,10 @@ class ComputeManager(manager.Manager):
             if not none, contains implementation specific data.
         :param migration_status:
             Contains the status we want to set for the migration object
+        :param source_bdms: BDMs prior to modification by the destination
+                            compute host. Set by _do_live_migration and not
+                            part of the callback interface, so this is never
+                            None
 
         """
         if (isinstance(migrate_data, migrate_data_obj.LiveMigrateData) and
@@ -6963,11 +7093,19 @@ class ComputeManager(manager.Manager):
         # NOTE(mriedem): This is a no-op for neutron.
         self.network_api.setup_networks_on_host(context, instance, self.host)
 
+        source_bdms_by_volid = {bdm.volume_id: bdm for bdm in source_bdms
+                                if bdm.is_volume}
+
+        # NOTE(lyarwood): Fetch the current list of BDMs and delete any volume
+        # attachments used by the destination host before rolling back to the
+        # original and still valid source host volume attachments.
         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
                 context, instance.uuid)
         for bdm in bdms:
             if bdm.is_volume:
                 # remove the connection on the destination host
+                # NOTE(lyarwood): This actually calls the cinderv2
+                # os-terminate_connection API if required.
                 self.compute_rpcapi.remove_volume_connection(
                         context, instance, bdm.volume_id, dest)
 
@@ -6976,13 +7114,21 @@ class ComputeManager(manager.Manager):
                     # attachment_id to the old attachment of the source
                     # host. If old_attachments is not there, then
                     # there was an error before the new attachment was made.
+                    # TODO(lyarwood): migrate_data.old_vol_attachment_ids can
+                    # be removed now as we can lookup the original
+                    # attachment_ids from the source_bdms list here.
                     old_attachments = migrate_data.old_vol_attachment_ids \
                         if 'old_vol_attachment_ids' in migrate_data else None
                     if old_attachments and bdm.volume_id in old_attachments:
                         self.volume_api.attachment_delete(context,
                                                           bdm.attachment_id)
                         bdm.attachment_id = old_attachments[bdm.volume_id]
-                        bdm.save()
+
+                # NOTE(lyarwood): Rollback the connection_info stored within
+                # the BDM to that used by the source and not the destination.
+                source_bdm = source_bdms_by_volid[bdm.volume_id]
+                bdm.connection_info = source_bdm.connection_info
+                bdm.save()
 
         self._notify_about_instance_usage(context, instance,
                                           "live_migration._rollback.start")

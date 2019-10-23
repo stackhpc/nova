@@ -4518,7 +4518,10 @@ class ComputeTestCase(BaseTestCase,
         self.assertEqual('ERROR', msg.priority)
         payload = msg.payload
         message = payload['message']
-        self.assertNotEqual(-1, message.find("i'm dying"))
+        # The fault message does not contain the exception value, only the
+        # class name.
+        self.assertEqual(-1, message.find("i'm dying"))
+        self.assertIn('TestingException', message)
 
     def test_terminate_usage_notification(self):
         # Ensure terminate_instance generates correct usage notification.
@@ -5819,6 +5822,8 @@ class ComputeTestCase(BaseTestCase,
         migration_context.migration_id = migration.id
         migration_context.old_numa_topology = old_inst_topology
         migration_context.new_numa_topology = new_inst_topology
+        migration_context.old_pci_devices = None
+        migration_context.new_pci_devices = None
 
         instance.migration_context = migration_context
         instance.vm_state = vm_states.RESIZED
@@ -5855,12 +5860,14 @@ class ComputeTestCase(BaseTestCase,
         old_pci_devices = objects.PciDeviceList(
             objects=[objects.PciDevice(vendor_id='1377',
                                        product_id='0047',
-                                       address='0000:0a:00.1')])
+                                       address='0000:0a:00.1',
+                                       request_id=uuids.req1)])
 
         new_pci_devices = objects.PciDeviceList(
             objects=[objects.PciDevice(vendor_id='1377',
                                        product_id='0047',
-                                       address='0000:0b:00.1')])
+                                       address='0000:0b:00.1',
+                                       request_id=uuids.req2)])
 
         if expected_pci_addr == old_pci_devices[0].address:
             expected_pci_device = old_pci_devices[0]
@@ -5937,7 +5944,9 @@ class ComputeTestCase(BaseTestCase,
             old_vm_state = vm_states.ACTIVE
         else:
             old_vm_state = vm_states.STOPPED
-        params = {'vm_state': old_vm_state}
+        params = {'vm_state': old_vm_state,
+                  'info_cache': objects.InstanceInfoCache(
+                      network_info=network_model.NetworkInfo([]))}
         instance = self._create_fake_instance_obj(params)
 
         self.stub_out('nova.virt.fake.FakeDriver.finish_migration', fake)
@@ -6087,7 +6096,9 @@ class ComputeTestCase(BaseTestCase,
         def fake(*args, **kwargs):
             pass
 
-        instance = self._create_fake_instance_obj()
+        params = {'info_cache': objects.InstanceInfoCache(
+                      network_info=network_model.NetworkInfo([]))}
+        instance = self._create_fake_instance_obj(params)
 
         self.stub_out('nova.virt.fake.FakeDriver.finish_migration', fake)
         self.stub_out('nova.virt.fake.FakeDriver.finish_revert_migration',
@@ -6275,7 +6286,7 @@ class ComputeTestCase(BaseTestCase,
     @mock.patch('nova.objects.Migration.save')
     def test_live_migration_exception_rolls_back(self, mock_save,
                                 mock_rollback, mock_remove,
-                                mock_get_uuid,
+                                mock_get_bdms,
                                 mock_get_node, mock_pre, mock_get_disk):
         # Confirm exception when pre_live_migration fails.
         c = context.get_admin_context()
@@ -6290,27 +6301,39 @@ class ComputeTestCase(BaseTestCase,
         dest_host = updated_instance['host']
         dest_node = objects.ComputeNode(host=dest_host, uuid=uuids.dest_node)
         mock_get_node.return_value = dest_node
-        fake_bdms = objects.BlockDeviceMappingList(objects=[
+
+        # All the fake BDMs we've generated, in order
+        fake_bdms = []
+
+        def gen_fake_bdms(obj, instance):
+            # generate a unique fake connection_info every time we're called,
+            # simulating connection_info being mutated elsewhere.
+            bdms = objects.BlockDeviceMappingList(objects=[
                 objects.BlockDeviceMapping(
                     **fake_block_device.FakeDbBlockDeviceDict(
                         {'volume_id': uuids.volume_id_1,
                          'source_type': 'volume',
+                         'connection_info':
+                            jsonutils.dumps(uuidutils.generate_uuid()),
                          'destination_type': 'volume'})),
                 objects.BlockDeviceMapping(
                     **fake_block_device.FakeDbBlockDeviceDict(
                         {'volume_id': uuids.volume_id_2,
                          'source_type': 'volume',
+                         'connection_info':
+                            jsonutils.dumps(uuidutils.generate_uuid()),
                          'destination_type': 'volume'}))
-        ])
+            ])
+            for bdm in bdms:
+                bdm.save = mock.Mock()
+            fake_bdms.append(bdms)
+            return bdms
+
         migrate_data = migrate_data_obj.XenapiLiveMigrateData(
             block_migration=True)
 
-        block_device_info = {
-                'swap': None, 'ephemerals': [], 'block_device_mapping': [],
-                'root_device_name': None}
-        mock_get_disk.return_value = 'fake_disk'
         mock_pre.side_effect = test.TestingException
-        mock_get_uuid.return_value = fake_bdms
+        mock_get_bdms.side_effect = gen_fake_bdms
 
         # start test
         migration = objects.Migration(uuid=uuids.migration)
@@ -6343,12 +6366,26 @@ class ComputeTestCase(BaseTestCase,
         self.assertEqual(vm_states.ACTIVE, instance.vm_state)
         self.assertIsNone(instance.task_state)
         self.assertEqual('error', migration.status)
-        mock_get_disk.assert_called_once_with(instance,
-                block_device_info=block_device_info)
+        mock_get_disk.assert_called()
         mock_pre.assert_called_once_with(c,
-                instance, True, 'fake_disk', dest_host, migrate_data)
+                instance, True, mock_get_disk.return_value, dest_host,
+                migrate_data)
 
-        mock_get_uuid.assert_called_with(c, instance.uuid)
+        # Assert that _rollback_live_migration puts connection_info back to
+        # what it was before the call to pre_live_migration.
+        # BlockDeviceMappingList.get_by_instance_uuid is mocked to generate
+        # BDMs with unique connection_info every time it's called. These are
+        # stored in fake_bdms in the order they were generated. We assert here
+        # that the last BDMs generated (in _rollback_live_migration) now have
+        # the same connection_info as the first BDMs generated (before calling
+        # pre_live_migration), and that we saved them.
+        self.assertGreater(len(fake_bdms), 1)
+        for source_bdm, final_bdm in zip(fake_bdms[0], fake_bdms[-1]):
+            self.assertEqual(source_bdm.connection_info,
+                             final_bdm.connection_info)
+            final_bdm.save.assert_called()
+
+        mock_get_bdms.assert_called_with(c, instance.uuid)
         mock_remove.assert_has_calls([
             mock.call(c, instance, uuids.volume_id_1, dest_host),
             mock.call(c, instance, uuids.volume_id_2, dest_host)])
@@ -6721,6 +6758,7 @@ class ComputeTestCase(BaseTestCase,
         instance = mock.MagicMock()
         migration = objects.Migration(uuid=uuids.migration)
         migrate_data = objects.LibvirtLiveMigrateData(migration=migration)
+        source_bdms = objects.BlockDeviceMappingList()
 
         dest_node = objects.ComputeNode(host='foo', uuid=uuids.dest_node)
         mock_get_node.return_value = dest_node
@@ -6737,10 +6775,12 @@ class ComputeTestCase(BaseTestCase,
             if migration_status:
                 self.compute._rollback_live_migration(
                     c, instance, 'foo', migrate_data=migrate_data,
-                    migration_status=migration_status)
+                    migration_status=migration_status,
+                    source_bdms=source_bdms)
             else:
                 self.compute._rollback_live_migration(
-                    c, instance, 'foo', migrate_data=migrate_data)
+                    c, instance, 'foo', migrate_data=migrate_data,
+                    source_bdms=source_bdms)
             mock_notify.assert_has_calls([
                 mock.call(c, instance, self.compute.host,
                           action='live_migration_rollback', phase='start',
@@ -6778,6 +6818,7 @@ class ComputeTestCase(BaseTestCase,
         instance = fake_instance.fake_instance_obj(ctxt)
         migration = objects.Migration(ctxt, uuid=uuids.migration)
         migrate_data = objects.LibvirtLiveMigrateData(migration=migration)
+        source_bdms = objects.BlockDeviceMappingList()
 
         @mock.patch.object(self.compute, '_notify_about_instance_usage')
         @mock.patch('nova.compute.utils.notify_about_instance_action')
@@ -6793,7 +6834,8 @@ class ComputeTestCase(BaseTestCase,
             self.assertRaises(test.TestingException,
                               self.compute._rollback_live_migration,
                               ctxt, instance, 'dest-host', migrate_data,
-                              migration_status='goofballs')
+                              migration_status='goofballs',
+                              source_bdms=source_bdms)
             # setup_networks_on_host is called twice:
             # - once to re-setup networking on the source host, which for
             #   neutron doesn't actually do anything since the port's host
@@ -6915,11 +6957,12 @@ class ComputeTestCase(BaseTestCase,
 
         def fake_db_fault_create(ctxt, values):
             self.assertIn('raise NotImplementedError', values['details'])
+            self.assertIn('test', values['details'])
             del values['details']
 
             expected = {
                 'code': 500,
-                'message': 'test',
+                'message': 'NotImplementedError',
                 'instance_uuid': instance['uuid'],
                 'host': self.compute.host
             }
@@ -6950,12 +6993,14 @@ class ComputeTestCase(BaseTestCase,
             global raised_exc
 
             self.assertIn('raise messaging.RemoteError', values['details'])
+            self.assertIn('Remote error: test My Test Message\nNone.',
+                          values['details'])
             del values['details']
 
             expected = {
                 'code': 500,
                 'instance_uuid': instance['uuid'],
-                'message': 'Remote error: test My Test Message\nNone.',
+                'message': 'RemoteError',
                 'host': self.compute.host
             }
             self.assertEqual(expected, values)
@@ -7010,7 +7055,7 @@ class ComputeTestCase(BaseTestCase,
         def fake_db_fault_create(ctxt, values):
             expected = {
                 'code': 500,
-                'message': 'test',
+                'message': 'NotImplementedError',
                 'details': '',
                 'instance_uuid': instance['uuid'],
                 'host': self.compute.host
@@ -7046,9 +7091,11 @@ class ComputeTestCase(BaseTestCase,
                       fake_db_fault_create)
 
         ctxt = context.get_admin_context()
-        compute_utils.add_instance_fault_from_exc(ctxt,
-                                                  instance,
-                                                  NotImplementedError(message))
+        # Use a NovaException because non-nova exceptions will just have the
+        # class name recorded in the fault message which will not exercise our
+        # length trim code.
+        exc = exception.NovaException(message=message)
+        compute_utils.add_instance_fault_from_exc(ctxt, instance, exc)
 
     def test_add_instance_fault_with_message(self):
         instance = self._create_fake_instance_obj()
@@ -8098,7 +8145,10 @@ class ComputeTestCase(BaseTestCase,
         self.compute.confirm_resize(self.context, instance=instance,
                                     migration=migration)
 
-    def test_allow_confirm_resize_on_instance_in_deleting_task_state(self):
+    @mock.patch.object(objects.MigrationContext,
+                       'get_pci_mapping_for_migration')
+    def test_allow_confirm_resize_on_instance_in_deleting_task_state(
+            self, mock_pci_mapping):
         instance = self._create_fake_instance_obj()
         old_type = instance.flavor
         new_type = flavors.get_flavor_by_flavor_id('4')
@@ -8106,6 +8156,7 @@ class ComputeTestCase(BaseTestCase,
         instance.flavor = new_type
         instance.old_flavor = old_type
         instance.new_flavor = new_type
+        instance.migration_context = objects.MigrationContext()
 
         fake_rt = mock.MagicMock()
 

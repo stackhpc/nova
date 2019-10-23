@@ -2839,6 +2839,58 @@ class _ComputeAPIUnitTestMixIn(object):
 
         _do_test()
 
+    def test_count_attachments_for_swap_not_found_and_readonly(self):
+        """Tests that attachment records that aren't found are considered
+        read/write by default. Also tests that read-only attachments are
+        not counted.
+        """
+        ctxt = context.get_admin_context()
+        volume = {
+            'attachments': {
+                uuids.server1: {
+                    'attachment_id': uuids.attachment1
+                },
+                uuids.server2: {
+                    'attachment_id': uuids.attachment2
+                }
+            }
+        }
+
+        def fake_attachment_get(_context, attachment_id):
+            if attachment_id == uuids.attachment1:
+                raise exception.VolumeAttachmentNotFound(
+                    attachment_id=attachment_id)
+            return {'connection_info': {'attach_mode': 'ro'}}
+
+        with mock.patch.object(self.compute_api.volume_api, 'attachment_get',
+                               side_effect=fake_attachment_get) as mock_get:
+            self.assertEqual(
+                1, self.compute_api._count_attachments_for_swap(ctxt, volume))
+        mock_get.assert_has_calls([
+            mock.call(ctxt, uuids.attachment1),
+            mock.call(ctxt, uuids.attachment2)], any_order=True)
+
+    @mock.patch('nova.volume.cinder.API.attachment_get',
+                new_callable=mock.NonCallableMock)  # asserts not called
+    def test_count_attachments_for_swap_no_query(self, mock_attachment_get):
+        """Tests that if the volume has <2 attachments, we don't query
+        the attachments for their attach_mode value.
+        """
+        volume = {}
+        self.assertEqual(
+            0, self.compute_api._count_attachments_for_swap(
+                mock.sentinel.context, volume))
+        volume = {
+            'attachments': {
+                uuids.server: {
+                    'attachment_id': uuids.attach1
+                }
+            }
+        }
+        self.assertEqual(
+            1, self.compute_api._count_attachments_for_swap(
+                mock.sentinel.context, volume))
+
     @mock.patch.object(compute_api.API, '_record_action_start')
     def _test_snapshot_and_backup(self, mock_record, is_snapshot=True,
                                   with_base_ref=False, min_ram=None,
@@ -2853,7 +2905,6 @@ class _ComputeAPIUnitTestMixIn(object):
         # carried from sys_meta into image property...since it should be set
         # explicitly by _create_image() in compute api.
         fake_image_meta = {
-            'is_public': True,
             'name': 'base-name',
             'disk_format': 'fake',
             'container_format': 'fake',
@@ -2871,7 +2922,7 @@ class _ComputeAPIUnitTestMixIn(object):
         }
         image_type = is_snapshot and 'snapshot' or 'backup'
         sent_meta = {
-            'is_public': False,
+            'visibility': 'private',
             'name': 'fake-name',
             'disk_format': 'fake',
             'container_format': 'fake',
@@ -3137,7 +3188,7 @@ class _ComputeAPIUnitTestMixIn(object):
                            'ram_disk': 'fake_ram_disk_id'},
             'size': 0,
             'min_disk': '22',
-            'is_public': False,
+            'visibility': 'private',
             'min_ram': '11',
         }
         if quiesce_required:
@@ -5424,33 +5475,32 @@ class _ComputeAPIUnitTestMixIn(object):
         return migration
 
     @mock.patch('nova.compute.api.API._record_action_start')
-    @mock.patch.object(compute_rpcapi.ComputeAPI, 'live_migration_abort')
     @mock.patch.object(objects.Migration, 'get_by_id_and_instance')
     def test_live_migrate_abort_succeeded(self,
                                           mock_get_migration,
-                                          mock_lm_abort,
                                           mock_rec_action):
         instance = self._create_instance_obj()
         instance.task_state = task_states.MIGRATING
         migration = self._get_migration(21, 'running', 'live-migration')
         mock_get_migration.return_value = migration
 
-        self.compute_api.live_migrate_abort(self.context,
-                                            instance,
-                                            migration.id)
+        with mock.patch.object(self.compute_api.compute_rpcapi,
+                               'live_migration_abort') as mock_lm_abort:
+            self.compute_api.live_migrate_abort(self.context,
+                                                instance,
+                                                migration.id)
+            mock_lm_abort.assert_called_once_with(self.context, instance,
+                                                  migration.id)
         mock_rec_action.assert_called_once_with(self.context,
                                     instance,
                                     instance_actions.LIVE_MIGRATION_CANCEL)
-        mock_lm_abort.called_once_with(self.context, instance, migration.id)
 
     @mock.patch('nova.compute.api.API._record_action_start')
-    @mock.patch.object(compute_rpcapi.ComputeAPI, 'live_migration_abort')
     @mock.patch.object(objects.Migration, 'get_by_id_and_instance')
     @mock.patch.object(objects.Service, 'get_by_compute_host')
     def test_live_migrate_abort_in_queue_succeeded(self,
                                                    mock_get_service,
                                                    mock_get_migration,
-                                                   mock_lm_abort,
                                                    mock_rec_action):
         service_obj = objects.Service()
         service_obj.version = (
@@ -5462,16 +5512,18 @@ class _ComputeAPIUnitTestMixIn(object):
             migration = self._get_migration(
                 21, migration_status, 'live-migration')
             mock_get_migration.return_value = migration
-            self.compute_api.live_migrate_abort(self.context,
-                                                instance,
-                                                migration.id,
-                                                support_abort_in_queue=True)
+
+            with mock.patch.object(self.compute_api.compute_rpcapi,
+                                   'live_migration_abort') as mock_lm_abort:
+                self.compute_api.live_migrate_abort(
+                    self.context, instance, migration.id,
+                    support_abort_in_queue=True)
+                mock_lm_abort.assert_called_once_with(self.context, instance,
+                                                      migration.id)
             mock_rec_action.assert_called_once_with(
                 self.context, instance, instance_actions.LIVE_MIGRATION_CANCEL)
-            mock_lm_abort.called_once_with(self.context, instance, migration)
             mock_get_migration.reset_mock()
             mock_rec_action.reset_mock()
-            mock_lm_abort.reset_mock()
 
     @mock.patch.object(objects.Migration, 'get_by_id_and_instance')
     def test_live_migration_abort_in_queue_old_microversion_fails(
