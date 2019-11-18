@@ -8051,13 +8051,27 @@ class ComputeManager(manager.Manager):
                          "nodes are %(nodes)s",
                          {'id': cn.id, 'hh': cn.hypervisor_hostname,
                           'nodes': nodenames})
-                cn.destroy()
-                rt.remove_node(cn.hypervisor_hostname)
-                # Delete the corresponding resource provider in placement,
-                # along with any associated allocations and inventory.
-                # TODO(cdent): Move use of reportclient into resource tracker.
-                self.scheduler_client.reportclient.delete_resource_provider(
-                    context, cn, cascade=True)
+                try:
+                    cn.destroy()
+                except exception.ComputeHostNotFound:
+                    # NOTE(mgoddard): it's possible that another compute
+                    # service took ownership of this compute node since we
+                    # queried it due to a rebalance, and this will cause the
+                    # deletion to fail. Ignore the error in that case.
+                    LOG.info("Ignoring failure to delete orphan compute node "
+                             "%(id)s on hypervisor host %(hh)s due to "
+                             "possible node rebalance",
+                             {'id': cn.id, 'hh': cn.hypervisor_hostname})
+                    rt.remove_node(cn.hypervisor_hostname)
+                else:
+                    rt.remove_node(cn.hypervisor_hostname)
+                    # Delete the corresponding resource provider in placement,
+                    # along with any associated allocations.
+                    # TODO(cdent): Move use of reportclient into resource
+                    # tracker.
+                    reportclient = self.scheduler_client.reportclient
+                    reportclient.delete_resource_provider(
+                        context, cn, cascade=True)
 
         for nodename in nodenames:
             self._update_available_resource_for_node(context, nodename)
