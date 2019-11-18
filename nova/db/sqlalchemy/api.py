@@ -763,10 +763,10 @@ def compute_node_update(context, compute_id, values):
 
 
 @pick_context_manager_writer
-def compute_node_delete(context, compute_id):
+def compute_node_delete(context, compute_id, compute_host):
     """Delete a ComputeNode record."""
     result = model_query(context, models.ComputeNode).\
-             filter_by(id=compute_id).\
+             filter_by(id=compute_id, host=compute_host).\
              soft_delete(synchronize_session=False)
 
     if not result:

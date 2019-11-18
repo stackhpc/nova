@@ -202,8 +202,10 @@ class BaseTestCase(test.TestCase):
                         context, objects.ComputeNode(), cn)
                     for cn in fake_compute_nodes]
 
-        def fake_compute_node_delete(context, compute_node_id):
+        def fake_compute_node_delete(context, compute_node_id,
+                                     compute_node_host):
             self.assertEqual(2, compute_node_id)
+            self.assertEqual('fake_phyp1', compute_node_host)
 
         self.stub_out(
             'nova.compute.manager.ComputeManager._get_compute_nodes_in_db',
