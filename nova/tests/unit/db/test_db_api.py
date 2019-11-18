@@ -5393,7 +5393,7 @@ class ComputeNodeTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
             # Now delete the newly-created compute node to ensure the related
             # compute node stats are wiped in a cascaded fashion
-            db.compute_node_delete(self.ctxt, node['id'])
+            db.compute_node_delete(self.ctxt, node['id'], node['host'])
 
             # Clean up the service
             db.service_destroy(self.ctxt, service['id'])
@@ -5567,9 +5567,17 @@ class ComputeNodeTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
     def test_compute_node_delete(self):
         compute_node_id = self.item['id']
-        db.compute_node_delete(self.ctxt, compute_node_id)
+        compute_node_host = self.item['host']
+        db.compute_node_delete(self.ctxt, compute_node_id, compute_node_host)
         nodes = db.compute_node_get_all(self.ctxt)
         self.assertEqual(len(nodes), 0)
+
+    def test_compute_node_delete_different_host(self):
+        compute_node_id = self.item['id']
+        compute_node_host = 'invalid-host'
+        self.assertRaises(exception.ComputeHostNotFound,
+                          db.compute_node_delete,
+                          self.ctxt, compute_node_id, compute_node_host)
 
     def test_compute_node_search_by_hypervisor(self):
         nodes_created = []
