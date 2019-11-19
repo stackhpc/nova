@@ -141,9 +141,8 @@ class NodeRebalanceDeletedComputeNodeRaceTestCase(
         self.assertEqual(0, len(rps), rps)
 
         # host1[3]: Should recreate compute node and resource provider.
-        # FIXME(mgoddard): Resource provider not recreated here, because it
-        # exists in the provider tree. See
-        # https://bugs.launchpad.net/nova/+bug/1841481.
+        # FIXME(mgoddard): Resource provider not recreated here, due to
+        # https://bugs.launchpad.net/nova/+bug/1853159.
         host1.manager.update_available_resource(ctxt)
 
         # Verify that the node was recreated.
@@ -158,14 +157,11 @@ class NodeRebalanceDeletedComputeNodeRaceTestCase(
         self.assertEqual(0, len(rps), rps)
 
         # But the RP it exists in the provider tree.
-        self.assertTrue(host1.manager.rt.reportclient._provider_tree.exists(
+        self.assertFalse(host1.manager.rt.reportclient._provider_tree.exists(
             nodename))
 
         # host1[1]: Should add compute node to RT cache and recreate resource
         # provider.
-        # FIXME(mgoddard): Resource provider not recreated here, because it
-        # exists in the provider tree. See
-        # https://bugs.launchpad.net/nova/+bug/1841481.
         host1.manager.update_available_resource(ctxt)
 
         # Verify that the node still exists.
@@ -174,13 +170,10 @@ class NodeRebalanceDeletedComputeNodeRaceTestCase(
         # And it is now in the RT cache.
         self.assertIn(nodename, host1.manager.rt.compute_nodes)
 
-        # There is still no RP.
+        # The resource provider has now been created.
         rps = self._get_all_providers()
-        self.assertEqual(0, len(rps), rps)
-
-        # But the RP it exists in the provider tree.
-        self.assertTrue(host1.manager.rt.reportclient._provider_tree.exists(
-            nodename))
+        self.assertEqual(1, len(rps), rps)
+        self.assertEqual(nodename, rps[0]['name'])
 
         # This fails due to the lack of a resource provider.
         self.assertIn('Skipping removal of allocations for deleted instances',
