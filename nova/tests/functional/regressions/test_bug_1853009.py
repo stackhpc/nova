@@ -141,23 +141,40 @@ class NodeRebalanceDeletedComputeNodeRaceTestCase(
         self.assertEqual(0, len(rps), rps)
 
         # host1[3]: Should recreate compute node and resource provider.
-        # FIXME(mgoddard): Compute node not recreated here, because it is
-        # already in RT.compute_nodes. See
-        # https://bugs.launchpad.net/nova/+bug/1853009.
         # FIXME(mgoddard): Resource provider not recreated here, because it
         # exists in the provider tree. See
         # https://bugs.launchpad.net/nova/+bug/1841481.
         host1.manager.update_available_resource(ctxt)
 
-        # Verify that the node was not recreated.
-        hypervisors = self.api.api_get(
-            '/os-hypervisors/detail').body['hypervisors']
-        self.assertEqual(0, len(hypervisors), hypervisors)
+        # Verify that the node was recreated.
+        self._assert_hypervisor_api(nodename, 'host1')
 
-        # But the compute node exists in the RT.
-        self.assertIn(nodename, host1.manager.rt.compute_nodes)
+        # But due to https://bugs.launchpad.net/nova/+bug/1853159 the compute
+        # node is not cached in the RT.
+        self.assertNotIn(nodename, host1.manager.rt.compute_nodes)
 
         # There is no RP.
+        rps = self._get_all_providers()
+        self.assertEqual(0, len(rps), rps)
+
+        # But the RP it exists in the provider tree.
+        self.assertTrue(host1.manager.rt.reportclient._provider_tree.exists(
+            nodename))
+
+        # host1[1]: Should add compute node to RT cache and recreate resource
+        # provider.
+        # FIXME(mgoddard): Resource provider not recreated here, because it
+        # exists in the provider tree. See
+        # https://bugs.launchpad.net/nova/+bug/1841481.
+        host1.manager.update_available_resource(ctxt)
+
+        # Verify that the node still exists.
+        self._assert_hypervisor_api(nodename, 'host1')
+
+        # And it is now in the RT cache.
+        self.assertIn(nodename, host1.manager.rt.compute_nodes)
+
+        # There is still no RP.
         rps = self._get_all_providers()
         self.assertEqual(0, len(rps), rps)
 
