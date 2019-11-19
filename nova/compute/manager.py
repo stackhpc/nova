@@ -8033,13 +8033,16 @@ class ComputeManager(manager.Manager):
         compute_nodes_in_db = self._get_compute_nodes_in_db(context,
                                                             use_slave=True,
                                                             startup=startup)
+
+        rt = self._get_resource_tracker()
+        rt.clean_compute_node_cache(compute_nodes_in_db)
+
         try:
             nodenames = set(self.driver.get_available_nodes())
         except exception.VirtDriverNotReady:
             LOG.warning("Virt driver is not ready.")
             return
 
-        rt = self._get_resource_tracker()
         # Delete orphan compute node not reported by driver but still in db
         for cn in compute_nodes_in_db:
             if cn.hypervisor_hostname not in nodenames:

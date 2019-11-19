@@ -309,6 +309,7 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
             [mock.call(self.context, node) for node in avail_nodes_l])
 
         # First node in set should have been removed from DB
+        # Last node in set should have been added to DB.
         for db_node in db_nodes:
             if db_node.hypervisor_hostname == 'node1':
                 db_node.destroy.assert_called_once_with()
@@ -318,6 +319,8 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase):
                     'node1')
             else:
                 self.assertFalse(db_node.destroy.called)
+        (mock_get_rt.return_value.clean_compute_node_cache.
+         assert_called_once_with(db_nodes))
 
     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
                 'delete_resource_provider')

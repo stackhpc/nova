@@ -141,22 +141,35 @@ class NodeRebalanceDeletedComputeNodeRaceTestCase(
         self.assertEqual(0, len(rps), rps)
 
         # host1[3]: Should recreate compute node and resource provider.
-        # FIXME(mgoddard): Compute node not recreated here, because it is
-        # already in RT.compute_nodes. See
-        # https://bugs.launchpad.net/nova/+bug/1853009.
         host1.manager.update_available_resource(ctxt)
 
-        # Verify that the node was not recreated.
-        hypervisors = self.api.api_get(
-            '/os-hypervisors/detail').body['hypervisors']
-        self.assertEqual(0, len(hypervisors), hypervisors)
+        # Verify that the node was recreated.
+        self._assert_hypervisor_api(nodename, 'host1')
 
         rt = host1.manager._get_resource_tracker()
 
-        # But the compute node exists in the RT.
+        # But due to https://bugs.launchpad.net/nova/+bug/1853159 the compute
+        # node is not cached in the RT.
+        self.assertNotIn(nodename, rt.compute_nodes)
+
+        # And for the same reason, the provider is not recreated.
+        rps = self._get_all_providers()
+        self.assertEqual(0, len(rps), rps)
+
+        # host1[1]: Should add compute node to RT cache and recreate resource
+        # provider.
+        # FIXME(mgoddard): Resource provider not recreated here, because it
+        # exists in the provider tree. See
+        # https://bugs.launchpad.net/nova/+bug/1841481.
+        host1.manager.update_available_resource(ctxt)
+
+        # Verify that the node still exists.
+        self._assert_hypervisor_api(nodename, 'host1')
+
+        # And it is now in the RT cache.
         self.assertIn(nodename, rt.compute_nodes)
 
-        # The RP exists in Rocky, due to the lack of a provider tree cache.
+        # There is still no RP.
         rps = self._get_all_providers()
         self.assertEqual(1, len(rps), rps)
         self.assertEqual(nodename, rps[0]['name'])

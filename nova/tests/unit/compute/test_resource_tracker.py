@@ -3310,3 +3310,20 @@ class OverCommitTestCase(BaseTestCase):
     def test_disk_allocation_ratio_none_negative(self):
         self.assertRaises(ValueError,
                           CONF.set_default, 'disk_allocation_ratio', -1.0)
+
+
+class TestCleanComputeNodeCache(BaseTestCase):
+
+    def setUp(self):
+        super(TestCleanComputeNodeCache, self).setUp()
+        self._setup_rt()
+        self.context = context.RequestContext(mock.sentinel.user_id,
+                                              mock.sentinel.project_id)
+
+    @mock.patch.object(resource_tracker.ResourceTracker, "remove_node")
+    def test_clean_compute_node_cache(self, mock_remove):
+        invalid_nodename = "invalid-node"
+        self.rt.compute_nodes[_NODENAME] = _COMPUTE_NODE_FIXTURES[0]
+        self.rt.compute_nodes[invalid_nodename] = mock.sentinel.compute
+        self.rt.clean_compute_node_cache([_COMPUTE_NODE_FIXTURES[0]])
+        mock_remove.assert_called_once_with(invalid_nodename)
