@@ -79,10 +79,6 @@ class NodeRebalanceDeletedComputeNodeRaceTestCase(
 
         # host1[1]: Finds no compute record in RT. Tries to create one
         # (_init_compute_node).
-        # FIXME(mgoddard): This shows a traceback with SQL rollback due to
-        # soft-deleted node. The create seems to succeed but breaks the RT
-        # update for this node. See
-        # https://bugs.launchpad.net/nova/+bug/1853159.
         host1.manager.update_available_resource(ctxt)
         self._assert_hypervisor_api(nodename, 'host1')
         # There should only be one resource provider (fake-node).
@@ -150,40 +146,12 @@ class NodeRebalanceDeletedComputeNodeRaceTestCase(
             ctxt, cn, cascade=True)
 
         # host1[3]: Should recreate compute node and resource provider.
-        # FIXME(mgoddard): Resource provider not recreated here, due to
-        # https://bugs.launchpad.net/nova/+bug/1853159.
         host1.manager.update_available_resource(ctxt)
 
         # Verify that the node was recreated.
         self._assert_hypervisor_api(nodename, 'host1')
 
-        # But due to https://bugs.launchpad.net/nova/+bug/1853159 the compute
-        # node is not cached in the RT.
-        self.assertNotIn(nodename, host1.manager.rt.compute_nodes)
-
-        # There is no RP.
-        rps = self._get_all_providers()
-        self.assertEqual(0, len(rps), rps)
-
-        # But the RP it exists in the provider tree.
-        self.assertFalse(host1.manager.rt.reportclient._provider_tree.exists(
-            nodename))
-
-        # host1[1]: Should add compute node to RT cache and recreate resource
-        # provider.
-        host1.manager.update_available_resource(ctxt)
-
-        # Verify that the node still exists.
-        self._assert_hypervisor_api(nodename, 'host1')
-
-        # And it is now in the RT cache.
-        self.assertIn(nodename, host1.manager.rt.compute_nodes)
-
         # The resource provider has now been created.
         rps = self._get_all_providers()
         self.assertEqual(1, len(rps), rps)
         self.assertEqual(nodename, rps[0]['name'])
-
-        # This fails due to the lack of a resource provider.
-        self.assertIn('Skipping removal of allocations for deleted instances',
-                      self.stdlog.logger.output)
