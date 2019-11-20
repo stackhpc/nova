@@ -79,10 +79,6 @@ class NodeRebalanceDeletedComputeNodeRaceTestCase(
 
         # host1[1]: Finds no compute record in RT. Tries to create one
         # (_init_compute_node).
-        # FIXME(mgoddard): This shows a traceback with SQL rollback due to
-        # soft-deleted node. The create seems to succeed but breaks the RT
-        # update for this node. See
-        # https://bugs.launchpad.net/nova/+bug/1853159.
         host1.manager.update_available_resource(ctxt)
         self._assert_hypervisor_api(nodename, 'host1')
         # There should only be one resource provider (fake-node).
@@ -156,30 +152,7 @@ class NodeRebalanceDeletedComputeNodeRaceTestCase(
         # Verify that the node was recreated.
         self._assert_hypervisor_api(nodename, 'host1')
 
-        rt = host1.manager._get_resource_tracker()
-
-        # But due to https://bugs.launchpad.net/nova/+bug/1853159 the compute
-        # node is not cached in the RT.
-        self.assertNotIn(nodename, rt.compute_nodes)
-
-        # And for the same reason, the provider is not recreated.
-        rps = self._get_all_providers()
-        self.assertEqual(0, len(rps), rps)
-
-        # host1[1]: Should add compute node to RT cache and recreate resource
-        # provider.
-        # FIXME(mgoddard): Resource provider not recreated here, because it
-        # exists in the provider tree. See
-        # https://bugs.launchpad.net/nova/+bug/1841481.
-        host1.manager.update_available_resource(ctxt)
-
-        # Verify that the node still exists.
-        self._assert_hypervisor_api(nodename, 'host1')
-
-        # And it is now in the RT cache.
-        self.assertIn(nodename, rt.compute_nodes)
-
-        # There is still no RP.
+        # The resource provider has now been created.
         rps = self._get_all_providers()
         self.assertEqual(1, len(rps), rps)
         self.assertEqual(nodename, rps[0]['name'])
