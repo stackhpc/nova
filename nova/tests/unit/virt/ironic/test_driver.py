@@ -2740,24 +2740,6 @@ class IronicDriverTestCase(test.NoDBTestCase):
         mock_stop_fw.assert_called_once_with(instance, None)
         self.assertFalse(mock_call.called)
 
-    @mock.patch.object(ironic_driver.IronicDriver, '_stop_firewall')
-    @mock.patch.object(ironic_driver.IronicDriver, '_unplug_vifs')
-    @mock.patch.object(ironic_driver.IronicDriver,
-                       '_cleanup_volume_target_info')
-    @mock.patch.object(cw.IronicClientWrapper, 'call')
-    def test__cleanup_deploy_no_remove_ii(self, mock_call, mock_vol,
-                                          mock_unvif, mock_stop_fw):
-        # TODO(TheJulia): This REALLY should be updated to cover all of the
-        # calls that take place.
-        node = ironic_utils.get_test_node(driver='fake')
-        instance = fake_instance.fake_instance_obj(self.ctx,
-                                                   node=node.uuid)
-        self.driver._cleanup_deploy(node, instance, remove_instance_info=False)
-        mock_vol.assert_called_once_with(instance)
-        mock_unvif.assert_called_once_with(node, instance, None)
-        mock_stop_fw.assert_called_once_with(instance, None)
-        self.assertFalse(mock_call.called)
-
 
 class IronicDriverSyncTestCase(IronicDriverTestCase):
 
