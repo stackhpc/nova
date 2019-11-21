@@ -1547,3 +1547,20 @@ class ResourceTracker(object):
     def build_succeeded(self, nodename):
         """Resets the failed_builds stats for the given node."""
         self.stats[nodename].build_succeeded()
+
+    @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE)
+    def clean_compute_node_cache(self, compute_nodes_in_db):
+        """Clean the compute node cache of any nodes that no longer exist.
+
+        :param compute_nodes_in_db: list of ComputeNode objects from the DB.
+        """
+        compute_nodes_in_db_nodenames = {cn.hypervisor_hostname
+                                         for cn in compute_nodes_in_db}
+        stale_cns = set(self.compute_nodes) - compute_nodes_in_db_nodenames
+
+        for stale_cn in stale_cns:
+            # NOTE(mgoddard): we have found a node in the cache that has no
+            # compute node in the DB. This could be due to a node rebalance
+            # where another compute service took ownership of the node. Clean
+            # up the cache.
+            self.remove_node(stale_cn)

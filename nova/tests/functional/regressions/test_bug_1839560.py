@@ -19,7 +19,6 @@ from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional import integrated_helpers
 from nova import utils
-from nova.virt import fake as fake_virt
 
 LOG = logging.getLogger(__name__)
 
@@ -59,9 +58,11 @@ class PeriodicNodeRecreateTestCase(test.TestCase,
         # First we create a compute service to manage a couple of fake nodes.
         # When start_service runs, it will create the node1 and node2
         # ComputeNodes.
-        fake_virt.set_nodes(['node1', 'node2'])
-        self.addCleanup(fake_virt.restore_nodes)
         compute = self.start_service('compute', 'node1')
+        compute.manager.driver._set_nodes(['node1', 'node2'])
+        # Run the update_available_resource periodic to register node2.
+        ctxt = context.get_admin_context()
+        compute.manager.update_available_resource(ctxt)
         # Now we should have two compute nodes, make sure the hypervisors API
         # shows them.
         hypervisors = self.api.api_get('/os-hypervisors').body['hypervisors']
@@ -72,7 +73,6 @@ class PeriodicNodeRecreateTestCase(test.TestCase,
         # Now stub the driver to only report node1. This is making it look like
         # node2 is no longer available when update_available_resource runs.
         compute.manager.driver._nodes = ['node1']
-        ctxt = context.get_admin_context()
         compute.manager.update_available_resource(ctxt)
         # node2 should have been deleted, check the logs and API.
         log = self.stdlog.logger.output

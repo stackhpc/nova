@@ -18,7 +18,6 @@ from nova.tests.functional import integrated_helpers
 from nova.tests.unit.image import fake as fake_image
 from nova.tests.unit import policy_fixture
 from nova import utils
-from nova.virt import fake as fake_virt
 
 
 class InstanceListWithDeletedServicesTestCase(
@@ -50,7 +49,6 @@ class InstanceListWithDeletedServicesTestCase(
 
         # the image fake backend needed for image discovery
         fake_image.stub_out_image_service(self)
-        self.addCleanup(fake_image.FakeImageService_reset)
         # Get the image before we set the microversion to latest to avoid
         # the proxy issues with GET /images in 2.36.
         self.image_id = self.api.get_images()[0]['id']
@@ -83,8 +81,6 @@ class InstanceListWithDeletedServicesTestCase(
         5. migrate the instance back to the host1 service
         6. list instances which will try to online migrate the old service uuid
         """
-        fake_virt.set_nodes(['host1'])
-        self.addCleanup(fake_virt.restore_nodes)
         host1 = self.start_service('compute', host='host1')
 
         # Create an instance which will be on host1 since it's the only host.
@@ -96,8 +92,6 @@ class InstanceListWithDeletedServicesTestCase(
 
         # Now we start a 2nd compute which is "upgraded" (has a uuid) and
         # we'll migrate the instance to that host.
-        fake_virt.set_nodes(['host2'])
-        self.addCleanup(fake_virt.restore_nodes)
         host2 = self.start_service('compute', host='host2')
         self.assertIsNotNone(host2.service_ref.uuid)
 
