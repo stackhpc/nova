@@ -41,13 +41,12 @@ class QemuTestCase(test.NoDBTestCase):
                           '/fake/path')
 
     @mock.patch.object(os.path, 'exists', return_value=True)
-    @mock.patch('oslo_concurrency.processutils.execute',
-                return_value=('stdout', None))
+    @mock.patch('nova.privsep.qemu.unprivileged_qemu_img_info',
+                return_value={})
     def test_qemu_info_with_no_errors(self, path_exists,
                                       utils_execute):
         image_info = images.qemu_img_info('/fake/path')
         self.assertTrue(image_info)
-        self.assertTrue(str(image_info))
 
     @mock.patch.object(compute_utils, 'disk_ops_semaphore')
     @mock.patch('nova.privsep.utils.supports_direct_io', return_value=True)
