@@ -344,15 +344,16 @@ def compute_node_update(context, compute_id, values):
     return IMPL.compute_node_update(context, compute_id, values)
 
 
-def compute_node_delete(context, compute_id):
+def compute_node_delete(context, compute_id, compute_host):
     """Delete a compute node from the database.
 
     :param context: The security context
     :param compute_id: ID of the compute node
+    :param compute_host: Hostname of the compute service
 
     Raises ComputeHostNotFound if compute node with the given ID doesn't exist.
     """
-    return IMPL.compute_node_delete(context, compute_id)
+    return IMPL.compute_node_delete(context, compute_id, compute_host)
 
 
 def compute_node_statistics(context):
