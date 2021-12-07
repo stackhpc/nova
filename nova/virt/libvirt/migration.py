@@ -58,8 +58,10 @@ def get_updated_guest_xml(instance, guest, migrate_data, get_volume_config,
     xml_doc = etree.fromstring(guest.get_xml_desc(dump_migratable=True))
     xml_doc = _update_graphics_xml(xml_doc, migrate_data)
     xml_doc = _update_serial_xml(xml_doc, migrate_data)
-    xml_doc = _update_volume_xml(
+    xml_doc, mon_hosts_xml = _update_volume_xml(
         xml_doc, migrate_data, instance, get_volume_config)
+    if mon_hosts_xml:
+        xml_doc = _fix_rbd_monitor_hosts(xml_doc, migrate_data, mon_hosts_xml)
     xml_doc = _update_perf_events_xml(xml_doc, migrate_data)
     xml_doc = _update_memory_backing_xml(xml_doc, migrate_data)
     if get_vif_config is not None:
@@ -196,6 +198,7 @@ def _update_serial_xml(xml_doc, migrate_data):
 def _update_volume_xml(xml_doc, migrate_data, instance, get_volume_config):
     """Update XML using device information of destination host."""
     migrate_bdm_info = migrate_data.bdms
+    mon_hosts_xml = None
 
     # Update volume xml
     parser = etree.XMLParser(remove_blank_text=True)
@@ -229,6 +232,15 @@ def _update_volume_xml(xml_doc, migrate_data, instance, get_volume_config):
             LOG.debug("Find same serial number: pos=%(pos)s, "
                       "serial=%(num)s",
                       {'pos': pos, 'num': serial_source})
+
+            # save the monitor nodes
+            mon_hosts_xml = "<source>\n"
+            for mon_host in xml_doc2.findall('./source/host'):
+                h = mon_host.get('name')
+                p = mon_host.get('port')
+                mon_hosts_xml += '<host name="' + h + '" port="' + p + '"/>\n'
+            mon_hosts_xml += "</source>"
+
             for cnt, item_src in enumerate(disk_dev):
                 # If source and destination have same item, update
                 # the item using destination value.
@@ -247,6 +259,31 @@ def _update_volume_xml(xml_doc, migrate_data, instance, get_volume_config):
                     # again, hw address presented to guest must never change
                     item_dst.tail = None
                     disk_dev.insert(cnt, item_dst)
+    return xml_doc, mon_hosts_xml
+
+
+def _fix_rbd_monitor_hosts(xml_doc, migrate_data, mon_hosts_xml):
+    """Fix the rbd monitor nodes for all rbd disks."""
+    disk_nodes = xml_doc.findall('./devices/disk')
+
+    for pos, disk_dev in enumerate(disk_nodes):
+        target = disk_dev.find('target')
+
+        for rbd_source in disk_dev.findall('source'):
+            if rbd_source.get('protocol') == "rbd":
+                # remove the monitor hosts
+                mon_hosts = etree.fromstring(mon_hosts_xml)
+
+                for rbd_host in rbd_source.findall('host'):
+                    LOG.debug('Removing rbd_host: (%s)',  (rbd_host.attrib))
+                    rbd_source.remove(rbd_host)
+                    rbd_source.tail = None
+
+                # add the right monitor hosts
+                for new_rbd_host in mon_hosts.findall('host'):
+                    LOG.debug('Inserting new_rbd_host: (%s)',  (new_rbd_host.attrib))
+                    rbd_source.insert(0, new_rbd_host)
+                    rbd_source.tail = None
     return xml_doc
 
 
