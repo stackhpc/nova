@@ -198,7 +198,20 @@ def _update_serial_xml(xml_doc, migrate_data):
 def _update_volume_xml(xml_doc, migrate_data, instance, get_volume_config):
     """Update XML using device information of destination host."""
     migrate_bdm_info = migrate_data.bdms
-    mon_hosts_xml = None
+
+    mon_hosts = [
+        {'name': 'HOST1', 'port': '6789'},
+        {'name': 'HOST2', 'port': '6789'},
+        {'name': 'HOST3', 'port': '6789'},
+        {'name': 'HOST4', 'port': '6789'},
+        {'name': 'HOST5', 'port': '6789'},
+    ]
+    mon_hosts_xml = "<source>\n"
+    for mon_host in mon_hosts:
+        h = mon_host.get('name')
+        p = mon_host.get('port')
+        mon_hosts_xml += '<host name="' + h + '" port="' + p + '"/>\n'
+    mon_hosts_xml += "</source>"
 
     # Update volume xml
     parser = etree.XMLParser(remove_blank_text=True)
@@ -232,14 +245,6 @@ def _update_volume_xml(xml_doc, migrate_data, instance, get_volume_config):
             LOG.debug("Find same serial number: pos=%(pos)s, "
                       "serial=%(num)s",
                       {'pos': pos, 'num': serial_source})
-
-            # save the monitor nodes
-            mon_hosts_xml = "<source>\n"
-            for mon_host in xml_doc2.findall('./source/host'):
-                h = mon_host.get('name')
-                p = mon_host.get('port')
-                mon_hosts_xml += '<host name="' + h + '" port="' + p + '"/>\n'
-            mon_hosts_xml += "</source>"
 
             for cnt, item_src in enumerate(disk_dev):
                 # If source and destination have same item, update
