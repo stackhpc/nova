@@ -26,7 +26,6 @@ from nova.tests.unit.virt.libvirt import fake_imagebackend
 from nova.tests.unit.virt.libvirt import fake_os_brick_connector
 from nova.tests.unit.virt.libvirt import fakelibvirt
 
-
 CONF = conf.CONF
 
 
@@ -42,10 +41,11 @@ class ServersTestBase(integrated_helpers._IntegratedTestBase):
         self.compute_rp_uuids = {}
 
         super(ServersTestBase, self).setUp()
-
         self.useFixture(fake_imagebackend.ImageBackendFixture())
-        self.useFixture(fakelibvirt.FakeLibvirtFixture())
-
+        self.libvirt = self.useFixture(fakelibvirt.FakeLibvirtFixture())
+        self.useFixture(fixtures.MonkeyPatch(
+            'nova.virt.libvirt.driver.connector',
+            fake_os_brick_connector))
         self.useFixture(fixtures.MockPatch(
             'nova.virt.libvirt.LibvirtDriver._create_image',
             return_value=(False, False)))
@@ -135,6 +135,12 @@ class ServersTestBase(integrated_helpers._IntegratedTestBase):
                 host_info, pci_info, mdev_info, vdpa_info, libvirt_version,
                 qemu_version, hostname,
             )
+            # If the compute is configured with PCI devices then we need to
+            # make sure that the stubs around sysfs has the MAC address
+            # information for the PCI PF devices
+            if pci_info:
+                self.libvirt.update_sriov_mac_address_mapping(
+                    pci_info.get_pci_address_mac_mapping())
             # This is fun. Firstly we need to do a global'ish mock so we can
             # actually start the service.
             with mock.patch('nova.virt.libvirt.host.Host.get_connection',
@@ -363,6 +369,22 @@ class LibvirtNeutronFixture(nova_fixtures.NeutronFixture):
         'binding:vif_details': {'vlan': 42},
         'binding:vif_type': 'hw_veb',
         'binding:vnic_type': 'direct',
+    }
+
+    network_4_port_pf = {
+        'id': 'c6f51315-9202-416f-9e2f-eb78b3ac36d9',
+        'network_id': network_4['id'],
+        'status': 'ACTIVE',
+        'mac_address': 'b5:bc:2e:e7:51:01',
+        'fixed_ips': [
+            {
+                'ip_address': '192.168.4.8',
+                'subnet_id': subnet_4['id']
+            }
+        ],
+        'binding:vif_details': {'vlan': 42},
+        'binding:vif_type': 'hostdev_physical',
+        'binding:vnic_type': 'direct-physical',
     }
 
     def __init__(self, test):
