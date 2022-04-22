@@ -3283,6 +3283,7 @@ class LibvirtConfigNodeDeviceMdevInformation(LibvirtConfigObject):
                                         root_name="capability", **kwargs)
         self.type = None
         self.iommu_group = None
+        self.uuid = None
 
     def parse_dom(self, xmldoc):
         super(LibvirtConfigNodeDeviceMdevInformation,
@@ -3292,6 +3293,8 @@ class LibvirtConfigNodeDeviceMdevInformation(LibvirtConfigObject):
                 self.type = c.get('id')
             if c.tag == "iommuGroup":
                 self.iommu_group = int(c.get('number'))
+            if c.tag == "uuid":
+                self.uuid = c.text
 
 
 class LibvirtConfigGuestRng(LibvirtConfigGuestDevice):
