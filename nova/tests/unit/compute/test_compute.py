@@ -18,6 +18,7 @@
 """Tests for compute service."""
 
 import datetime
+import fixtures as std_fixtures
 from itertools import chain
 import operator
 import sys
@@ -6144,9 +6145,15 @@ class ComputeTestCase(BaseTestCase,
         # Confirm setup_compute_volume is called when volume is mounted.
         def stupid(*args, **kwargs):
             return fake_network.fake_get_instance_nw_info(self)
+
         if CONF.use_neutron:
             self.stub_out(
                 'nova.network.neutronv2.api.API.get_instance_nw_info', stupid)
+            self.useFixture(
+                std_fixtures.MonkeyPatch(
+                    'nova.network.neutronv2.api.'
+                    'API.supports_port_binding_extension',
+                    lambda *args: True))
         else:
             self.stub_out('nova.network.api.API.get_instance_nw_info', stupid)
 
@@ -6157,6 +6164,9 @@ class ComputeTestCase(BaseTestCase,
         fake_notifier.NOTIFICATIONS = []
         migrate_data = objects.LibvirtLiveMigrateData(
             is_shared_instance_path=False)
+        vifs = migrate_data_obj.VIFMigrateData.create_skeleton_migrate_vifs(
+                stupid())
+        migrate_data.vifs = vifs
         mock_pre.return_value = migrate_data
 
         with mock.patch.object(self.compute.network_api,
@@ -6484,8 +6494,9 @@ class ComputeTestCase(BaseTestCase,
             mock.patch.object(
                 self.compute.network_api, 'setup_networks_on_host'),
             mock.patch.object(migration_obj, 'save'),
+            mock.patch.object(instance, 'get_network_info', return_value=[]),
         ) as (
-            mock_migrate, mock_setup, mock_mig_save
+            mock_migrate, mock_setup, mock_mig_save, mock_get_nw_info
         ):
             self.compute._post_live_migration(c, instance, dest,
                                               migrate_data=migrate_data,
@@ -6497,6 +6508,7 @@ class ComputeTestCase(BaseTestCase,
         mock_migrate.assert_called_once_with(c, instance, migration)
         mock_post.assert_called_once_with(c, instance, False, dest)
         mock_clear.assert_called_once_with(mock.ANY)
+        mock_get_nw_info.assert_called()
 
     @mock.patch('nova.compute.utils.notify_about_instance_action')
     def test_post_live_migration_working_correctly(self, mock_notify):
@@ -6539,12 +6551,15 @@ class ComputeTestCase(BaseTestCase,
                               'clear_events_for_instance'),
             mock.patch.object(self.compute, 'update_available_resource'),
             mock.patch.object(migration_obj, 'save'),
+            mock.patch.object(instance, 'get_network_info'),
         ) as (
             post_live_migration, unfilter_instance,
             migrate_instance_start, post_live_migration_at_destination,
             post_live_migration_at_source, setup_networks_on_host,
-            clear_events, update_available_resource, mig_save
+            clear_events, update_available_resource, mig_save, get_nw_info,
         ):
+            nw_info = network_model.NetworkInfo.hydrate([])
+            get_nw_info.return_value = nw_info
             self.compute._post_live_migration(c, instance, dest,
                                               migrate_data=migrate_data,
                                               source_bdms=bdms)
@@ -6567,7 +6582,7 @@ class ComputeTestCase(BaseTestCase,
             post_live_migration_at_destination.assert_has_calls([
                 mock.call(c, instance, False, dest)])
             post_live_migration_at_source.assert_has_calls(
-                [mock.call(c, instance, [])])
+                [mock.call(c, instance, nw_info)])
             clear_events.assert_called_once_with(instance)
             update_available_resource.assert_has_calls([mock.call(c)])
             self.assertEqual('completed', migration_obj.status)
@@ -9130,6 +9145,7 @@ class ComputeAPITestCase(BaseTestCase):
                      'image_ramdisk_id': uuids.ramdisk_id,
                      'image_something_else': 'meow',
                      'preserved': 'preserve this!',
+                     'image_base_image_ref': image_ref,
                      'boot_roles': ''},
                     sys_meta)
 

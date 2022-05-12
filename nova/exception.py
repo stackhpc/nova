@@ -254,6 +254,11 @@ class TooManyDiskDevices(InvalidBDM):
     code = 403
 
 
+class InvalidBDMDiskBus(InvalidBDM):
+    msg_fmr = _("Block Device Mapping is invalid: The provided disk bus "
+                "%(disk_bus)s is not valid.")
+
+
 class InvalidAttribute(Invalid):
     msg_fmt = _("Attribute not supported: %(attr)s")
 
@@ -613,6 +618,11 @@ class ImageUnacceptable(Invalid):
 class ImageBadRequest(Invalid):
     msg_fmt = _("Request of image %(image_id)s got BadRequest response: "
                 "%(response)s")
+
+
+class ImageQuotaExceeded(NovaException):
+    msg_fmt = _("Quota exceeded or out of space for image %(image_id)s "
+                "in the image service.")
 
 
 class InstanceUnacceptable(Invalid):
@@ -2536,7 +2546,7 @@ class PMEMNamespaceConfigInvalid(NovaException):
                 "please check your conf file. ")
 
 
-class GetPMEMNamespaceFailed(NovaException):
+class GetPMEMNamespacesFailed(NovaException):
     msg_fmt = _("Get PMEM namespaces on host failed: %(reason)s.")
 
 
