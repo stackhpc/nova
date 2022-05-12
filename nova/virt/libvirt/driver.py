@@ -597,6 +597,22 @@ class LibvirtDriver(driver.ComputeDriver):
                                                   driver_cache)
             conf.driver_cache = cache_mode
 
+        # NOTE(acewit): If the [libvirt]disk_cachemodes is set as
+        # `block=writeback` or `block=writethrough` or `block=unsafe`,
+        # whose correponding Linux's IO semantic is not O_DIRECT in
+        # file nova.conf, then it will result in an attachment failure
+        # because of the libvirt bug
+        # (https://bugzilla.redhat.com/show_bug.cgi?id=1086704)
+        if ((getattr(conf, 'driver_io', None) == "native") and
+                conf.driver_cache not in [None, 'none', 'directsync']):
+            conf.driver_io = "threads"
+            LOG.warning("The guest disk driver io mode has fallen back "
+                        "from 'native' to 'threads' because the "
+                        "disk cache mode is set as %(cachemode)s, which does"
+                        "not use O_DIRECT. See the following bug report "
+                        "for more details: https://launchpad.net/bugs/1841363",
+                        {'cachemode': conf.driver_cache})
+
     def _do_quality_warnings(self):
         """Warn about potential configuration issues.
 
@@ -2621,6 +2637,10 @@ class LibvirtDriver(driver.ComputeDriver):
         libvirt_utils.extract_snapshot(disk_delta, 'qcow2',
                                        out_path, image_format)
 
+        # Remove the disk_delta file once the snapshot extracted, so that
+        # it doesn't hang around till the snapshot gets uploaded
+        fileutils.delete_if_exists(disk_delta)
+
     def _volume_snapshot_update_status(self, context, snapshot_id, status):
         """Send a snapshot status update to Cinder.
 
@@ -2841,31 +2861,14 @@ class LibvirtDriver(driver.ComputeDriver):
         timer.start(interval=0.5).wait()
 
     @staticmethod
-    def _rebase_with_qemu_img(guest, device, active_disk_object,
-                              rebase_base):
-        """Rebase a device tied to a guest using qemu-img.
+    def _rebase_with_qemu_img(source_path, rebase_base):
+        """Rebase a disk using qemu-img.
 
-        :param guest:the Guest which owns the device being rebased
-        :type guest: nova.virt.libvirt.guest.Guest
-        :param device: the guest block device to rebase
-        :type device: nova.virt.libvirt.guest.BlockDevice
-        :param active_disk_object: the guest block device to rebase
-        :type active_disk_object: nova.virt.libvirt.config.\
-                                    LibvirtConfigGuestDisk
+        :param source_path: the disk source path to rebase
+        :type source_path: string
         :param rebase_base: the new parent in the backing chain
         :type rebase_base: None or string
         """
-
-        # It's unsure how well qemu-img handles network disks for
-        # every protocol. So let's be safe.
-        active_protocol = active_disk_object.source_protocol
-        if active_protocol is not None:
-            msg = _("Something went wrong when deleting a volume snapshot: "
-                    "rebasing a %(protocol)s network disk using qemu-img "
-                    "has not been fully tested") % {'protocol':
-                    active_protocol}
-            LOG.error(msg)
-            raise exception.InternalError(msg)
 
         if rebase_base is None:
             # If backing_file is specified as "" (the empty string), then
@@ -2877,11 +2880,20 @@ class LibvirtDriver(driver.ComputeDriver):
             # If the rebased image is going to have a backing file then
             # explicitly set the backing file format to avoid any security
             # concerns related to file format auto detection.
-            backing_file = rebase_base
+            if os.path.isabs(rebase_base):
+                backing_file = rebase_base
+            else:
+                # this is a probably a volume snapshot case where the
+                # rebase_base is relative. See bug
+                # https://bugs.launchpad.net/nova/+bug/1885528
+                backing_file_name = os.path.basename(rebase_base)
+                volume_path = os.path.dirname(source_path)
+                backing_file = os.path.join(volume_path, backing_file_name)
+
             b_file_fmt = images.qemu_img_info(backing_file).file_format
             qemu_img_extra_arg = ['-F', b_file_fmt]
 
-        qemu_img_extra_arg.append(active_disk_object.source_path)
+        qemu_img_extra_arg.append(source_path)
         # execute operation with disk concurrency semaphore
         with compute_utils.disk_ops_semaphore:
             processutils.execute("qemu-img", "rebase", "-b", backing_file,
@@ -3044,7 +3056,18 @@ class LibvirtDriver(driver.ComputeDriver):
             else:
                 LOG.debug('Guest is not running so doing a block rebase '
                           'using "qemu-img rebase"', instance=instance)
-                self._rebase_with_qemu_img(guest, dev, active_disk_object,
+
+                # It's unsure how well qemu-img handles network disks for
+                # every protocol. So let's be safe.
+                active_protocol = active_disk_object.source_protocol
+                if active_protocol is not None:
+                    msg = _("Something went wrong when deleting a volume "
+                            "snapshot: rebasing a %(protocol)s network disk "
+                            "using qemu-img has not been fully tested"
+                           ) % {'protocol': active_protocol}
+                    LOG.error(msg)
+                    raise exception.InternalError(msg)
+                self._rebase_with_qemu_img(active_disk_object.source_path,
                                            rebase_base)
 
         else:
@@ -4001,9 +4024,24 @@ class LibvirtDriver(driver.ComputeDriver):
                 backend.create_snap(libvirt_utils.RESIZE_SNAPSHOT_NAME)
             if backend.SUPPORTS_CLONE:
                 def clone_fallback_to_fetch(*args, **kwargs):
+                    refuse_fetch = (
+                        CONF.libvirt.images_type == 'rbd' and
+                        CONF.workarounds.never_download_image_if_on_rbd)
                     try:
                         backend.clone(context, disk_images['image_id'])
                     except exception.ImageUnacceptable:
+                        if refuse_fetch:
+                            # Re-raise the exception from the failed
+                            # ceph clone.  The compute manager expects
+                            # ImageUnacceptable as a possible result
+                            # of spawn(), from which this is called.
+                            with excutils.save_and_reraise_exception():
+                                LOG.warning(
+                                    'Image %s is not on my ceph and '
+                                    '[workarounds]/'
+                                    'never_download_image_if_on_rbd=True;'
+                                    ' refusing to fetch and upload.',
+                                    disk_images['image_id'])
                         libvirt_utils.fetch_image(*args, **kwargs)
                 fetch_func = clone_fallback_to_fetch
             else:
@@ -4011,6 +4049,14 @@ class LibvirtDriver(driver.ComputeDriver):
             self._try_fetch_image_cache(backend, fetch_func, context,
                                         root_fname, disk_images['image_id'],
                                         instance, size, fallback_from_host)
+
+            # During unshelve on Qcow2 backend, we spawn() using snapshot image
+            # created during shelve. Extra work is needed in order to rebase
+            # disk image to its original image_ref. Disk backing file will
+            # then represent back image_ref instead of shelved image.
+            if (instance.vm_state == vm_states.SHELVED_OFFLOADED and
+                   isinstance(backend, imagebackend.Qcow2)):
+                self._finalize_unshelve_qcow2_image(context, instance, backend)
 
             if need_inject:
                 self._inject_data(backend, instance, injection_info)
@@ -4020,6 +4066,36 @@ class LibvirtDriver(driver.ComputeDriver):
                         'instance is not supported', instance=instance)
 
         return created_disks
+
+    def _finalize_unshelve_qcow2_image(self, context, instance, backend):
+        # NOTE(aarents): During qcow2 instance unshelve, backing file
+        # represents shelved image, not original instance.image_ref.
+        # We rebase here instance disk to original image.
+        # This second fetch call does nothing except downloading original
+        # backing file if missing, as image disk have already been
+        # created/resized by first fetch call.
+        base_dir = self.image_cache_manager.cache_dir
+        base_image_ref = instance.system_metadata.get('image_base_image_ref')
+        root_fname = imagecache.get_cache_fname(base_image_ref)
+        base_backing_fname = os.path.join(base_dir, root_fname)
+
+        try:
+            self._try_fetch_image_cache(backend, libvirt_utils.fetch_image,
+                                        context, root_fname, base_image_ref,
+                                        instance, None)
+        except exception.ImageNotFound:
+            # We must flatten here in order to remove dependency with an orphan
+            # backing file (as shelved image will be dropped once unshelve
+            # is successfull).
+            LOG.warning('Current disk image is created on top of shelved '
+                        'image and cannot be rebased to original image '
+                        'because it is no longer available in the image '
+                        'service, disk will be consequently flattened.',
+                        instance=instance)
+            base_backing_fname = None
+
+        LOG.info('Rebasing disk image.', instance=instance)
+        self._rebase_with_qemu_img(backend.path, base_backing_fname)
 
     def _create_configdrive(self, context, instance, injection_info,
                             rescue=False):
@@ -5106,7 +5182,9 @@ class LibvirtDriver(driver.ComputeDriver):
             flavor):
         hide_hypervisor_id = (strutils.bool_from_string(
                 flavor.extra_specs.get('hide_hypervisor_id')) or
-            image_meta.properties.get('img_hide_hypervisor_id'))
+                strutils.bool_from_string(
+                    flavor.extra_specs.get('hw:hide_hypervisor_id')) or
+                image_meta.properties.get('img_hide_hypervisor_id'))
 
         if virt_type == "xen":
             # PAE only makes sense in X86
@@ -5214,7 +5292,7 @@ class LibvirtDriver(driver.ComputeDriver):
             raise exception.RequestedVRamTooHigh(req_vram=video_ram,
                                                  max_vram=max_vram)
         if max_vram and video_ram:
-            video.vram = video_ram * units.Mi / units.Ki
+            video.vram = video_ram * units.Mi // units.Ki
         guest.add_device(video)
 
         # NOTE(sean-k-mooney): return the video device we added

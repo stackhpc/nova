@@ -4447,6 +4447,19 @@ class LibvirtConnTestCase(test.NoDBTestCase,
     def test_get_guest_config_windows_hyperv_all_hide_flv(self):
         # Similar to test_get_guest_config_windows_hyperv_feature2
         #   but also test hiding the HyperV signature with the flavor
+        #   extra_spec "hw:hide_hypervisor_id"
+        flavor_hide_id = fake_flavor.fake_flavor_obj(self.context,
+            extra_specs={"hw:hide_hypervisor_id": "true"},
+            expected_attrs={"extra_specs"})
+        # this works for kvm (the default, tested below) and qemu
+        self.flags(virt_type='qemu', group='libvirt')
+
+        self._test_get_guest_config_windows_hyperv(
+            flavor=flavor_hide_id, hvid_hidden=True)
+
+    def test_get_guest_config_windows_hyperv_all_hide_flv_old(self):
+        # Similar to test_get_guest_config_windows_hyperv_feature2
+        #   but also test hiding the HyperV signature with the flavor
         #   extra_spec "hide_hypervisor_id"
         flavor_hide_id = fake_flavor.fake_flavor_obj(self.context,
             extra_specs={"hide_hypervisor_id": "true"},
@@ -4471,10 +4484,10 @@ class LibvirtConnTestCase(test.NoDBTestCase,
     def test_get_guest_config_windows_hyperv_all_hide_flv_img(self):
         # Similar to test_get_guest_config_windows_hyperv_feature2
         #   but also test hiding the HyperV signature with both the flavor
-        #   extra_spec "hide_hypervisor_id" and the image property
+        #   extra_spec "hw:hide_hypervisor_id" and the image property
         #   "img_hide_hypervisor_id"
         flavor_hide_id = fake_flavor.fake_flavor_obj(self.context,
-            extra_specs={"hide_hypervisor_id": "true"},
+            extra_specs={"hw:hide_hypervisor_id": "true"},
             expected_attrs={"extra_specs"})
         self.flags(virt_type='qemu', group='libvirt')
 
@@ -6087,7 +6100,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
 
         self.assertEqual(cfg.devices[4].type, "spice")
         self.assertEqual(cfg.devices[5].type, "qxl")
-        self.assertEqual(cfg.devices[5].vram, 64 * units.Mi / units.Ki)
+        self.assertEqual(cfg.devices[5].vram, 65536)
 
     def _test_add_video_driver(self, model):
         self.flags(virt_type='kvm', group='libvirt')
@@ -6098,15 +6111,19 @@ class LibvirtConnTestCase(test.NoDBTestCase,
 
         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
         guest = vconfig.LibvirtConfigGuest()
-        instance_ref = objects.Instance(**self.test_instance)
-        flavor = instance_ref.get_flavor()
+        flavor = objects.Flavor(
+            extra_specs={'hw_video:ram_max_mb': '512'})
         image_meta = objects.ImageMeta.from_dict({
-            'properties': {'hw_video_model': model}})
+            'properties': {
+                'hw_video_model': model,
+                'hw_video_ram': 8,
+            },
+        })
 
         self.assertTrue(drvr._guest_add_video_device(guest))
-        video = drvr._add_video_driver(guest, image_meta,
-                                       flavor)
+        video = drvr._add_video_driver(guest, image_meta, flavor)
         self.assertEqual(model, video.type)
+        self.assertEqual(8192, video.vram)  # should be in bytes
 
     def test__add_video_driver(self):
         self._test_add_video_driver('qxl')
@@ -6518,7 +6535,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
             self):
         # Input to the test: flavor extra_specs
         flavor_hide_id = fake_flavor.fake_flavor_obj(self.context,
-            extra_specs={"hide_hypervisor_id": "true"},
+            extra_specs={"hw:hide_hypervisor_id": "true"},
             expected_attrs={"extra_specs"})
 
         self.flags(virt_type='kvm', group='libvirt')
@@ -6544,7 +6561,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
         # Input to the test: image metadata (true) and flavor
         #     extra_specs (true)
         flavor_hide_id = fake_flavor.fake_flavor_obj(self.context,
-            extra_specs={"hide_hypervisor_id": "true"},
+            extra_specs={"hw:hide_hypervisor_id": "true"},
             expected_attrs={"extra_specs"})
         image_meta = objects.ImageMeta.from_dict({
             "disk_format": "raw",
@@ -6571,7 +6588,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
         # Input to the test: image metadata (false) and flavor
         #     extra_specs (true)
         flavor_hide_id = fake_flavor.fake_flavor_obj(self.context,
-            extra_specs={"hide_hypervisor_id": "true"},
+            extra_specs={"hw:hide_hypervisor_id": "true"},
             expected_attrs={"extra_specs"})
         image_meta = objects.ImageMeta.from_dict({
             "disk_format": "raw",
@@ -6596,7 +6613,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
         # Input to the test: image metadata (true) and flavor
         #     extra_specs (false)
         flavor_hide_id = fake_flavor.fake_flavor_obj(self.context,
-            extra_specs={"hide_hypervisor_id": "false"},
+            extra_specs={"hw:hide_hypervisor_id": "false"},
             expected_attrs={"extra_specs"})
         image_meta = objects.ImageMeta.from_dict({
             "disk_format": "raw",
@@ -6643,7 +6660,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
     def test_get_guest_config_without_hiding_hypervisor_id_flavor_extra_specs(
             self):
         flavor_hide_id = fake_flavor.fake_flavor_obj(self.context,
-            extra_specs={"hide_hypervisor_id": "false"},
+            extra_specs={"hw:hide_hypervisor_id": "false"},
             expected_attrs={"extra_specs"})
 
         self.flags(virt_type='qemu', group='libvirt')
@@ -17727,6 +17744,51 @@ class LibvirtConnTestCase(test.NoDBTestCase,
         drvr._set_cache_mode(fake_conf)
         self.assertEqual('none', fake_conf.driver_cache)
 
+    def _make_fake_conf(self, cache=None):
+        if cache:
+            self.flags(disk_cachemodes=['block=' + cache], group='libvirt')
+        else:
+            self.flags(group='libvirt')
+        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
+        fake_conf = FakeConfigGuestDisk()
+        fake_conf.source_type = 'block'
+        fake_conf.driver_io = 'native'
+        drvr._set_cache_mode(fake_conf)
+        return fake_conf
+
+    def test_set_cache_mode_driver_io_writeback(self):
+        """Tests that when conf.driver_io is 'native' and driver_cache is
+        'writeback', then conf.driver_io is forced to 'threads'
+        """
+        fake_conf = self._make_fake_conf('writeback')
+        self.assertEqual('writeback', fake_conf.driver_cache)
+        self.assertEqual('threads', fake_conf.driver_io)
+
+    def test_set_cache_mode_driver_io_writethrough(self):
+        """Tests that when conf.driver_io is 'native' and driver_cache is
+        'writethrough', then conf.driver_io is forced to 'threads'
+        """
+        fake_conf = self._make_fake_conf('writethrough')
+        self.assertEqual('writethrough', fake_conf.driver_cache)
+        self.assertEqual('threads', fake_conf.driver_io)
+
+    def test_set_cache_mode_driver_io_unsafe(self):
+        """Tests that when conf.driver_io is 'native' and driver_cache is
+        'unsafe', then conf.driver_io is forced to 'threads'
+        """
+        fake_conf = self._make_fake_conf('unsafe')
+        self.assertEqual('unsafe', fake_conf.driver_cache)
+        self.assertEqual('threads', fake_conf.driver_io)
+
+    def test_without_set_cache_mode_driver_io(self):
+        """Tests that when conf.driver_io is 'native' and driver_cache is
+        not set(this is default settings), then conf.driver_io is kept as
+        'native'
+        """
+        fake_conf = self._make_fake_conf()
+        self.assertIsNone(fake_conf.driver_cache)
+        self.assertEqual('native', fake_conf.driver_io)
+
     def test_set_cache_mode_invalid_mode(self):
         self.flags(disk_cachemodes=['file=FAKE'], group='libvirt')
         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
@@ -19142,10 +19204,11 @@ class LibvirtConnTestCase(test.NoDBTestCase,
         disconnect_volume.assert_called_once_with(self.context,
                 mock.sentinel.new_connection_info, instance)
 
+    @mock.patch.object(fileutils, 'delete_if_exists')
     @mock.patch('nova.virt.libvirt.guest.BlockDevice.is_job_complete')
     @mock.patch('nova.privsep.path.chown')
     def _test_live_snapshot(
-            self, mock_chown, mock_is_job_complete,
+            self, mock_chown, mock_is_job_complete, mock_delete,
             can_quiesce=False, require_quiesce=False):
         drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI())
         mock_dom = mock.MagicMock()
@@ -19203,6 +19266,7 @@ class LibvirtConnTestCase(test.NoDBTestCase,
             mock_chown.assert_called_once_with(dltfile, uid=os.getuid())
             mock_snapshot.assert_called_once_with(dltfile, "qcow2",
                                                   dstfile, "qcow2")
+            mock_delete.assert_called_once_with(dltfile)
             mock_define.assert_called_once_with(xmldoc)
             mock_quiesce.assert_any_call(mock.ANY, self.test_instance,
                                          mock.ANY, True)
@@ -21734,6 +21798,74 @@ class LibvirtDriverTestCase(test.NoDBTestCase, TraitsComparisonMixin):
         mock_rbd_driver.flatten.assert_called_once_with(
             mock.sentinel.rbd_name, pool=mock.sentinel.rbd_pool)
 
+    @mock.patch.object(libvirt_driver.LibvirtDriver, '_try_fetch_image_cache')
+    @mock.patch.object(libvirt_driver.LibvirtDriver, '_rebase_with_qemu_img')
+    def _test_unshelve_qcow2_rebase_image_during_create(self,
+            mock_rebase, mock_fetch, original_image_in_glance=True):
+        self.flags(images_type='qcow2', group='libvirt')
+
+        # Original image ref from where instance was created, before SHELVE
+        # occurs, base_root_fname is related backing file name.
+        base_image_ref = 'base_image_ref'
+        base_root_fname = imagecache.get_cache_fname(base_image_ref)
+        # Snapshot image ref created during SHELVE.
+        shelved_image_ref = 'shelved_image_ref'
+        shelved_root_fname = imagecache.get_cache_fname(shelved_image_ref)
+
+        # Instance state during unshelve spawn().
+        inst_params = {
+                'image_ref': shelved_image_ref,
+                'vm_state': vm_states.SHELVED_OFFLOADED,
+                'system_metadata': {'image_base_image_ref': base_image_ref}
+            }
+
+        instance = self._create_instance(params=inst_params)
+        disk_images = {'image_id': instance.image_ref}
+        instance_dir = libvirt_utils.get_instance_path(instance)
+        disk_path = os.path.join(instance_dir, 'disk')
+        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+
+        if original_image_in_glance:
+            # We expect final backing file is original image, not shelved one.
+            expected_backing_file = os.path.join(
+                    imagecache.ImageCacheManager().cache_dir,
+                    base_root_fname)
+        else:
+            # None means rebase will merge backing file into disk(flatten).
+            expected_backing_file = None
+            mock_fetch.side_effect = [
+                None,
+                exception.ImageNotFound(image_id=base_image_ref)
+            ]
+
+        drvr._create_and_inject_local_root(
+            self.context, instance, False, '', disk_images, None, None)
+
+        mock_fetch.assert_has_calls([
+            mock.call(test.MatchType(nova.virt.libvirt.imagebackend.Qcow2),
+                      libvirt_utils.fetch_image,
+                      self.context, shelved_root_fname, shelved_image_ref,
+                      instance, instance.root_gb * units.Gi, None),
+            mock.call(test.MatchType(nova.virt.libvirt.imagebackend.Qcow2),
+                      libvirt_utils.fetch_image,
+                      self.context, base_root_fname, base_image_ref,
+                      instance, None)])
+        mock_rebase.assert_called_once_with(disk_path, expected_backing_file)
+
+    def test_unshelve_qcow2_rebase_image_during_create(self):
+        # Original image is present in Glance. In that case the 2nd
+        # fetch succeeds and we rebase instance disk to original image backing
+        # file, instance is back to nominal state: after unshelve,
+        # instance.image_ref will match current backing file.
+        self._test_unshelve_qcow2_rebase_image_during_create()
+
+    def test_unshelve_qcow2_rebase_image_during_create_notfound(self):
+        # Original image is no longer available in Glance, so 2nd fetch
+        # will failed (HTTP 404). In that case qemu-img rebase will merge
+        # backing file into disk, removing backing file dependency.
+        self._test_unshelve_qcow2_rebase_image_during_create(
+                original_image_in_glance=False)
+
     @mock.patch('nova.virt.libvirt.driver.imagebackend')
     @mock.patch('nova.virt.libvirt.driver.LibvirtDriver._inject_data')
     @mock.patch('nova.virt.libvirt.driver.imagecache')
@@ -21751,6 +21883,52 @@ class LibvirtDriverTestCase(test.NoDBTestCase, TraitsComparisonMixin):
                                     '', disk_images, get_injection_info(),
                                     None)
         self.assertFalse(mock_inject.called)
+
+    @mock.patch('nova.virt.libvirt.utils.fetch_image')
+    @mock.patch('nova.virt.libvirt.storage.rbd_utils.RBDDriver')
+    @mock.patch.object(imagebackend, 'IMAGE_API')
+    def test_create_fetch_image_ceph_workaround(self, mock_image, mock_rbd,
+                                                mock_fetch):
+        # Make sure that rbd clone will fail as un-clone-able
+        mock_rbd.is_cloneable.return_value = False
+        # Make sure the rbd code thinks the image does not already exist
+        mock_rbd.return_value.exists.return_value = False
+        # Make sure the rbd code says the image is small
+        mock_rbd.return_value.size.return_value = 128 * units.Mi
+        # Make sure IMAGE_API.get() returns a raw image
+        mock_image.get.return_value = {'locations': [], 'disk_format': 'raw'}
+
+        instance = self._create_instance()
+        disk_images = {'image_id': 'foo'}
+        self.flags(images_type='rbd', group='libvirt')
+        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+
+        def do_create():
+            # Reset the fetch mock and run our driver method so we can
+            # check for called-ness after each attempt
+            mock_fetch.reset_mock()
+            drvr._create_and_inject_local_root(self.context,
+                                               instance,
+                                               False,
+                                               '',
+                                               disk_images,
+                                               get_injection_info(),
+                                               None)
+
+        # Do an image create with rbd
+        do_create()
+        # Make sure it tried fetch, which implies that it tried and
+        # failed to clone.
+        mock_fetch.assert_called()
+
+        # Enable the workaround
+        self.flags(never_download_image_if_on_rbd=True,
+                   group='workarounds')
+        # Ensure that we raise the original ImageUnacceptable from the
+        # failed clone...
+        self.assertRaises(exception.ImageUnacceptable, do_create)
+        # ...and ensure that we did _not_ try to fetch
+        mock_fetch.assert_not_called()
 
     @mock.patch('nova.virt.netutils.get_injected_network_template')
     @mock.patch('nova.virt.disk.api.inject_data')
@@ -23794,6 +23972,25 @@ class LibvirtDriverTestCase(test.NoDBTestCase, TraitsComparisonMixin):
 </cpu>
 '''], 1)
 
+    @mock.patch('nova.virt.images.qemu_img_info',
+                return_value=mock.Mock(file_format="fake_fmt"))
+    @mock.patch('oslo_concurrency.processutils.execute')
+    def test_rebase_with_qemu_img(self, mock_execute, mock_qemu_img_info):
+        """rebasing disk image to another backing file"""
+        self.drvr._rebase_with_qemu_img("disk", "backing_file")
+        mock_qemu_img_info.assert_called_once_with("backing_file")
+        mock_execute.assert_called_once_with('qemu-img', 'rebase',
+                                             '-b', 'backing_file', '-F',
+                                             'fake_fmt', 'disk')
+
+        # Flatten disk image when no backing file is given.
+        mock_qemu_img_info.reset_mock()
+        mock_execute.reset_mock()
+        self.drvr._rebase_with_qemu_img("disk", None)
+        self.assertEqual(0, mock_qemu_img_info.call_count)
+        mock_execute.assert_called_once_with('qemu-img', 'rebase',
+                                             '-b', '', 'disk')
+
 
 class LibvirtVolumeUsageTestCase(test.NoDBTestCase):
     """Test for LibvirtDriver.get_all_volume_usage."""
@@ -24413,8 +24610,23 @@ class LibvirtVolumeSnapshotTestCase(test.NoDBTestCase):
         not running should trigger a blockRebase using qemu-img not libvirt.
         In this test, we rebase the image with another image as backing file.
         """
+        dom_xml = """
+              <domain type='kvm'>
+                <devices>
+                  <disk type='file'>
+                     <source file='/var/lib/nova/instances/%s/disk1_file'/>
+                     <target dev='vda' bus='virtio'/>
+                     <serial>0e38683e-f0af-418f-a3f1-6b67ea0f919d</serial>
+                  </disk>
+                  <disk type='block'>
+                    <source dev='/path/to/dev/1'/>
+                    <target dev='vdb' bus='virtio' serial='1234'/>
+                  </disk>
+                </devices>
+              </domain>""" % self.inst['uuid']
+
         mock_domain, guest = self._setup_block_rebase_domain_and_guest_mocks(
-                                self.dom_xml)
+                                dom_xml)
 
         instance = objects.Instance(**self.inst)
         snapshot_id = 'snapshot-1234'
@@ -24425,10 +24637,13 @@ class LibvirtVolumeSnapshotTestCase(test.NoDBTestCase):
                                               self.delete_info_1)
 
         mock_disk_op_sema.__enter__.assert_called_once()
-        mock_qemu_img_info.assert_called_once_with("snap.img")
-        mock_execute.assert_called_once_with('qemu-img', 'rebase',
-                                             '-b', 'snap.img', '-F',
-                                             'fake_fmt', 'disk1_file')
+        mock_qemu_img_info.assert_called_once_with(
+            "/var/lib/nova/instances/%s/snap.img" % instance.uuid)
+        mock_execute.assert_called_once_with(
+            'qemu-img', 'rebase',
+            '-b', '/var/lib/nova/instances/%s/snap.img' % instance.uuid,
+            '-F', 'fake_fmt',
+            '/var/lib/nova/instances/%s/disk1_file' % instance.uuid)
 
     @mock.patch.object(compute_utils, 'disk_ops_semaphore')
     @mock.patch.object(host.Host, "has_min_version",
@@ -25423,6 +25638,15 @@ class LibvirtPMEMNamespaceTests(test.NoDBTestCase):
         vpmem_conf = ["4GB:ns_0", "SMALL:ns_0"]
         self.assertRaises(exception.PMEMNamespaceConfigInvalid,
                           drvr._discover_vpmems, vpmem_conf)
+
+    @mock.patch('nova.privsep.libvirt.get_pmem_namespaces')
+    def test_get_vpmems_on_host__exception(self, mock_get_ns):
+        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
+        mock_get_ns.side_effect = Exception('foo')
+
+        self.assertRaises(
+            exception.GetPMEMNamespacesFailed,
+            drvr._get_vpmems_on_host)
 
     @mock.patch('nova.virt.hardware.get_vpmems')
     def test_get_ordered_vpmems(self, mock_labels):
