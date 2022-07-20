@@ -102,8 +102,8 @@ class VGPUTestBase(base.ServersTestBase):
                                                    parent=libvirt_parent)})
         return uuid
 
-    def start_compute(self, hostname):
-        hostname = super().start_compute(
+    def start_compute_with_vgpu(self, hostname):
+        hostname = self.start_compute(
             pci_info=fakelibvirt.HostPCIDevicesInfo(
                 num_pci=0, num_pfs=0, num_vfs=0, num_mdevcap=2,
             ),
@@ -145,8 +145,7 @@ class VGPUTests(VGPUTestBase):
         self.policy.set_rules({
             'os_compute_api:os-instance-actions:events': 'rule:admin_or_owner'
         }, overwrite=False)
-
-        self.compute1 = self.start_compute('host1')
+        self.compute1 = self.start_compute_with_vgpu('host1')
 
     def assert_vgpu_usage_for_compute(self, compute, expected):
         total_usages = collections.defaultdict(int)
@@ -188,7 +187,7 @@ class VGPUTests(VGPUTestBase):
 
     def test_resize_servers_with_vgpu(self):
         # Add another compute for the sake of resizing
-        self.compute2 = self.start_compute('host2')
+        self.compute2 = self.start_compute_with_vgpu('host2')
         server = self._create_server(
             image_uuid='155d900f-4e14-4e4c-a73d-069cbf4541e6',
             flavor_id=self.flavor, host=self.compute1.host,
@@ -310,7 +309,7 @@ class VGPUMultipleTypesTests(VGPUTestBase):
         # Prepare traits for later on
         self._create_trait('CUSTOM_NVIDIA_11')
         self._create_trait('CUSTOM_NVIDIA_12')
-        self.compute1 = self.start_compute('host1')
+        self.compute1 = self.start_compute_with_vgpu('host1')
 
     def test_create_servers_with_vgpu(self):
         self._create_server(
@@ -342,13 +341,12 @@ class VGPUMultipleTypesTests(VGPUTestBase):
 
     def test_create_servers_with_specific_type(self):
         # Regenerate the PCI addresses so both pGPUs now support nvidia-12
-        connection = self.computes[
-            self.compute1.host].driver._host.get_connection()
-        connection.pci_info = fakelibvirt.HostPCIDevicesInfo(
+        pci_info = fakelibvirt.HostPCIDevicesInfo(
             num_pci=0, num_pfs=0, num_vfs=0, num_mdevcap=2,
             multiple_gpu_types=True)
         # Make a restart to update the Resource Providers
-        self.compute1 = self.restart_compute_service(self.compute1)
+        self.compute1 = self.restart_compute_service(
+            self.compute1.host, pci_info=pci_info, keep_hypervisor_state=False)
         pgpu1_rp_uuid = self._get_provider_uuid_by_name(
             self.compute1.host + '_' + fakelibvirt.PGPU1_PCI_ADDR)
         pgpu2_rp_uuid = self._get_provider_uuid_by_name(
