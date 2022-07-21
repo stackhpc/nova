@@ -122,6 +122,43 @@ class VGPUTestBase(base.ServersTestBase):
         self.assertEqual([], compute.driver._get_mediated_devices())
         return compute
 
+    def assert_mdev_usage(self, compute, expected_amount, instance=None,
+                          expected_rc=orc.VGPU, expected_rp_name=None):
+        """Verify the allocations for either a whole compute or just a
+           specific instance.
+           :param compute: the internal compute object
+           :param expected_amount: the expected amount of allocations
+           :param instance: if not None, a specific Instance to lookup instead
+                            of the whole compute allocations.
+           :param expected_rc: the expected resource class
+           :param expected_rp_name: the expected resource provider name if an
+                                    instance is provided.
+        """
+        total_usages = collections.defaultdict(int)
+        # We only want to get mdevs that are assigned to either all the
+        # instances or just one.
+        mdevs = compute.driver._get_all_assigned_mediated_devices(instance)
+        for mdev in mdevs:
+            mdev_name = libvirt_utils.mdev_uuid2name(mdev)
+            mdev_info = compute.driver._get_mediated_device_information(
+                mdev_name)
+            parent_name = mdev_info['parent']
+            parent_rp_name = compute.host + '_' + parent_name
+            parent_rp_uuid = self._get_provider_uuid_by_name(parent_rp_name)
+            parent_usage = self._get_provider_usages(parent_rp_uuid)
+            if (expected_rc in parent_usage and
+                parent_rp_name not in total_usages
+            ):
+                # We only set the total amount if we didn't had it already
+                total_usages[parent_rp_name] = parent_usage[expected_rc]
+            if expected_rp_name and instance is not None:
+                # If this is for an instance, all the mdevs should be in the
+                # same RP.
+                self.assertEqual(expected_rp_name, parent_rp_name)
+        self.assertEqual(expected_amount, len(mdevs))
+        self.assertEqual(expected_amount,
+                         sum(total_usages[k] for k in total_usages))
+
 
 class VGPUTests(VGPUTestBase):
 
