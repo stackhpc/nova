@@ -20,6 +20,7 @@ import testtools
 from oslo_config import cfg
 from oslo_log import log as logging
 
+import nova
 from nova.conf import neutron as neutron_conf
 from nova import context as nova_context
 from nova import objects
@@ -548,32 +549,8 @@ class NUMAServersTest(NUMAServersTestBase):
                    group='compute')
         self.flags(vcpu_pin_set=None)
 
-        host_info = fakelibvirt.HostInfo(cpu_nodes=2, cpu_sockets=1,
-                                         cpu_cores=2, cpu_threads=2,
-                                         kB_mem=15740000)
-
         # Start services
-        self.computes = {}
-        self.compute_rp_uuids = {}
-        for host in ['test_compute0', 'test_compute1']:
-            fake_connection = self._get_connection(
-                host_info=host_info, hostname=host)
-
-            # This is fun. Firstly we need to do a global'ish mock so we can
-            # actually start the service.
-            with mock.patch('nova.virt.libvirt.host.Host.get_connection',
-                            return_value=fake_connection):
-                compute = self.start_service('compute', host=host)
-
-            # Once that's done, we need to do some tweaks to each individual
-            # compute "service" to make sure they return unique objects
-            compute.driver._host.get_connection = lambda: fake_connection
-            self.computes[host] = compute
-
-            # and save the UUIDs for the corresponding resource providers
-            self.compute_rp_uuids[host] = self.placement_api.get(
-                '/resource_providers?name=%s' % host).body[
-                'resource_providers'][0]['uuid']
+        self.start_computes(save_rp_uuids=True)
 
         # Create server
         flavor_a_id = self._create_flavor(extra_spec={})
@@ -671,6 +648,86 @@ class NUMAServersTest(NUMAServersTestBase):
                     'usages']
             self.assertEqual(expected_usage, compute_usage)
 
+    def test_resize_bug_1879878(self):
+        """Resize a instance with a NUMA topology when confirm takes time.
+
+        Bug 1879878 describes a race between the periodic tasks of the resource
+        tracker and the libvirt virt driver. The virt driver expects to be the
+        one doing the unpinning of instances, however, the resource tracker is
+        stepping on the virt driver's toes.
+        """
+        self.flags(
+            cpu_dedicated_set='0-3', cpu_shared_set='4-7', group='compute')
+        self.flags(vcpu_pin_set=None)
+
+        orig_confirm = nova.virt.libvirt.driver.LibvirtDriver.confirm_migration
+
+        def fake_confirm_migration(*args, **kwargs):
+            # run periodics before finally running the confirm_resize routine,
+            # simulating a race between the resource tracker and the virt
+            # driver
+            self._run_periodics()
+
+            # then inspect the ComputeNode objects for our two hosts
+            src_numa_topology = objects.NUMATopology.obj_from_db_obj(
+                objects.ComputeNode.get_by_nodename(
+                    self.ctxt, src_host,
+                ).numa_topology,
+            )
+            dst_numa_topology = objects.NUMATopology.obj_from_db_obj(
+                objects.ComputeNode.get_by_nodename(
+                    self.ctxt, dst_host,
+                ).numa_topology,
+            )
+            self.assertEqual(2, len(src_numa_topology.cells[0].pinned_cpus))
+            self.assertEqual(2, len(dst_numa_topology.cells[0].pinned_cpus))
+
+            # before continuing with the actualy confirm process
+            return orig_confirm(*args, **kwargs)
+
+        self.stub_out(
+            'nova.virt.libvirt.driver.LibvirtDriver.confirm_migration',
+            fake_confirm_migration,
+        )
+
+        # start services
+        self.start_computes(save_rp_uuids=True)
+
+        # create server
+        flavor_a_id = self._create_flavor(
+            vcpu=2, extra_spec={'hw:cpu_policy': 'dedicated'})
+        server = self.api.post_server(
+            {'server': self._build_server(flavor_a_id)}
+        )
+        server = self._wait_for_state_change(server, 'BUILD')
+
+        src_host = server['OS-EXT-SRV-ATTR:host']
+
+        # we don't really care what the new flavor is, so long as the old
+        # flavor is using pinning. We use a similar flavor for simplicity.
+        flavor_b_id = self._create_flavor(
+            vcpu=2, extra_spec={'hw:cpu_policy': 'dedicated'})
+
+        # TODO(stephenfin): The mock of 'migrate_disk_and_power_off' should
+        # probably be less...dumb
+        with mock.patch(
+            'nova.virt.libvirt.driver.LibvirtDriver'
+            '.migrate_disk_and_power_off', return_value='{}',
+        ):
+            # TODO(stephenfin): Replace with a helper
+            post = {'resize': {'flavorRef': flavor_b_id}}
+            self.api.post_server_action(server['id'], post)
+            server = self._wait_for_state_change(server, 'VERIFY_RESIZE')
+
+        dst_host = server['OS-EXT-SRV-ATTR:host']
+
+        # Now confirm the resize
+
+        post = {'confirmResize': None}
+        self.api.post_server_action(server['id'], post)
+
+        server = self._wait_for_state_change(server, 'ACTIVE')
+
 
 class NUMAServerTestWithCountingQuotaFromPlacement(NUMAServersTest):
 
@@ -718,27 +775,7 @@ class ReshapeForPCPUsTest(NUMAServersTestBase):
                                          kB_mem=15740000)
 
         # Start services
-        self.computes = {}
-        self.compute_rp_uuids = {}
-        for host in ['test_compute0', 'test_compute1']:
-            fake_connection = self._get_connection(
-                host_info=host_info, hostname=host)
-
-            # This is fun. Firstly we need to do a global'ish mock so we can
-            # actually start the service.
-            with mock.patch('nova.virt.libvirt.host.Host.get_connection',
-                            return_value=fake_connection):
-                compute = self.start_service('compute', host=host)
-
-            # Once that's done, we need to do some tweaks to each individual
-            # compute "service" to make sure they return unique objects
-            compute.driver._host.get_connection = lambda: fake_connection
-            self.computes[host] = compute
-
-            # and save the UUIDs for the corresponding resource providers
-            self.compute_rp_uuids[host] = self.placement_api.get(
-                '/resource_providers?name=%s' % host).body[
-                'resource_providers'][0]['uuid']
+        self.start_computes(save_rp_uuids=True)
 
         # ensure there is no PCPU inventory being reported
 
@@ -1135,26 +1172,9 @@ class NUMAServersWithNetworksTest(NUMAServersTestBase):
         self.assertIn('NoValidHost', six.text_type(ex))
 
     def test_cold_migrate_with_physnet(self):
-        host_info = fakelibvirt.HostInfo(cpu_nodes=2, cpu_sockets=1,
-                                         cpu_cores=2, cpu_threads=2,
-                                         kB_mem=15740000)
 
         # Start services
-        self.computes = {}
-        for host in ['test_compute0', 'test_compute1']:
-            fake_connection = self._get_connection(
-                host_info=host_info, hostname=host)
-
-            # This is fun. Firstly we need to do a global'ish mock so we can
-            # actually start the service.
-            with mock.patch('nova.virt.libvirt.host.Host.get_connection',
-                            return_value=fake_connection):
-                compute = self.start_service('compute', host=host)
-
-            # Once that's done, we need to do some tweaks to each individual
-            # compute "service" to make sure they return unique objects
-            compute.driver._host.get_connection = lambda: fake_connection
-            self.computes[host] = compute
+        self.start_computes(save_rp_uuids=True)
 
         # Create server
         extra_spec = {'hw:numa_nodes': '1'}
