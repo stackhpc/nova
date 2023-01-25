@@ -4779,8 +4779,18 @@ class ComputeManager(manager.Manager):
                   self.host, instance=instance)
         # TODO(mriedem): Calculate provider mappings when we support
         # cross-cell resize/migrate with ports having resource requests.
-        self._finish_revert_resize_network_migrate_finish(
-            ctxt, instance, migration, provider_mappings=None)
+        # NOTE(hanrong): we need to change migration.dest_compute to
+        # source host temporarily.
+        # "network_api.migrate_instance_finish" will setup the network
+        # for the instance on the destination host. For revert resize,
+        # the instance will back to the source host, the setup of the
+        # network for instance should be on the source host. So set
+        # the migration.dest_compute to source host at here.
+        with utils.temporary_mutation(
+            migration, dest_compute=migration.source_compute
+        ):
+            self.network_api.migrate_instance_finish(
+                ctxt, instance, migration, provider_mappings=None)
         network_info = self.network_api.get_instance_nw_info(ctxt, instance)
 
         # Remember that prep_snapshot_based_resize_at_source destroyed the
@@ -4872,50 +4882,6 @@ class ComputeManager(manager.Manager):
             self.compute_rpcapi.finish_revert_resize(context, instance,
                     migration, migration.source_compute, request_spec)
 
-    def _finish_revert_resize_network_migrate_finish(
-            self, context, instance, migration, provider_mappings):
-        """Causes port binding to be updated. In some Neutron or port
-        configurations - see NetworkModel.get_bind_time_events() - we
-        expect the vif-plugged event from Neutron immediately and wait for it.
-        The rest of the time, the event is expected further along in the
-        virt driver, so we don't wait here.
-
-        :param context: The request context.
-        :param instance: The instance undergoing the revert resize.
-        :param migration: The Migration object of the resize being reverted.
-        :param provider_mappings: a dict of list of resource provider uuids
-            keyed by port uuid
-        :raises: eventlet.timeout.Timeout or
-                 exception.VirtualInterfacePlugException.
-        """
-        network_info = instance.get_network_info()
-        events = []
-        deadline = CONF.vif_plugging_timeout
-        if deadline and network_info:
-            events = network_info.get_bind_time_events(migration)
-            if events:
-                LOG.debug('Will wait for bind-time events: %s', events)
-        error_cb = self._neutron_failed_migration_callback
-        try:
-            with self.virtapi.wait_for_instance_event(instance, events,
-                                                      deadline=deadline,
-                                                      error_callback=error_cb):
-                # NOTE(hanrong): we need to change migration.dest_compute to
-                # source host temporarily.
-                # "network_api.migrate_instance_finish" will setup the network
-                # for the instance on the destination host. For revert resize,
-                # the instance will back to the source host, the setup of the
-                # network for instance should be on the source host. So set
-                # the migration.dest_compute to source host at here.
-                with utils.temporary_mutation(
-                        migration, dest_compute=migration.source_compute):
-                    self.network_api.migrate_instance_finish(
-                        context, instance, migration, provider_mappings)
-        except eventlet.timeout.Timeout:
-            with excutils.save_and_reraise_exception():
-                LOG.error('Timeout waiting for Neutron events: %s', events,
-                          instance=instance)
-
     @wrap_exception()
     @reverts_task_state
     @wrap_instance_event(prefix='compute')
@@ -4973,8 +4939,18 @@ class ComputeManager(manager.Manager):
 
             self.network_api.setup_networks_on_host(context, instance,
                                                     migration.source_compute)
-            self._finish_revert_resize_network_migrate_finish(
-                context, instance, migration, provider_mappings)
+            # NOTE(hanrong): we need to change migration.dest_compute to
+            # source host temporarily. "network_api.migrate_instance_finish"
+            # will setup the network for the instance on the destination host.
+            # For revert resize, the instance will back to the source host, the
+            # setup of the network for instance should be on the source host.
+            # So set the migration.dest_compute to source host at here.
+            with utils.temporary_mutation(
+                    migration, dest_compute=migration.source_compute):
+                self.network_api.migrate_instance_finish(context,
+                                                         instance,
+                                                         migration,
+                                                         provider_mappings)
             network_info = self.network_api.get_instance_nw_info(context,
                                                                  instance)
 
@@ -5051,8 +5027,7 @@ class ComputeManager(manager.Manager):
             # the provider mappings. If the instance has ports with
             # resource request then the port update will fail in
             # _update_port_binding_for_instance() called via
-            # _finish_revert_resize_network_migrate_finish() in
-            # finish_revert_resize.
+            # migrate_instance_finish() in finish_revert_resize.
             provider_mappings = None
         return provider_mappings
 
@@ -8255,8 +8230,8 @@ class ComputeManager(manager.Manager):
         return migrate_data
 
     @staticmethod
-    def _neutron_failed_migration_callback(event_name, instance):
-        msg = ('Neutron reported failure during migration '
+    def _neutron_failed_live_migration_callback(event_name, instance):
+        msg = ('Neutron reported failure during live migration '
                'with %(event)s for instance %(uuid)s')
         msg_args = {'event': event_name, 'uuid': instance.uuid}
         if CONF.vif_plugging_is_fatal:
@@ -8352,7 +8327,7 @@ class ComputeManager(manager.Manager):
                 disk = None
 
             deadline = CONF.vif_plugging_timeout
-            error_cb = self._neutron_failed_migration_callback
+            error_cb = self._neutron_failed_live_migration_callback
             # In order to avoid a race with the vif plugging that the virt
             # driver does on the destination host, we register our events
             # to wait for before calling pre_live_migration. Then if the
@@ -8460,8 +8435,9 @@ class ComputeManager(manager.Manager):
         # host attachment. We fetch BDMs before that to retain connection_info
         # and attachment_id relating to the source host for post migration
         # cleanup.
-        post_live_migration = functools.partial(self._post_live_migration,
-                                                source_bdms=source_bdms)
+        post_live_migration = functools.partial(
+            self._post_live_migration_update_host, source_bdms=source_bdms
+            )
         rollback_live_migration = functools.partial(
             self._rollback_live_migration, source_bdms=source_bdms)
 
@@ -8588,15 +8564,41 @@ class ComputeManager(manager.Manager):
             migration, future = (
                 self._waiting_live_migrations.pop(instance.uuid))
             if future and future.cancel():
-                # If we got here, we've successfully aborted the queued
-                # migration and _do_live_migration won't run so we need
-                # to set the migration status to cancelled and send the
-                # notification. If Future.cancel() fails, it means
-                # _do_live_migration is running and the migration status
-                # is preparing, and _do_live_migration() itself will attempt
-                # to pop the queued migration, hit a KeyError, and rollback,
-                # set the migration to cancelled and send the
-                # live.migration.abort.end notification.
+                # If we got here, we've successfully dropped a queued
+                # migration from the queue, so _do_live_migration won't run
+                # and we only need to revert minor changes introduced by Nova
+                # control plane (port bindings, resource allocations and
+                # instance's PCI devices), restore VM's state, set the
+                # migration's status to cancelled and send the notification.
+                # If Future.cancel() fails, it means _do_live_migration is
+                # running and the migration status is preparing, and
+                # _do_live_migration() itself will attempt to pop the queued
+                # migration, hit a KeyError, and rollback, set the migration
+                # to cancelled and send the live.migration.abort.end
+                # notification.
+                self._revert_allocation(context, instance, migration)
+                try:
+                    # This call will delete any inactive destination host
+                    # port bindings.
+                    self.network_api.setup_networks_on_host(
+                        context, instance, host=migration.dest_compute,
+                        teardown=True)
+                except exception.PortBindingDeletionFailed as e:
+                    # Removing the inactive port bindings from the destination
+                    # host is not critical so just log an error but don't fail.
+                    LOG.error(
+                        'Network cleanup failed for destination host %s '
+                        'during live migration rollback. You may need to '
+                        'manually clean up resources in the network service. '
+                        'Error: %s', migration.dest_compute, str(e))
+                except Exception:
+                    with excutils.save_and_reraise_exception():
+                        LOG.exception(
+                            'An error occurred while cleaning up networking '
+                            'during live migration rollback.',
+                            instance=instance)
+                instance.task_state = None
+                instance.save(expected_task_state=[task_states.MIGRATING])
                 self._set_migration_status(migration, 'cancelled')
         except KeyError:
             migration = objects.Migration.get_by_id(context, migration_id)
@@ -8707,6 +8709,42 @@ class ComputeManager(manager.Manager):
                                   bdm.attachment_id, self.host,
                                   str(e), instance=instance)
 
+    # TODO(sean-k-mooney): add typing
+    def _post_live_migration_update_host(
+        self, ctxt, instance, dest, block_migration=False,
+        migrate_data=None, source_bdms=None
+    ):
+        try:
+            self._post_live_migration(
+                ctxt, instance, dest, block_migration, migrate_data,
+                source_bdms)
+        except Exception:
+            # Restore the instance object
+            node_name = None
+            try:
+                # get node name of compute, where instance will be
+                # running after migration, that is destination host
+                compute_node = self._get_compute_info(ctxt, dest)
+                node_name = compute_node.hypervisor_hostname
+            except exception.ComputeHostNotFound:
+                LOG.exception('Failed to get compute_info for %s', dest)
+
+            # we can never rollback from post live migration and we can only
+            # get here if the instance is running on the dest so we ensure
+            # the instance.host is set correctly and reraise the original
+            # exception unmodified.
+            if instance.host != dest:
+                # apply saves the new fields while drop actually removes the
+                # migration context from the instance, so migration persists.
+                instance.apply_migration_context()
+                instance.drop_migration_context()
+                instance.host = dest
+                instance.task_state = None
+                instance.node = node_name
+                instance.progress = 0
+                instance.save()
+            raise
+
     @wrap_exception()
     @wrap_instance_fault
     def _post_live_migration(self, ctxt, instance, dest,
@@ -8718,7 +8756,7 @@ class ComputeManager(manager.Manager):
         and mainly updating database record.
 
         :param ctxt: security context
-        :param instance: instance dict
+        :param instance: instance object
         :param dest: destination host
         :param block_migration: if true, prepare for block migration
         :param migrate_data: if not None, it is a dict which has data

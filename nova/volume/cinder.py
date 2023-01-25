@@ -25,7 +25,6 @@ import sys
 import urllib
 
 from cinderclient import api_versions as cinder_api_versions
-from cinderclient import apiclient as cinder_apiclient
 from cinderclient import client as cinder_client
 from cinderclient import exceptions as cinder_exception
 from keystoneauth1 import exceptions as keystone_exception
@@ -567,7 +566,8 @@ class API(object):
     @translate_volume_exception
     @retrying.retry(stop_max_attempt_number=5,
                     retry_on_exception=lambda e:
-                    type(e) == cinder_apiclient.exceptions.InternalServerError)
+                    (isinstance(e, cinder_exception.ClientException) and
+                     e.code == 500))
     def detach(self, context, volume_id, instance_uuid=None,
                attachment_id=None):
         client = cinderclient(context)
@@ -632,7 +632,8 @@ class API(object):
     @translate_volume_exception
     @retrying.retry(stop_max_attempt_number=5,
                     retry_on_exception=lambda e:
-                    type(e) == cinder_apiclient.exceptions.InternalServerError)
+                    (isinstance(e, cinder_exception.ClientException) and
+                     e.code == 500))
     def terminate_connection(self, context, volume_id, connector):
         return cinderclient(context).volumes.terminate_connection(volume_id,
                                                                   connector)
@@ -881,19 +882,24 @@ class API(object):
     @translate_attachment_exception
     @retrying.retry(stop_max_attempt_number=5,
                     retry_on_exception=lambda e:
-                    type(e) == cinder_apiclient.exceptions.InternalServerError)
+                    (isinstance(e, cinder_exception.ClientException) and
+                     e.code in (500, 504)))
     def attachment_delete(self, context, attachment_id):
         try:
             cinderclient(
                 context, '3.44', skip_version_check=True).attachments.delete(
                     attachment_id)
         except cinder_exception.ClientException as ex:
-            with excutils.save_and_reraise_exception():
-                LOG.error('Delete attachment failed for attachment '
-                          '%(id)s. Error: %(msg)s Code: %(code)s',
-                          {'id': attachment_id,
-                           'msg': str(ex),
-                           'code': getattr(ex, 'code', None)})
+            if ex.code == 404:
+                LOG.warning('Attachment %(id)s does not exist. Ignoring.',
+                            {'id': attachment_id})
+            else:
+                with excutils.save_and_reraise_exception():
+                    LOG.error('Delete attachment failed for attachment '
+                              '%(id)s. Error: %(msg)s Code: %(code)s',
+                              {'id': attachment_id,
+                               'msg': str(ex),
+                               'code': getattr(ex, 'code', None)})
 
     @translate_attachment_exception
     def attachment_complete(self, context, attachment_id):
