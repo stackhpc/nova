@@ -346,6 +346,14 @@ Related options:
 * :oslo.config:option:`image_cache.subdirectory_name`
 * :oslo.config:option:`update_resources_interval`
 """),
+    cfg.BoolOpt('skip_cpu_compare_on_dest',
+               default=False,
+               help="""
+With the libvirt driver, during live migration, skip comparing guest CPU
+with the destination host. When using QEMU >= 2.9 and libvirt >=
+4.4.0, libvirt will do the correct thing with respect to checking CPU
+compatibility on the destination host during live migration.
+"""),
 ]
 
 
