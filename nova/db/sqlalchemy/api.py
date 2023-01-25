@@ -690,7 +690,7 @@ def compute_node_search_by_hypervisor(context, hypervisor_match):
 
 
 @pick_context_manager_writer
-def compute_node_create(context, values):
+def _compute_node_create(context, values):
     """Creates a new ComputeNode and populates the capacity fields
     with the most recent data.
     """
@@ -698,8 +698,21 @@ def compute_node_create(context, values):
 
     compute_node_ref = models.ComputeNode()
     compute_node_ref.update(values)
+    compute_node_ref.save(context.session)
+    return compute_node_ref
+
+
+# NOTE(mgoddard): We avoid decorating this with @pick_context_manager_writer,
+# so that we get a separate transaction in the exception handler. This avoids
+# an error message about inactive DB sessions during a transaction rollback.
+# See https://bugs.launchpad.net/nova/+bug/1853159.
+def compute_node_create(context, values):
+    """Creates a new ComputeNode and populates the capacity fields
+    with the most recent data. Will restore a soft deleted compute node if a
+    UUID has been explicitly requested.
+    """
     try:
-        compute_node_ref.save(context.session)
+        compute_node_ref = _compute_node_create(context, values)
     except db_exc.DBDuplicateEntry:
         with excutils.save_and_reraise_exception(logger=LOG) as err_ctx:
             # Check to see if we have a (soft) deleted ComputeNode with the
@@ -763,14 +776,24 @@ def compute_node_update(context, compute_id, values):
 
 
 @pick_context_manager_writer
-def compute_node_delete(context, compute_id):
+def compute_node_delete(context, compute_id, constraint=None):
     """Delete a ComputeNode record."""
-    result = model_query(context, models.ComputeNode).\
-             filter_by(id=compute_id).\
-             soft_delete(synchronize_session=False)
+    query = model_query(context, models.ComputeNode).filter_by(id=compute_id)
+
+    if constraint is not None:
+        query = constraint.apply(models.ComputeNode, query)
+
+    result = query.soft_delete(synchronize_session=False)
 
     if not result:
-        raise exception.ComputeHostNotFound(host=compute_id)
+        # The soft_delete could fail for one of two reasons:
+        # 1) The compute node no longer exists
+        # 2) The constraint, if specified, was not met
+        # Try to read the compute node and let it raise ComputeHostNotFound if
+        # 1) happened.
+        compute_node_get(context, compute_id)
+        # Else, raise ConstraintNotMet if 2) happened.
+        raise exception.ConstraintNotMet()
 
 
 @pick_context_manager_reader
