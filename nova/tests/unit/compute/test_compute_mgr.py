@@ -376,18 +376,20 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase,
         )
 
         # First node in set should have been removed from DB
+        # Last node in set should have been added to DB.
         for db_node in db_nodes:
             if db_node.hypervisor_hostname == 'node1':
                 db_node.destroy.assert_called_once_with()
                 rc_mock.delete_resource_provider.assert_called_once_with(
                     self.context, db_node, cascade=True)
-                mock_rt.remove_node.assert_called_once_with(
-                    'node1')
+                mock_rt.remove_node.assert_called_once_with('node1')
                 mock_log.error.assert_called_once_with(
                     "Failed to delete compute node resource provider for "
                     "compute node %s: %s", db_node.uuid, mock.ANY)
             else:
                 self.assertFalse(db_node.destroy.called)
+        self.assertEqual(1, mock_rt.remove_node.call_count)
+        mock_rt.clean_compute_node_cache.assert_called_once_with(db_nodes)
 
     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
                 'delete_resource_provider')
@@ -408,6 +410,33 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase,
         # these shouldn't get processed on VirtDriverNotReady
         update_mock.assert_not_called()
         del_rp_mock.assert_not_called()
+
+    @mock.patch.object(manager.ComputeManager,
+                       '_update_available_resource_for_node')
+    @mock.patch.object(fake_driver.FakeDriver, 'get_available_nodes')
+    @mock.patch.object(manager.ComputeManager, '_get_compute_nodes_in_db')
+    def test_update_available_resource_destroy_rebalance(
+            self, get_db_nodes, get_avail_nodes, update_mock):
+        mock_rt = self._mock_rt()
+        rc_mock = self.useFixture(fixtures.fixtures.MockPatchObject(
+            self.compute, 'reportclient')).mock
+        db_nodes = [self._make_compute_node('node1', 1)]
+        get_db_nodes.return_value = db_nodes
+        # Destroy can fail if nodes were rebalanced between getting the node
+        # list and calling destroy.
+        db_nodes[0].destroy.side_effect = exception.ComputeHostNotFound(
+            'node1')
+        get_avail_nodes.return_value = set()
+        self.compute.update_available_resource(self.context)
+        get_db_nodes.assert_called_once_with(self.context, set(),
+                                             use_slave=True, startup=False)
+        self.assertEqual(0, update_mock.call_count)
+
+        db_nodes[0].destroy.assert_called_once_with()
+        self.assertEqual(0, rc_mock.delete_resource_provider.call_count)
+        mock_rt.remove_node.assert_called_once_with('node1')
+        rc_mock.invalidate_resource_provider.assert_called_once_with(
+            db_nodes[0].uuid)
 
     @mock.patch('nova.context.get_admin_context')
     def test_pre_start_hook(self, get_admin_context):
