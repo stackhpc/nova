@@ -105,7 +105,6 @@ from nova.virt import fake
 from nova.virt import firewall as base_firewall
 from nova.virt import hardware
 from nova.virt.image import model as imgmodel
-from nova.virt import images
 from nova.virt.libvirt import blockinfo
 from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt import designer
@@ -1206,23 +1205,6 @@ class LibvirtConnTestCase(test.NoDBTestCase,
                 version_arg_found = True
                 break
         self.assertFalse(version_arg_found)
-
-    # NOTE(sdague): python2.7 and python3.5 have different behaviors
-    # when it comes to comparing against the sentinel, so
-    # has_min_version is needed to pass python3.5.
-    @mock.patch.object(nova.virt.libvirt.host.Host, "has_min_version",
-                       return_value=True)
-    @mock.patch.object(fakelibvirt.Connection, 'getVersion',
-                       return_value=mock.sentinel.qemu_version)
-    def test_qemu_image_version(self, mock_get_libversion, min_ver):
-        """Test that init_host sets qemu image version
-
-        A sentinel is used here so that we aren't chasing this value
-        against minimums that get raised over time.
-        """
-        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), True)
-        drvr.init_host("dummyhost")
-        self.assertEqual(images.QEMU_VERSION, mock.sentinel.qemu_version)
 
     @mock.patch.object(fields.Architecture, "from_host",
                        return_value=fields.Architecture.PPC64)
@@ -19595,10 +19577,10 @@ class LibvirtConnTestCase(test.NoDBTestCase,
     @mock.patch('os.path.exists')
     @mock.patch('os.path.getsize')
     @mock.patch('os.path.isdir')
-    @mock.patch('oslo_concurrency.processutils.execute')
+    @mock.patch('nova.virt.images.qemu_img_info')
     @mock.patch.object(host.Host, '_get_domain')
     def test_get_instance_disk_info_parallels_ct(self, mock_get_domain,
-                                                 mock_execute,
+                                                 mock_qemu_img_info,
                                                  mock_isdir,
                                                  mock_getsize,
                                                  mock_exists,
@@ -19613,10 +19595,9 @@ class LibvirtConnTestCase(test.NoDBTestCase,
                     "<target dir='/'/></filesystem>"
                     "</devices></domain>")
 
-        ret = ("image: /test/disk/root.hds\n"
-               "file format: parallels\n"
-               "virtual size: 20G (21474836480 bytes)\n"
-               "disk size: 789M\n")
+        mock_qemu_img_info.return_value = mock.Mock(
+            virtual_size=21474836480, image="/test/disk/root.hds",
+            file_format="ploop", size=827327254, backing_file=None)
 
         self.flags(virt_type='parallels', group='libvirt')
         instance = objects.Instance(**self.test_instance)
@@ -19636,7 +19617,6 @@ class LibvirtConnTestCase(test.NoDBTestCase,
         mock_getsize.side_effect = getsize_sideeffect
         mock_exists.return_value = True
         mock_isdir.return_value = True
-        mock_execute.return_value = (ret, '')
 
         info = drvr.get_instance_disk_info(instance)
         info = jsonutils.loads(info)

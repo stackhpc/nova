@@ -19,14 +19,12 @@
 Handling of VM disk images.
 """
 
-import operator
 import os
 
 from oslo_concurrency import processutils
 from oslo_log import log as logging
 from oslo_utils import fileutils
 from oslo_utils import imageutils
-from oslo_utils import units
 
 from nova.compute import utils as compute_utils
 import nova.conf
@@ -40,15 +38,6 @@ LOG = logging.getLogger(__name__)
 CONF = nova.conf.CONF
 IMAGE_API = image.API()
 
-QEMU_IMG_LIMITS = processutils.ProcessLimits(
-    cpu_time=30,
-    address_space=1 * units.Gi)
-
-# This is set by the libvirt driver on startup. The version is used to
-# determine what flags need to be set on the command line.
-QEMU_VERSION = None
-QEMU_VERSION_REQ_SHARED = 2010000
-
 
 def qemu_img_info(path, format=None):
     """Return an object containing the parsed output from qemu-img info."""
@@ -57,42 +46,19 @@ def qemu_img_info(path, format=None):
     if not os.path.exists(path) and CONF.libvirt.images_type != 'rbd':
         raise exception.DiskNotFound(location=path)
 
-    try:
-        # The following check is about ploop images that reside within
-        # directories and always have DiskDescriptor.xml file beside them
-        if (os.path.isdir(path) and
-            os.path.exists(os.path.join(path, "DiskDescriptor.xml"))):
-            path = os.path.join(path, "root.hds")
+    info = nova.privsep.qemu.unprivileged_qemu_img_info(path, format=format)
+    return imageutils.QemuImgInfo(info, format='json')
 
-        cmd = ('env', 'LC_ALL=C', 'LANG=C', 'qemu-img', 'info', path)
-        if format is not None:
-            cmd = cmd + ('-f', format)
-        # Check to see if the qemu version is >= 2.10 because if so, we need
-        # to add the --force-share flag.
-        if QEMU_VERSION and operator.ge(QEMU_VERSION, QEMU_VERSION_REQ_SHARED):
-            cmd = cmd + ('--force-share',)
-        out, err = processutils.execute(*cmd, prlimit=QEMU_IMG_LIMITS)
-    except processutils.ProcessExecutionError as exp:
-        if exp.exit_code == -9:
-            # this means we hit prlimits, make the exception more specific
-            msg = (_("qemu-img aborted by prlimits when inspecting "
-                    "%(path)s : %(exp)s") % {'path': path, 'exp': exp})
-        elif exp.exit_code == 1 and 'No such file or directory' in exp.stderr:
-            # The os.path.exists check above can race so this is a simple
-            # best effort at catching that type of failure and raising a more
-            # specific error.
-            raise exception.DiskNotFound(location=path)
-        else:
-            msg = (_("qemu-img failed to execute on %(path)s : %(exp)s") %
-                   {'path': path, 'exp': exp})
-        raise exception.InvalidDiskInfo(reason=msg)
 
-    if not out:
-        msg = (_("Failed to run qemu-img info on %(path)s : %(error)s") %
-               {'path': path, 'error': err})
-        raise exception.InvalidDiskInfo(reason=msg)
+def privileged_qemu_img_info(path, format=None, output_format='json'):
+    """Return an object containing the parsed output from qemu-img info."""
+    # TODO(mikal): this code should not be referring to a libvirt specific
+    # flag.
+    if not os.path.exists(path) and CONF.libvirt.images_type != 'rbd':
+        raise exception.DiskNotFound(location=path)
 
-    return imageutils.QemuImgInfo(out)
+    info = nova.privsep.qemu.privileged_qemu_img_info(path, format=format)
+    return imageutils.QemuImgInfo(info, format='json')
 
 
 def convert_image(source, dest, in_format, out_format, run_as_root=False,
@@ -148,6 +114,34 @@ def get_info(context, image_href):
     return IMAGE_API.get(context, image_href)
 
 
+def check_vmdk_image(image_id, data):
+    # Check some rules about VMDK files. Specifically we want to make
+    # sure that the "create-type" of the image is one that we allow.
+    # Some types of VMDK files can reference files outside the disk
+    # image and we do not want to allow those for obvious reasons.
+
+    types = CONF.compute.vmdk_allowed_types
+
+    if not len(types):
+        LOG.warning('Refusing to allow VMDK image as vmdk_allowed_'
+                    'types is empty')
+        msg = _('Invalid VMDK create-type specified')
+        raise exception.ImageUnacceptable(image_id=image_id, reason=msg)
+
+    try:
+        create_type = data.format_specific['data']['create-type']
+    except KeyError:
+        msg = _('Unable to determine VMDK create-type')
+        raise exception.ImageUnacceptable(image_id=image_id, reason=msg)
+
+    if create_type not in CONF.compute.vmdk_allowed_types:
+        LOG.warning('Refusing to process VMDK file with create-type of %r '
+                    'which is not in allowed set of: %s', create_type,
+                    ','.join(CONF.compute.vmdk_allowed_types))
+        msg = _('Invalid VMDK create-type specified')
+        raise exception.ImageUnacceptable(image_id=image_id, reason=msg)
+
+
 def fetch_to_raw(context, image_href, path, trusted_certs=None):
     path_tmp = "%s.part" % path
     fetch(context, image_href, path_tmp, trusted_certs)
@@ -166,6 +160,9 @@ def fetch_to_raw(context, image_href, path, trusted_certs=None):
             raise exception.ImageUnacceptable(image_id=image_href,
                 reason=(_("fmt=%(fmt)s backed by: %(backing_file)s") %
                         {'fmt': fmt, 'backing_file': backing_file}))
+
+        if fmt == 'vmdk':
+            check_vmdk_image(image_href, data)
 
         if fmt != "raw" and CONF.force_raw_images:
             staged = "%s.converted" % path
