@@ -202,8 +202,10 @@ class BaseTestCase(test.TestCase):
                         context, objects.ComputeNode(), cn)
                     for cn in fake_compute_nodes]
 
-        def fake_compute_node_delete(context, compute_node_id):
+        def fake_compute_node_delete(context, compute_node_id,
+                                     compute_node_host):
             self.assertEqual(2, compute_node_id)
+            self.assertEqual('fake_phyp1', compute_node_host)
 
         self.stub_out(
             'nova.compute.manager.ComputeManager._get_compute_nodes_in_db',
@@ -5834,9 +5836,7 @@ class ComputeTestCase(BaseTestCase,
             old_vm_state = vm_states.ACTIVE
         else:
             old_vm_state = vm_states.STOPPED
-        params = {'vm_state': old_vm_state,
-                  'info_cache': objects.InstanceInfoCache(
-                      network_info=network_model.NetworkInfo([]))}
+        params = {'vm_state': old_vm_state}
         instance = self._create_fake_instance_obj(params)
         request_spec = objects.RequestSpec()
 
@@ -5989,9 +5989,7 @@ class ComputeTestCase(BaseTestCase,
         def fake(*args, **kwargs):
             pass
 
-        params = {'info_cache': objects.InstanceInfoCache(
-                      network_info=network_model.NetworkInfo([]))}
-        instance = self._create_fake_instance_obj(params)
+        instance = self._create_fake_instance_obj()
         request_spec = objects.RequestSpec()
 
         self.stub_out('nova.virt.fake.FakeDriver.finish_migration', fake)

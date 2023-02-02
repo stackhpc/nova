@@ -376,18 +376,20 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase,
         )
 
         # First node in set should have been removed from DB
+        # Last node in set should have been added to DB.
         for db_node in db_nodes:
             if db_node.hypervisor_hostname == 'node1':
                 db_node.destroy.assert_called_once_with()
                 rc_mock.delete_resource_provider.assert_called_once_with(
                     self.context, db_node, cascade=True)
-                mock_rt.remove_node.assert_called_once_with(
-                    'node1')
+                mock_rt.remove_node.assert_called_once_with('node1')
                 mock_log.error.assert_called_once_with(
                     "Failed to delete compute node resource provider for "
                     "compute node %s: %s", db_node.uuid, mock.ANY)
             else:
                 self.assertFalse(db_node.destroy.called)
+        self.assertEqual(1, mock_rt.remove_node.call_count)
+        mock_rt.clean_compute_node_cache.assert_called_once_with(db_nodes)
 
     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
                 'delete_resource_provider')
@@ -408,6 +410,33 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase,
         # these shouldn't get processed on VirtDriverNotReady
         update_mock.assert_not_called()
         del_rp_mock.assert_not_called()
+
+    @mock.patch.object(manager.ComputeManager,
+                       '_update_available_resource_for_node')
+    @mock.patch.object(fake_driver.FakeDriver, 'get_available_nodes')
+    @mock.patch.object(manager.ComputeManager, '_get_compute_nodes_in_db')
+    def test_update_available_resource_destroy_rebalance(
+            self, get_db_nodes, get_avail_nodes, update_mock):
+        mock_rt = self._mock_rt()
+        rc_mock = self.useFixture(fixtures.fixtures.MockPatchObject(
+            self.compute, 'reportclient')).mock
+        db_nodes = [self._make_compute_node('node1', 1)]
+        get_db_nodes.return_value = db_nodes
+        # Destroy can fail if nodes were rebalanced between getting the node
+        # list and calling destroy.
+        db_nodes[0].destroy.side_effect = exception.ComputeHostNotFound(
+            'node1')
+        get_avail_nodes.return_value = set()
+        self.compute.update_available_resource(self.context)
+        get_db_nodes.assert_called_once_with(self.context, set(),
+                                             use_slave=True, startup=False)
+        self.assertEqual(0, update_mock.call_count)
+
+        db_nodes[0].destroy.assert_called_once_with()
+        self.assertEqual(0, rc_mock.delete_resource_provider.call_count)
+        mock_rt.remove_node.assert_called_once_with('node1')
+        rc_mock.invalidate_resource_provider.assert_called_once_with(
+            db_nodes[0].uuid)
 
     @mock.patch('nova.context.get_admin_context')
     def test_pre_start_hook(self, get_admin_context):
@@ -3387,12 +3416,16 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase,
                 CONF.host, instance.uuid, graceful_exit=False)
             return result
 
+    @mock.patch('nova.objects.InstanceGroup.get_by_instance_uuid', mock.Mock(
+        side_effect=exception.InstanceGroupNotFound(group_uuid='')))
     def test_check_can_live_migrate_destination_success(self):
         self.useFixture(std_fixtures.MonkeyPatch(
             'nova.network.neutron.API.supports_port_binding_extension',
             lambda *args: True))
         self._test_check_can_live_migrate_destination()
 
+    @mock.patch('nova.objects.InstanceGroup.get_by_instance_uuid', mock.Mock(
+        side_effect=exception.InstanceGroupNotFound(group_uuid='')))
     def test_check_can_live_migrate_destination_fail(self):
         self.useFixture(std_fixtures.MonkeyPatch(
             'nova.network.neutron.API.supports_port_binding_extension',
@@ -3402,7 +3435,9 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase,
             self._test_check_can_live_migrate_destination,
             do_raise=True)
 
-    def test_check_can_live_migrate_destination_contins_vifs(self):
+    @mock.patch('nova.objects.InstanceGroup.get_by_instance_uuid', mock.Mock(
+        side_effect=exception.InstanceGroupNotFound(group_uuid='')))
+    def test_check_can_live_migrate_destination_contains_vifs(self):
         self.useFixture(std_fixtures.MonkeyPatch(
             'nova.network.neutron.API.supports_port_binding_extension',
             lambda *args: True))
@@ -3410,6 +3445,8 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase,
         self.assertIn('vifs', migrate_data)
         self.assertIsNotNone(migrate_data.vifs)
 
+    @mock.patch('nova.objects.InstanceGroup.get_by_instance_uuid', mock.Mock(
+        side_effect=exception.InstanceGroupNotFound(group_uuid='')))
     def test_check_can_live_migrate_destination_no_binding_extended(self):
         self.useFixture(std_fixtures.MonkeyPatch(
             'nova.network.neutron.API.supports_port_binding_extension',
@@ -3417,17 +3454,39 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase,
         migrate_data = self._test_check_can_live_migrate_destination()
         self.assertNotIn('vifs', migrate_data)
 
+    @mock.patch('nova.objects.InstanceGroup.get_by_instance_uuid', mock.Mock(
+        side_effect=exception.InstanceGroupNotFound(group_uuid='')))
     def test_check_can_live_migrate_destination_src_numa_lm_false(self):
         self.useFixture(std_fixtures.MonkeyPatch(
             'nova.network.neutron.API.supports_port_binding_extension',
             lambda *args: True))
         self._test_check_can_live_migrate_destination(src_numa_lm=False)
 
+    @mock.patch('nova.objects.InstanceGroup.get_by_instance_uuid', mock.Mock(
+        side_effect=exception.InstanceGroupNotFound(group_uuid='')))
     def test_check_can_live_migrate_destination_src_numa_lm_true(self):
         self.useFixture(std_fixtures.MonkeyPatch(
             'nova.network.neutron.API.supports_port_binding_extension',
             lambda *args: True))
         self._test_check_can_live_migrate_destination(src_numa_lm=True)
+
+    @mock.patch.object(compute_utils, 'add_instance_fault_from_exc')
+    def test_check_can_live_migrate_destination_fail_group_policy(
+            self, mock_fail_db):
+
+        instance = fake_instance.fake_instance_obj(
+            self.context, host=self.compute.host, vm_state=vm_states.ACTIVE,
+            node='fake-node')
+
+        ex = exception.RescheduledException(
+                instance_uuid=instance.uuid, reason="policy violated")
+
+        with mock.patch.object(self.compute, '_validate_instance_group_policy',
+                               side_effect=ex):
+            self.assertRaises(
+                exception.MigrationPreCheckError,
+                self.compute.check_can_live_migrate_destination,
+                self.context, instance, None, None, None, None)
 
     def test_dest_can_numa_live_migrate(self):
         positive_dest_check_data = objects.LibvirtLiveMigrateData(
@@ -6009,86 +6068,6 @@ class ComputeManagerUnitTestCase(test.NoDBTestCase,
                     self.context, fake_instance, fake_bdm)
         block_stats.assert_called_once_with(fake_instance, 'vda')
 
-    def _test_finish_revert_resize_network_migrate_finish(
-            self, vifs, events, migration=None):
-        instance = fake_instance.fake_instance_obj(self.context)
-        instance.info_cache = objects.InstanceInfoCache(
-            network_info=network_model.NetworkInfo(vifs))
-        if migration is None:
-            migration = objects.Migration(
-                source_compute='fake-source',
-                dest_compute='fake-dest')
-
-        def fake_migrate_instance_finish(
-                context, instance, migration, mapping):
-            # NOTE(artom) This looks weird, but it's checking that the
-            # temporaty_mutation() context manager did its job.
-            self.assertEqual(migration.dest_compute, migration.source_compute)
-
-        with test.nested(
-            mock.patch.object(self.compute.virtapi,
-                              'wait_for_instance_event'),
-            mock.patch.object(self.compute.network_api,
-                              'migrate_instance_finish',
-                              side_effect=fake_migrate_instance_finish)
-        ) as (mock_wait, mock_migrate_instance_finish):
-            self.compute._finish_revert_resize_network_migrate_finish(
-                self.context, instance, migration, mock.sentinel.mapping)
-            mock_wait.assert_called_once_with(
-                instance, events, deadline=CONF.vif_plugging_timeout,
-                error_callback=self.compute._neutron_failed_migration_callback)
-            mock_migrate_instance_finish.assert_called_once_with(
-                self.context, instance, migration, mock.sentinel.mapping)
-
-    def test_finish_revert_resize_network_migrate_finish_wait(self):
-        """Test that we wait for bind-time events if we have a hybrid-plugged
-        VIF.
-        """
-        self._test_finish_revert_resize_network_migrate_finish(
-            [network_model.VIF(id=uuids.hybrid_vif,
-                               details={'ovs_hybrid_plug': True}),
-             network_model.VIF(id=uuids.normal_vif,
-                               details={'ovs_hybrid_plug': False})],
-            [('network-vif-plugged', uuids.hybrid_vif)])
-
-    def test_finish_revert_resize_network_migrate_finish_same_host(self):
-        """Test that we're not waiting for any events if its a same host
-        resize revert.
-        """
-        migration = objects.Migration(
-            source_compute='fake-source', dest_compute='fake-source')
-
-        self._test_finish_revert_resize_network_migrate_finish(
-            [network_model.VIF(id=uuids.hybrid_vif,
-                               details={'ovs_hybrid_plug': True}),
-             network_model.VIF(id=uuids.normal_vif,
-                               details={'ovs_hybrid_plug': False})],
-            [], migration=migration
-        )
-
-    def test_finish_revert_resize_network_migrate_finish_dont_wait(self):
-        """Test that we're not waiting for any events if we don't have any
-        hybrid-plugged VIFs.
-        """
-        self._test_finish_revert_resize_network_migrate_finish(
-            [network_model.VIF(id=uuids.hybrid_vif,
-                               details={'ovs_hybrid_plug': False}),
-             network_model.VIF(id=uuids.normal_vif,
-                               details={'ovs_hybrid_plug': False})],
-            [])
-
-    def test_finish_revert_resize_network_migrate_finish_no_vif_timeout(self):
-        """Test that we're not waiting for any events if vif_plugging_timeout
-        is 0.
-        """
-        self.flags(vif_plugging_timeout=0)
-        self._test_finish_revert_resize_network_migrate_finish(
-            [network_model.VIF(id=uuids.hybrid_vif,
-                               details={'ovs_hybrid_plug': True}),
-             network_model.VIF(id=uuids.normal_vif,
-                               details={'ovs_hybrid_plug': True})],
-            [])
-
     @mock.patch('nova.compute.manager.LOG')
     def test_cache_images_unsupported(self, mock_log):
         r = self.compute.cache_images(self.context, ['an-image'])
@@ -7532,7 +7511,8 @@ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
     def test_validate_policy_honors_workaround_disabled(self, mock_get):
         instance = objects.Instance(uuid=uuids.instance)
         hints = {'group': 'foo'}
-        mock_get.return_value = objects.InstanceGroup(policy=None)
+        mock_get.return_value = objects.InstanceGroup(policy=None,
+                                                      uuid=uuids.group)
         self.compute._validate_instance_group_policy(self.context,
                                                      instance, hints)
         mock_get.assert_called_once_with(self.context, 'foo')
@@ -7558,10 +7538,14 @@ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
                                                      instance, hints)
         mock_get.assert_called_once_with(self.context, uuids.group_hint)
 
+    @mock.patch('nova.objects.InstanceGroup.get_by_uuid')
     @mock.patch('nova.objects.InstanceList.get_uuids_by_host')
     @mock.patch('nova.objects.InstanceGroup.get_by_hint')
-    def test_validate_instance_group_policy_with_rules(self, mock_get_by_hint,
-                                                       mock_get_by_host):
+    @mock.patch.object(fake_driver.FakeDriver, 'get_available_nodes')
+    @mock.patch('nova.objects.MigrationList.get_in_progress_by_host_and_node')
+    def test_validate_instance_group_policy_with_rules(
+            self, migration_list, nodes, mock_get_by_hint, mock_get_by_host,
+            mock_get_by_uuid):
         # Create 2 instance in same host, inst2 created before inst1
         instance = objects.Instance(uuid=uuids.inst1)
         hints = {'group': [uuids.group_hint]}
@@ -7570,17 +7554,26 @@ class ComputeManagerBuildInstanceTestCase(test.NoDBTestCase):
         mock_get_by_host.return_value = existing_insts
 
         # if group policy rules limit to 1, raise RescheduledException
-        mock_get_by_hint.return_value = objects.InstanceGroup(
+        group = objects.InstanceGroup(
             policy='anti-affinity', rules={'max_server_per_host': '1'},
-            hosts=['host1'], members=members_uuids)
+            hosts=['host1'], members=members_uuids,
+            uuid=uuids.group)
+        mock_get_by_hint.return_value = group
+        mock_get_by_uuid.return_value = group
+        nodes.return_value = ['nodename']
+        migration_list.return_value = [objects.Migration(
+            uuid=uuids.migration, instance_uuid=uuids.instance)]
         self.assertRaises(exception.RescheduledException,
                           self.compute._validate_instance_group_policy,
                           self.context, instance, hints)
 
         # if group policy rules limit change to 2, validate OK
-        mock_get_by_hint.return_value = objects.InstanceGroup(
+        group2 = objects.InstanceGroup(
             policy='anti-affinity', rules={'max_server_per_host': 2},
-            hosts=['host1'], members=members_uuids)
+            hosts=['host1'], members=members_uuids,
+            uuid=uuids.group)
+        mock_get_by_hint.return_value = group2
+        mock_get_by_uuid.return_value = group2
         self.compute._validate_instance_group_policy(self.context,
                                                      instance, hints)
 
@@ -8726,8 +8719,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
         do_finish_revert_resize()
 
     @mock.patch.object(objects.Instance, 'drop_migration_context')
-    @mock.patch('nova.compute.manager.ComputeManager.'
-                '_finish_revert_resize_network_migrate_finish')
+    @mock.patch('nova.network.neutron.API.migrate_instance_finish')
     @mock.patch('nova.scheduler.utils.'
                 'fill_provider_mapping_based_on_allocation')
     @mock.patch('nova.compute.manager.ComputeManager._revert_allocation')
@@ -8741,7 +8733,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
     def test_finish_revert_resize_recalc_group_rp_mapping(
             self, mock_get_bdms, mock_notify_action, mock_notify_usage,
             mock_set_instance_info, mock_instance_save, mock_revert_allocation,
-            mock_fill_provider_mapping, mock_network_migrate_finish,
+            mock_fill_provider_mapping, mock_migrate_instance_finish,
             mock_drop_migration_context):
 
         mock_get_bdms.return_value = objects.BlockDeviceMappingList()
@@ -8758,8 +8750,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
             mock.sentinel.allocation)
 
     @mock.patch.object(objects.Instance, 'drop_migration_context')
-    @mock.patch('nova.compute.manager.ComputeManager.'
-                '_finish_revert_resize_network_migrate_finish')
+    @mock.patch('nova.network.neutron.API.migrate_instance_finish')
     @mock.patch('nova.scheduler.utils.'
                 'fill_provider_mapping_based_on_allocation')
     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
@@ -8776,7 +8767,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
             self, mock_get_bdms, mock_notify_action, mock_notify_usage,
             mock_set_instance_info, mock_instance_save, mock_revert_allocation,
             mock_get_allocations, mock_fill_provider_mapping,
-            mock_network_migrate_finish, mock_drop_migration_context):
+            mock_migrate_instance_finish, mock_drop_migration_context):
 
         mock_get_bdms.return_value = objects.BlockDeviceMappingList()
         mock_get_allocations.return_value = mock.sentinel.allocation
@@ -8790,7 +8781,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
 
         mock_get_allocations.assert_not_called()
         mock_fill_provider_mapping.assert_not_called()
-        mock_network_migrate_finish.assert_called_once_with(
+        mock_migrate_instance_finish.assert_called_once_with(
             self.context, self.instance, self.migration, None)
 
     def test_confirm_resize_deletes_allocations_and_update_scheduler(self):
@@ -9107,6 +9098,8 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
         manager.ComputeManager()
         mock_executor.assert_called_once_with()
 
+    @mock.patch('nova.objects.InstanceGroup.get_by_instance_uuid', mock.Mock(
+        side_effect=exception.InstanceGroupNotFound(group_uuid='')))
     def test_pre_live_migration_cinder_v3_api(self):
         # This tests that pre_live_migration with a bdm with an
         # attachment_id, will create a new attachment and update
@@ -9184,6 +9177,8 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
 
         _test()
 
+    @mock.patch('nova.objects.InstanceGroup.get_by_instance_uuid', mock.Mock(
+        side_effect=exception.InstanceGroupNotFound(group_uuid='')))
     def test_pre_live_migration_exception_cinder_v3_api(self):
         # The instance in this test has 2 attachments. The second attach_create
         # will throw an exception. This will test that the first attachment
@@ -9253,6 +9248,8 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
                 self.assertGreater(len(m.mock_calls), 0)
         _test()
 
+    @mock.patch('nova.objects.InstanceGroup.get_by_instance_uuid', mock.Mock(
+        side_effect=exception.InstanceGroupNotFound(group_uuid='')))
     def test_pre_live_migration_exceptions_delete_attachments(self):
         # The instance in this test has 2 attachments. The call to
         # driver.pre_live_migration will raise an exception. This will test
@@ -9871,6 +9868,27 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
             mock_delete.assert_called_once_with(self.context,
                                                 self.instance,
                                                 migration)
+
+    def test_post_live_migration_update_host(self):
+        @mock.patch.object(self.compute, '_get_compute_info')
+        def _test_post_live_migration(_get_compute_info):
+            dest_host = 'dest'
+            cn = objects.ComputeNode(hypervisor_hostname=dest_host)
+            _get_compute_info.return_value = cn
+            instance = fake_instance.fake_instance_obj(self.context,
+                                                        node='src',
+                                                        uuid=uuids.instance)
+            with mock.patch.object(self.compute, "_post_live_migration"
+                    ) as plm, mock.patch.object(instance, "save") as save:
+                error = ValueError("some failure")
+                plm.side_effect = error
+                self.assertRaises(
+                    ValueError, self.compute._post_live_migration_update_host,
+                    self.context, instance, dest_host)
+                save.assert_called_once()
+                self.assertEqual(instance.host, dest_host)
+
+        _test_post_live_migration()
 
     def test_post_live_migration_cinder_pre_344_api(self):
         # Because live migration has
@@ -10624,6 +10642,54 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
                 # _error_out_instance_on_exception should reraise the
                 # UnableToMigrateToSelf inside InstanceFaultRollback.
                 exception.UnableToMigrateToSelf, self.compute.prep_resize,
+                self.context, instance.image_meta, instance, instance.flavor,
+                request_spec, filter_properties={}, node=instance.node,
+                clean_shutdown=True, migration=migration, host_list=[])
+        # The instance.vm_state should remain unchanged
+        # (_error_out_instance_on_exception will set to ACTIVE by default).
+        self.assertEqual(vm_states.STOPPED, instance.vm_state)
+
+    @mock.patch('nova.compute.utils.notify_usage_exists')
+    @mock.patch('nova.compute.manager.ComputeManager.'
+                '_notify_about_instance_usage')
+    @mock.patch('nova.compute.utils.notify_about_resize_prep_instance')
+    @mock.patch('nova.objects.Instance.save')
+    @mock.patch('nova.compute.manager.ComputeManager._revert_allocation')
+    @mock.patch('nova.compute.manager.ComputeManager.'
+                '_reschedule_resize_or_reraise')
+    @mock.patch('nova.compute.utils.add_instance_fault_from_exc')
+    # this is almost copy-paste from test_prep_resize_fails_rollback
+    def test_prep_resize_fails_group_validation(
+            self, add_instance_fault_from_exc, _reschedule_resize_or_reraise,
+            _revert_allocation, mock_instance_save,
+            notify_about_resize_prep_instance, _notify_about_instance_usage,
+            notify_usage_exists):
+        """Tests that if _validate_instance_group_policy raises
+        InstanceFaultRollback, the instance.vm_state is reset properly in
+        _error_out_instance_on_exception
+        """
+        instance = fake_instance.fake_instance_obj(
+            self.context, host=self.compute.host, vm_state=vm_states.STOPPED,
+            node='fake-node', expected_attrs=['system_metadata', 'flavor'])
+        migration = mock.MagicMock(spec='nova.objects.Migration')
+        request_spec = mock.MagicMock(spec='nova.objects.RequestSpec')
+        ex = exception.RescheduledException(
+            instance_uuid=instance.uuid, reason="policy violated")
+        ex2 = exception.InstanceFaultRollback(
+            inner_exception=ex)
+
+        def fake_reschedule_resize_or_reraise(*args, **kwargs):
+            raise ex2
+
+        _reschedule_resize_or_reraise.side_effect = (
+            fake_reschedule_resize_or_reraise)
+
+        with mock.patch.object(self.compute, '_validate_instance_group_policy',
+                               side_effect=ex):
+            self.assertRaises(
+                # _error_out_instance_on_exception should reraise the
+                # RescheduledException inside InstanceFaultRollback.
+                exception.RescheduledException, self.compute.prep_resize,
                 self.context, instance.image_meta, instance, instance.flavor,
                 request_spec, filter_properties={}, node=instance.node,
                 clean_shutdown=True, migration=migration, host_list=[])
@@ -11909,8 +11975,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
     @mock.patch('nova.objects.BlockDeviceMappingList.get_by_instance_uuid')
     @mock.patch('nova.compute.manager.ComputeManager.'
                 '_update_volume_attachments')
-    @mock.patch('nova.compute.manager.ComputeManager.'
-                '_finish_revert_resize_network_migrate_finish')
+    @mock.patch('nova.network.neutron.API.migrate_instance_finish')
     @mock.patch('nova.compute.manager.ComputeManager.'
                 '_get_instance_block_device_info')
     @mock.patch('nova.objects.Instance.drop_migration_context')
@@ -11920,7 +11985,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
                 '_complete_volume_attachments')
     def test_finish_revert_snapshot_based_resize_at_source(
             self, mock_complete_attachments, mock_update_after_spawn,
-            mock_drop_mig_context, mock_get_bdi, mock_net_migrate_finish,
+            mock_drop_mig_context, mock_get_bdi, mock_migrate_instance_finish,
             mock_update_attachments, mock_get_bdms, mock_revert_allocs,
             mock_inst_save):
         """Happy path test for finish_revert_snapshot_based_resize_at_source.
@@ -11960,7 +12025,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
         mock_update_attachments.assert_called_once_with(
             self.context, self.instance, mock_get_bdms.return_value)
         # Assert that port bindings were updated to point at the source host.
-        mock_net_migrate_finish.assert_called_once_with(
+        mock_migrate_instance_finish.assert_called_once_with(
             self.context, self.instance, self.migration,
             provider_mappings=None)
         # Assert the driver finished reverting the migration.
@@ -11985,8 +12050,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
     @mock.patch('nova.objects.BlockDeviceMappingList.get_by_instance_uuid')
     @mock.patch('nova.compute.manager.ComputeManager.'
                 '_update_volume_attachments')
-    @mock.patch('nova.compute.manager.ComputeManager.'
-                '_finish_revert_resize_network_migrate_finish')
+    @mock.patch('nova.network.neutron.API.migrate_instance_finish')
     @mock.patch('nova.compute.manager.ComputeManager.'
                 '_get_instance_block_device_info')
     @mock.patch('nova.objects.Instance.drop_migration_context')
@@ -11997,7 +12061,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
                 side_effect=test.TestingException('vol complete failed'))
     def test_finish_revert_snapshot_based_resize_at_source_driver_fails(
             self, mock_complete_attachments, mock_update_after_spawn,
-            mock_drop_mig_context, mock_get_bdi, mock_net_migrate_finish,
+            mock_drop_mig_context, mock_get_bdi, mock_migrate_instance_finish,
             mock_update_attachments, mock_get_bdms, mock_revert_allocs,
             mock_inst_save):
         """Test for _finish_revert_snapshot_based_resize_at_source where the
@@ -12051,7 +12115,7 @@ class ComputeManagerMigrationTestCase(test.NoDBTestCase,
         mock_update_attachments.assert_called_once_with(
             self.context, self.instance, mock_get_bdms.return_value)
         # Assert that port bindings were updated to point at the source host.
-        mock_net_migrate_finish.assert_called_once_with(
+        mock_migrate_instance_finish.assert_called_once_with(
             self.context, self.instance, self.migration,
             provider_mappings=None)
         # Assert final DB cleanup for the instance did not happen.

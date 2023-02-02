@@ -1646,7 +1646,11 @@ class ComputeManager(manager.Manager):
         return [_decode(f) for f in injected_files]
 
     def _validate_instance_group_policy(self, context, instance,
-                                        scheduler_hints):
+                                        scheduler_hints=None):
+
+        if CONF.workarounds.disable_group_policy_check_upcall:
+            return
+
         # NOTE(russellb) Instance group policy is enforced by the scheduler.
         # However, there is a race condition with the enforcement of
         # the policy.  Since more than one instance may be scheduled at the
@@ -1655,29 +1659,63 @@ class ComputeManager(manager.Manager):
         # multiple instances with an affinity policy could end up on different
         # hosts.  This is a validation step to make sure that starting the
         # instance here doesn't violate the policy.
-        group_hint = scheduler_hints.get('group')
-        if not group_hint:
-            return
+        if scheduler_hints is not None:
+            # only go through here if scheduler_hints is provided, even if it
+            # is empty.
+            group_hint = scheduler_hints.get('group')
+            if not group_hint:
+                return
+            else:
+                # The RequestSpec stores scheduler_hints as key=list pairs so
+                # we need to check the type on the value and pull the single
+                # entry out. The API request schema validates that
+                # the 'group' hint is a single value.
+                if isinstance(group_hint, list):
+                    group_hint = group_hint[0]
 
-        # The RequestSpec stores scheduler_hints as key=list pairs so we need
-        # to check the type on the value and pull the single entry out. The
-        # API request schema validates that the 'group' hint is a single value.
-        if isinstance(group_hint, list):
-            group_hint = group_hint[0]
+                group = objects.InstanceGroup.get_by_hint(context, group_hint)
+        else:
+            # TODO(ganso): a call to DB can be saved by adding request_spec
+            # to rpcapi payload of live_migration, pre_live_migration and
+            # check_can_live_migrate_destination
+            try:
+                group = objects.InstanceGroup.get_by_instance_uuid(
+                    context, instance.uuid)
+            except exception.InstanceGroupNotFound:
+                return
 
-        @utils.synchronized(group_hint)
-        def _do_validation(context, instance, group_hint):
-            group = objects.InstanceGroup.get_by_hint(context, group_hint)
+        @utils.synchronized(group['uuid'])
+        def _do_validation(context, instance, group):
             if group.policy and 'anti-affinity' == group.policy:
+
+                # instances on host
                 instances_uuids = objects.InstanceList.get_uuids_by_host(
                     context, self.host)
                 ins_on_host = set(instances_uuids)
+
+                # instance param is just for logging, the nodename obtained is
+                # not actually related to the instance at all
+                nodename = self._get_nodename(instance)
+
+                # instances being migrated to host
+                migrations = (
+                    objects.MigrationList.get_in_progress_by_host_and_node(
+                        context, self.host, nodename))
+                migration_vm_uuids = set([mig['instance_uuid']
+                                          for mig in migrations])
+
+                total_instances = migration_vm_uuids | ins_on_host
+
+                # refresh group to get updated members within locked block
+                group = objects.InstanceGroup.get_by_uuid(context,
+                                                          group['uuid'])
                 members = set(group.members)
                 # Determine the set of instance group members on this host
                 # which are not the instance in question. This is used to
                 # determine how many other members from the same anti-affinity
                 # group can be on this host.
-                members_on_host = ins_on_host & members - set([instance.uuid])
+                members_on_host = (total_instances & members -
+                                   set([instance.uuid]))
                 rules = group.rules
                 if rules and 'max_server_per_host' in rules:
                     max_server = rules['max_server_per_host']
@@ -1689,6 +1727,12 @@ class ComputeManager(manager.Manager):
                     raise exception.RescheduledException(
                             instance_uuid=instance.uuid,
                             reason=msg)
+
+            # NOTE(ganso): The check for affinity below does not work and it
+            # can easily be violated because the lock happens in different
+            # compute hosts.
+            # The only fix seems to be a DB lock to perform the check whenever
+            # setting the host field to an instance.
             elif group.policy and 'affinity' == group.policy:
                 group_hosts = group.get_hosts(exclude=[instance.uuid])
                 if group_hosts and self.host not in group_hosts:
@@ -1697,8 +1741,7 @@ class ComputeManager(manager.Manager):
                             instance_uuid=instance.uuid,
                             reason=msg)
 
-        if not CONF.workarounds.disable_group_policy_check_upcall:
-            _do_validation(context, instance, group_hint)
+        _do_validation(context, instance, group)
 
     def _log_original_error(self, exc_info, instance_uuid):
         LOG.error('Error: %s', exc_info[1], instance_uuid=instance_uuid,
@@ -4781,8 +4824,18 @@ class ComputeManager(manager.Manager):
                   self.host, instance=instance)
         # TODO(mriedem): Calculate provider mappings when we support
         # cross-cell resize/migrate with ports having resource requests.
-        self._finish_revert_resize_network_migrate_finish(
-            ctxt, instance, migration, provider_mappings=None)
+        # NOTE(hanrong): we need to change migration.dest_compute to
+        # source host temporarily.
+        # "network_api.migrate_instance_finish" will setup the network
+        # for the instance on the destination host. For revert resize,
+        # the instance will back to the source host, the setup of the
+        # network for instance should be on the source host. So set
+        # the migration.dest_compute to source host at here.
+        with utils.temporary_mutation(
+            migration, dest_compute=migration.source_compute
+        ):
+            self.network_api.migrate_instance_finish(
+                ctxt, instance, migration, provider_mappings=None)
         network_info = self.network_api.get_instance_nw_info(ctxt, instance)
 
         # Remember that prep_snapshot_based_resize_at_source destroyed the
@@ -4874,50 +4927,6 @@ class ComputeManager(manager.Manager):
             self.compute_rpcapi.finish_revert_resize(context, instance,
                     migration, migration.source_compute, request_spec)
 
-    def _finish_revert_resize_network_migrate_finish(
-            self, context, instance, migration, provider_mappings):
-        """Causes port binding to be updated. In some Neutron or port
-        configurations - see NetworkModel.get_bind_time_events() - we
-        expect the vif-plugged event from Neutron immediately and wait for it.
-        The rest of the time, the event is expected further along in the
-        virt driver, so we don't wait here.
-
-        :param context: The request context.
-        :param instance: The instance undergoing the revert resize.
-        :param migration: The Migration object of the resize being reverted.
-        :param provider_mappings: a dict of list of resource provider uuids
-            keyed by port uuid
-        :raises: eventlet.timeout.Timeout or
-                 exception.VirtualInterfacePlugException.
-        """
-        network_info = instance.get_network_info()
-        events = []
-        deadline = CONF.vif_plugging_timeout
-        if deadline and network_info:
-            events = network_info.get_bind_time_events(migration)
-            if events:
-                LOG.debug('Will wait for bind-time events: %s', events)
-        error_cb = self._neutron_failed_migration_callback
-        try:
-            with self.virtapi.wait_for_instance_event(instance, events,
-                                                      deadline=deadline,
-                                                      error_callback=error_cb):
-                # NOTE(hanrong): we need to change migration.dest_compute to
-                # source host temporarily.
-                # "network_api.migrate_instance_finish" will setup the network
-                # for the instance on the destination host. For revert resize,
-                # the instance will back to the source host, the setup of the
-                # network for instance should be on the source host. So set
-                # the migration.dest_compute to source host at here.
-                with utils.temporary_mutation(
-                        migration, dest_compute=migration.source_compute):
-                    self.network_api.migrate_instance_finish(
-                        context, instance, migration, provider_mappings)
-        except eventlet.timeout.Timeout:
-            with excutils.save_and_reraise_exception():
-                LOG.error('Timeout waiting for Neutron events: %s', events,
-                          instance=instance)
-
     @wrap_exception()
     @reverts_task_state
     @wrap_instance_event(prefix='compute')
@@ -4976,8 +4985,18 @@ class ComputeManager(manager.Manager):
 
             self.network_api.setup_networks_on_host(context, instance,
                                                     migration.source_compute)
-            self._finish_revert_resize_network_migrate_finish(
-                context, instance, migration, provider_mappings)
+            # NOTE(hanrong): we need to change migration.dest_compute to
+            # source host temporarily. "network_api.migrate_instance_finish"
+            # will setup the network for the instance on the destination host.
+            # For revert resize, the instance will back to the source host, the
+            # setup of the network for instance should be on the source host.
+            # So set the migration.dest_compute to source host at here.
+            with utils.temporary_mutation(
+                    migration, dest_compute=migration.source_compute):
+                self.network_api.migrate_instance_finish(context,
+                                                         instance,
+                                                         migration,
+                                                         provider_mappings)
             network_info = self.network_api.get_instance_nw_info(context,
                                                                  instance)
 
@@ -5052,8 +5071,7 @@ class ComputeManager(manager.Manager):
             # the provider mappings. If the instance has ports with
             # resource request then the port update will fail in
             # _update_port_binding_for_instance() called via
-            # _finish_revert_resize_network_migrate_finish() in
-            # finish_revert_resize.
+            # migrate_instance_finish() in finish_revert_resize.
             provider_mappings = None
         return provider_mappings
 
@@ -5217,10 +5235,24 @@ class ComputeManager(manager.Manager):
         with self._error_out_instance_on_exception(
                 context, instance, instance_state=instance_state),\
                 errors_out_migration_ctxt(migration):
+
             self._send_prep_resize_notifications(
                 context, instance, fields.NotificationPhase.START,
                 instance_type)
             try:
+                scheduler_hints = self._get_scheduler_hints(filter_properties,
+                                                            request_spec)
+                # Error out if this host cannot accept the new instance due
+                # to anti-affinity. At this point the migration is already
+                # in-progress, so this is the definitive moment to abort due to
+                # the policy violation. Also, exploding here is covered by the
+                # cleanup methods in except block.
+                try:
+                    self._validate_instance_group_policy(context, instance,
+                                                         scheduler_hints)
+                except exception.RescheduledException as e:
+                    raise exception.InstanceFaultRollback(inner_exception=e)
+
                 self._prep_resize(context, image, instance,
                                   instance_type, filter_properties,
                                   node, migration, request_spec,
@@ -5597,6 +5629,14 @@ class ComputeManager(manager.Manager):
 
             instance.host = migration.dest_compute
             instance.node = migration.dest_node
+            # NOTE(gibi): as the instance now tracked on the destination we
+            # have to make sure that the source compute resource track can
+            # track this instance as a migration. For that the resource tracker
+            # needs to see the old_flavor set on the instance. The old_flavor
+            # setting used to be done on the destination host in finish_resize
+            # but that is racy with a source host update_available_resource
+            # periodic run
+            instance.old_flavor = instance.flavor
             instance.task_state = task_states.RESIZE_MIGRATED
             instance.save(expected_task_state=task_states.RESIZE_MIGRATING)
 
@@ -5710,6 +5750,10 @@ class ComputeManager(manager.Manager):
         # to ACTIVE for backwards compatibility
         old_vm_state = instance.system_metadata.get('old_vm_state',
                                                     vm_states.ACTIVE)
+        # NOTE(gibi): this is already set by the resize_instance on the source
+        # node before calling finish_resize on destination but during upgrade
+        # it can be that the source node is not having the fix for bug 1944759
+        # yet. This assignment can be removed in Z release.
         instance.old_flavor = old_flavor
 
         if old_instance_type_id != new_instance_type_id:
@@ -7823,6 +7867,20 @@ class ComputeManager(manager.Manager):
         :param limits: objects.SchedulerLimits object for this live migration.
         :returns: a LiveMigrateData object (hypervisor-dependent)
         """
+
+        # Error out if this host cannot accept the new instance due
+        # to anti-affinity. This check at this moment is not very accurate, as
+        # multiple requests may be happening concurrently and miss the lock,
+        # but when it works it provides a better user experience by failing
+        # earlier. Also, it should be safe to explode here, error becomes
+        # NoValidHost and instance status remains ACTIVE.
+        try:
+            self._validate_instance_group_policy(ctxt, instance)
+        except exception.RescheduledException as e:
+            msg = ("Failed to validate instance group policy "
+                   "due to: {}".format(e))
+            raise exception.MigrationPreCheckError(reason=msg)
+
         src_compute_info = obj_base.obj_to_primitive(
             self._get_compute_info(ctxt, instance.host))
         dst_compute_info = obj_base.obj_to_primitive(
@@ -7965,6 +8023,13 @@ class ComputeManager(manager.Manager):
         """
         LOG.debug('pre_live_migration data is %s', migrate_data)
 
+        # Error out if this host cannot accept the new instance due
+        # to anti-affinity. At this point the migration is already in-progress,
+        # so this is the definitive moment to abort due to the policy
+        # violation. Also, it should be safe to explode here. The instance
+        # status remains ACTIVE, migration status failed.
+        self._validate_instance_group_policy(context, instance)
+
         migrate_data.old_vol_attachment_ids = {}
         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
             context, instance.uuid)
@@ -8069,8 +8134,8 @@ class ComputeManager(manager.Manager):
         return migrate_data
 
     @staticmethod
-    def _neutron_failed_migration_callback(event_name, instance):
-        msg = ('Neutron reported failure during migration '
+    def _neutron_failed_live_migration_callback(event_name, instance):
+        msg = ('Neutron reported failure during live migration '
                'with %(event)s for instance %(uuid)s')
         msg_args = {'event': event_name, 'uuid': instance.uuid}
         if CONF.vif_plugging_is_fatal:
@@ -8166,7 +8231,7 @@ class ComputeManager(manager.Manager):
                 disk = None
 
             deadline = CONF.vif_plugging_timeout
-            error_cb = self._neutron_failed_migration_callback
+            error_cb = self._neutron_failed_live_migration_callback
             # In order to avoid a race with the vif plugging that the virt
             # driver does on the destination host, we register our events
             # to wait for before calling pre_live_migration. Then if the
@@ -8274,8 +8339,9 @@ class ComputeManager(manager.Manager):
         # host attachment. We fetch BDMs before that to retain connection_info
         # and attachment_id relating to the source host for post migration
         # cleanup.
-        post_live_migration = functools.partial(self._post_live_migration,
-                                                source_bdms=source_bdms)
+        post_live_migration = functools.partial(
+            self._post_live_migration_update_host, source_bdms=source_bdms
+            )
         rollback_live_migration = functools.partial(
             self._rollback_live_migration, source_bdms=source_bdms)
 
@@ -8521,6 +8587,42 @@ class ComputeManager(manager.Manager):
                                   bdm.attachment_id, self.host,
                                   six.text_type(e), instance=instance)
 
+    # TODO(sean-k-mooney): add typing
+    def _post_live_migration_update_host(
+        self, ctxt, instance, dest, block_migration=False,
+        migrate_data=None, source_bdms=None
+    ):
+        try:
+            self._post_live_migration(
+                ctxt, instance, dest, block_migration, migrate_data,
+                source_bdms)
+        except Exception:
+            # Restore the instance object
+            node_name = None
+            try:
+                # get node name of compute, where instance will be
+                # running after migration, that is destination host
+                compute_node = self._get_compute_info(ctxt, dest)
+                node_name = compute_node.hypervisor_hostname
+            except exception.ComputeHostNotFound:
+                LOG.exception('Failed to get compute_info for %s', dest)
+
+            # we can never rollback from post live migration and we can only
+            # get here if the instance is running on the dest so we ensure
+            # the instance.host is set correctly and reraise the original
+            # exception unmodified.
+            if instance.host != dest:
+                # apply saves the new fields while drop actually removes the
+                # migration context from the instance, so migration persists.
+                instance.apply_migration_context()
+                instance.drop_migration_context()
+                instance.host = dest
+                instance.task_state = None
+                instance.node = node_name
+                instance.progress = 0
+                instance.save()
+            raise
+
     @wrap_exception()
     @wrap_instance_fault
     def _post_live_migration(self, ctxt, instance, dest,
@@ -8532,7 +8634,7 @@ class ComputeManager(manager.Manager):
         and mainly updating database record.
 
         :param ctxt: security context
-        :param instance: instance dict
+        :param instance: instance object
         :param dest: destination host
         :param block_migration: if true, prepare for block migration
         :param migrate_data: if not None, it is a dict which has data
@@ -9898,6 +10000,8 @@ class ComputeManager(manager.Manager):
                                                             use_slave=True,
                                                             startup=startup)
 
+        self.rt.clean_compute_node_cache(compute_nodes_in_db)
+
         # Delete orphan compute node not reported by driver but still in db
         for cn in compute_nodes_in_db:
             if cn.hypervisor_hostname not in nodenames:
@@ -9906,17 +10010,30 @@ class ComputeManager(manager.Manager):
                          "nodes are %(nodes)s",
                          {'id': cn.id, 'hh': cn.hypervisor_hostname,
                           'nodes': nodenames})
-                cn.destroy()
-                self.rt.remove_node(cn.hypervisor_hostname)
-                # Delete the corresponding resource provider in placement,
-                # along with any associated allocations.
                 try:
-                    self.reportclient.delete_resource_provider(context, cn,
-                                                               cascade=True)
-                except keystone_exception.ClientException as e:
-                    LOG.error(
-                        "Failed to delete compute node resource provider "
-                        "for compute node %s: %s", cn.uuid, six.text_type(e))
+                    cn.destroy()
+                except exception.ComputeHostNotFound:
+                    # NOTE(mgoddard): it's possible that another compute
+                    # service took ownership of this compute node since we
+                    # queried it due to a rebalance, and this will cause the
+                    # deletion to fail. Ignore the error in that case.
+                    LOG.info("Ignoring failure to delete orphan compute node "
+                             "%(id)s on hypervisor host %(hh)s due to "
+                             "possible node rebalance",
+                             {'id': cn.id, 'hh': cn.hypervisor_hostname})
+                    self.rt.remove_node(cn.hypervisor_hostname)
+                    self.reportclient.invalidate_resource_provider(cn.uuid)
+                else:
+                    self.rt.remove_node(cn.hypervisor_hostname)
+                    # Delete the corresponding resource provider in placement,
+                    # along with any associated allocations.
+                    try:
+                        self.reportclient.delete_resource_provider(
+                            context, cn, cascade=True)
+                    except keystone_exception.ClientException as e:
+                        LOG.error(
+                            "Failed to delete compute node resource provider "
+                            "for compute node %s: %s", cn.uuid, str(e))
 
         for nodename in nodenames:
             self._update_available_resource_for_node(context, nodename,

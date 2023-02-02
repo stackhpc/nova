@@ -933,13 +933,40 @@ class ResourceTracker(object):
                             'flavor', 'migration_context',
                             'resources'])
 
-        # Now calculate usage based on instance utilization:
-        instance_by_uuid = self._update_usage_from_instances(
-            context, instances, nodename)
-
         # Grab all in-progress migrations and error migrations:
         migrations = objects.MigrationList.get_in_progress_and_error(
             context, self.host, nodename)
+
+        # Check for tracked instances with in-progress, incoming, but not
+        # finished migrations. For those instance the migration context
+        # is not applied yet (it will be during finish_resize when the
+        # migration goes to finished state). We need to manually and
+        # temporary apply the migration context here when the resource usage is
+        # updated. See bug 1953359 for more details.
+        instance_by_uuid = {instance.uuid: instance for instance in instances}
+        for migration in migrations:
+            if (
+                migration.instance_uuid in instance_by_uuid and
+                migration.dest_compute == self.host and
+                migration.dest_node == nodename
+            ):
+                # we does not check for the 'post-migrating' migration status
+                # as applying the migration context for an instance already
+                # in finished migration status is a no-op anyhow.
+                instance = instance_by_uuid[migration.instance_uuid]
+                LOG.debug(
+                    'Applying migration context for instance %s as it has an '
+                    'incoming, in-progress migration %s. '
+                    'Migration status is %s',
+                    migration.instance_uuid, migration.uuid, migration.status
+                )
+                # It is OK not to revert the migration context at the end of
+                # the periodic as the instance is not saved during the periodic
+                instance.apply_migration_context()
+
+        # Now calculate usage based on instance utilization:
+        instance_by_uuid = self._update_usage_from_instances(
+            context, instances, nodename)
 
         self._pair_instances_to_migrations(migrations, instance_by_uuid)
         self._update_usage_from_migrations(context, migrations, nodename)
@@ -1988,3 +2015,21 @@ class ResourceTracker(object):
         if migration:
             migration.status = 'done'
             migration.save()
+
+    @utils.synchronized(COMPUTE_RESOURCE_SEMAPHORE, fair=True)
+    def clean_compute_node_cache(self, compute_nodes_in_db):
+        """Clean the compute node cache of any nodes that no longer exist.
+
+        :param compute_nodes_in_db: list of ComputeNode objects from the DB.
+        """
+        compute_nodes_in_db_nodenames = {cn.hypervisor_hostname
+                                         for cn in compute_nodes_in_db}
+        stale_cns = set(self.compute_nodes) - compute_nodes_in_db_nodenames
+
+        for stale_cn in stale_cns:
+            # NOTE(mgoddard): we have found a node in the cache that has no
+            # compute node in the DB. This could be due to a node rebalance
+            # where another compute service took ownership of the node. Clean
+            # up the cache.
+            self.remove_node(stale_cn)
+            self.reportclient.invalidate_resource_provider(stale_cn)

@@ -1658,7 +1658,12 @@ class LibvirtDriver(driver.ComputeDriver):
 
         if instance.host != CONF.host:
             self._undefine_domain(instance)
-            self.unplug_vifs(instance, network_info)
+            # TODO(sean-k-mooney): remove this call to unplug_vifs after
+            # Wallaby is released. VIFs are now unplugged in resize_instance.
+            try:
+                self.unplug_vifs(instance, network_info)
+            except exception.InternalError as e:
+                LOG.debug(e, instance=instance)
 
     def _get_volume_driver(self, connection_info):
         driver_type = connection_info.get('driver_volume_type')
@@ -3383,11 +3388,32 @@ class LibvirtDriver(driver.ComputeDriver):
         # on which vif type we're using and we are working with a stale network
         # info cache here, so won't rely on waiting for neutron plug events.
         # vifs_already_plugged=True means "do not wait for neutron plug events"
+        external_events = []
+        vifs_already_plugged = True
+        event_expected_for_vnic_types = (
+            CONF.workarounds.wait_for_vif_plugged_event_during_hard_reboot)
+        if event_expected_for_vnic_types:
+            # NOTE(gibi): We unplugged every vif during destroy above and we
+            # will replug them with _create_guest_with_network. As the
+            # workaround config has some vnic_types configured we expect
+            # vif-plugged events for every vif with those vnic_types.
+            # TODO(gibi): only wait for events if we know that the networking
+            # backend sends plug time events. For that we need to finish
+            # https://bugs.launchpad.net/neutron/+bug/1821058 first in Neutron
+            # then create a driver -> plug-time event mapping in nova.
+            external_events = [
+                ('network-vif-plugged', vif['id'])
+                for vif in network_info
+                if vif['vnic_type'] in event_expected_for_vnic_types
+            ]
+            vifs_already_plugged = False
+
         # NOTE(efried): The instance should already have a vtpm_secret_uuid
         # registered if appropriate.
         self._create_guest_with_network(
             context, xml, instance, network_info, block_device_info,
-            vifs_already_plugged=True)
+            vifs_already_plugged=vifs_already_plugged,
+            external_events=external_events)
         self._prepare_pci_devices_for_use(
             pci_manager.get_instance_pci_devs(instance, 'all'))
 
@@ -7274,7 +7300,8 @@ class LibvirtDriver(driver.ComputeDriver):
                 if not types or cap['type'] in types:
                     device["types"].update({cap['type']: {
                         'availableInstances': cap['availableInstances'],
-                        'name': cap['name'],
+                        # This attribute is optional
+                        'name': cap.get('name'),
                         'deviceAPI': cap['deviceAPI']}})
         return device
 
@@ -8579,15 +8606,16 @@ class LibvirtDriver(driver.ComputeDriver):
         disk_available_mb = (
             (disk_available_gb * units.Ki) - CONF.reserved_host_disk_mb)
 
-        # Compare CPU
-        try:
-            if not instance.vcpu_model or not instance.vcpu_model.model:
-                source_cpu_info = src_compute_info['cpu_info']
-                self._compare_cpu(None, source_cpu_info, instance)
-            else:
-                self._compare_cpu(instance.vcpu_model, None, instance)
-        except exception.InvalidCPUInfo as e:
-            raise exception.MigrationPreCheckError(reason=e)
+        if not CONF.workarounds.skip_cpu_compare_on_dest:
+            # Compare CPU
+            try:
+                if not instance.vcpu_model or not instance.vcpu_model.model:
+                    source_cpu_info = src_compute_info['cpu_info']
+                    self._compare_cpu(None, source_cpu_info, instance)
+                else:
+                    self._compare_cpu(instance.vcpu_model, None, instance)
+            except exception.InvalidCPUInfo as e:
+                raise exception.MigrationPreCheckError(reason=e)
 
         # Create file on storage, to be checked on source host
         filename = self._create_shared_storage_test_file(instance)
@@ -10389,7 +10417,7 @@ class LibvirtDriver(driver.ComputeDriver):
                     exception.ResizeError(reason=reason))
 
         self.power_off(instance, timeout, retry_interval)
-
+        self.unplug_vifs(instance, network_info)
         block_device_mapping = driver.block_device_info_get_mapping(
             block_device_info)
         for vol in block_device_mapping:
@@ -10704,18 +10732,9 @@ class LibvirtDriver(driver.ComputeDriver):
                                   instance.image_meta,
                                   block_device_info=block_device_info,
                                   mdevs=mdevs)
-        # NOTE(artom) In some Neutron or port configurations we've already
-        # waited for vif-plugged events in the compute manager's
-        # _finish_revert_resize_network_migrate_finish(), right after updating
-        # the port binding. For any ports not covered by those "bind-time"
-        # events, we wait for "plug-time" events here.
-        events = network_info.get_plug_time_events(migration)
-        if events:
-            LOG.debug('Instance is using plug-time events: %s', events,
-                      instance=instance)
         self._create_guest_with_network(
             context, xml, instance, network_info, block_device_info,
-            power_on=power_on, external_events=events)
+            power_on=power_on)
 
         if power_on:
             timer = loopingcall.FixedIntervalLoopingCall(
