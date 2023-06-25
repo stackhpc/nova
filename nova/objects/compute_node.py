@@ -360,7 +360,7 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
 
     @base.remotable
     def destroy(self):
-        db.compute_node_delete(self._context, self.id)
+        db.compute_node_delete(self._context, self.id, self.host)
 
     def update_from_virt_driver(self, resources):
         # NOTE(pmurray): the virt driver provides a dict of values that

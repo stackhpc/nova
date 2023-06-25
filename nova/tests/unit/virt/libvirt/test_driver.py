@@ -348,6 +348,29 @@ _fake_NodeDevXml = {
         </capability>
       </capability>
     </device>""",
+     "pci_0000_06_00_1": """
+    <device>
+      <name>pci_0000_06_00_1</name>
+      <path>/sys/devices/pci0000:00/0000:00:06.1</path>
+      <parent></parent>
+      <driver>
+        <name>i915</name>
+      </driver>
+      <capability type="pci">
+        <domain>0</domain>
+        <bus>6</bus>
+        <slot>0</slot>
+        <function>1</function>
+        <product id="0x591d">HD Graphics P630</product>
+        <vendor id="0x8086">Intel Corporation</vendor>
+        <capability type='mdev_types'>
+          <type id='i915-GVTg_V5_8'>
+            <deviceAPI>vfio-pci</deviceAPI>
+            <availableInstances>2</availableInstances>
+          </type>
+        </capability>
+      </capability>
+    </device>""",
      "mdev_4b20d080_1b54_4048_85b3_a6a62d165c01": """
     <device>
       <name>mdev_4b20d080_1b54_4048_85b3_a6a62d165c01</name>
@@ -10928,6 +10951,25 @@ class LibvirtConnTestCase(test.NoDBTestCase,
                        '_create_shared_storage_test_file',
                        return_value='fake')
     @mock.patch.object(libvirt_driver.LibvirtDriver, '_compare_cpu')
+    def test_check_can_live_migrate_guest_cpu_none_model_skip_compare(
+            self, mock_cpu, mock_test_file):
+        self.flags(group='workarounds', skip_cpu_compare_on_dest=True)
+        instance_ref = objects.Instance(**self.test_instance)
+        instance_ref.vcpu_model = test_vcpu_model.fake_vcpumodel
+        instance_ref.vcpu_model.model = None
+        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+        compute_info = {'cpu_info': 'asdf', 'disk_available_least': 1}
+        drvr.check_can_live_migrate_destination(
+            self.context, instance_ref, compute_info, compute_info)
+        mock_cpu.assert_not_called()
+
+    @mock.patch(
+        'nova.network.neutron.API.has_port_binding_extension',
+        new=mock.Mock(return_value=False))
+    @mock.patch.object(libvirt_driver.LibvirtDriver,
+                       '_create_shared_storage_test_file',
+                       return_value='fake')
+    @mock.patch.object(libvirt_driver.LibvirtDriver, '_compare_cpu')
     def test_check_can_live_migrate_dest_numa_lm(
             self, mock_cpu, mock_test_file):
         instance_ref = objects.Instance(**self.test_instance)
@@ -16288,7 +16330,48 @@ class LibvirtConnTestCase(test.NoDBTestCase,
             accel_info=accel_info)
         mock_create_guest_with_network.assert_called_once_with(self.context,
             dummyxml, instance, network_info, block_device_info,
-            vifs_already_plugged=True)
+            vifs_already_plugged=True, external_events=[])
+
+    @mock.patch('oslo_utils.fileutils.ensure_tree', new=mock.Mock())
+    @mock.patch('nova.virt.libvirt.LibvirtDriver.get_info')
+    @mock.patch('nova.virt.libvirt.LibvirtDriver._create_guest_with_network')
+    @mock.patch('nova.virt.libvirt.LibvirtDriver._get_guest_xml')
+    @mock.patch('nova.virt.libvirt.LibvirtDriver.destroy', new=mock.Mock())
+    @mock.patch(
+        'nova.virt.libvirt.LibvirtDriver._get_all_assigned_mediated_devices',
+        new=mock.Mock(return_value={}))
+    def test_hard_reboot_wait_for_plug(
+        self, mock_get_guest_xml, mock_create_guest_with_network, mock_get_info
+    ):
+        self.flags(
+            group="workarounds",
+            wait_for_vif_plugged_event_during_hard_reboot=["normal"])
+        self.context.auth_token = None
+        instance = objects.Instance(**self.test_instance)
+        network_info = _fake_network_info(self, num_networks=4)
+        network_info[0]["vnic_type"] = "normal"
+        network_info[1]["vnic_type"] = "direct"
+        network_info[2]["vnic_type"] = "normal"
+        network_info[3]["vnic_type"] = "direct-physical"
+        block_device_info = None
+        return_values = [hardware.InstanceInfo(state=power_state.SHUTDOWN),
+                         hardware.InstanceInfo(state=power_state.RUNNING)]
+        mock_get_info.side_effect = return_values
+        mock_get_guest_xml.return_value = mock.sentinel.xml
+
+        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+        drvr._hard_reboot(
+                self.context, instance, network_info, block_device_info)
+
+        mock_create_guest_with_network.assert_called_once_with(
+            self.context, mock.sentinel.xml, instance, network_info,
+            block_device_info,
+            vifs_already_plugged=False,
+            external_events=[
+                ('network-vif-plugged', uuids.vif1),
+                ('network-vif-plugged', uuids.vif3),
+            ]
+        )
 
     @mock.patch('oslo_utils.fileutils.ensure_tree')
     @mock.patch('oslo_service.loopingcall.FixedIntervalLoopingCall')
@@ -25085,6 +25168,28 @@ class LibvirtDriverTestCase(test.NoDBTestCase, TraitsComparisonMixin):
         # we don't get results.
         self.assertEqual([],
                          drvr._get_mdev_capable_devices(types=['nvidia-12']))
+
+    @mock.patch.object(host.Host, 'device_lookup_by_name')
+    def test_get_mdev_capabilities_for_dev_name_optional(
+            self, device_lookup_by_name):
+        # We use another PCI device that doesn't provide a name attribute for
+        # each mdev type.
+        def fake_nodeDeviceLookupByName(name):
+            return FakeNodeDevice(_fake_NodeDevXml[name])
+        device_lookup_by_name.side_effect = fake_nodeDeviceLookupByName
+
+        drvr = libvirt_driver.LibvirtDriver(fake.FakeVirtAPI(), False)
+
+        expected = {"dev_id": "pci_0000_06_00_1",
+                     "vendor_id": 0x8086,
+                     "types": {'i915-GVTg_V5_8': {'availableInstances': 2,
+                                                  'name': None,
+                                                  'deviceAPI': 'vfio-pci'},
+                               }
+                     }
+        self.assertEqual(
+            expected,
+            drvr._get_mdev_capabilities_for_dev("pci_0000_06_00_1"))
 
     @mock.patch.object(host.Host, 'device_lookup_by_name')
     @mock.patch.object(host.Host, 'list_mediated_devices')

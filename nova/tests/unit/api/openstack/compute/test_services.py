@@ -701,6 +701,21 @@ class ServicesTestV21(test.TestCase):
         mock_get_compute_nodes.assert_called_once_with(
             self.req.environ['nova.context'], compute.host)
 
+    @mock.patch(
+        'nova.objects.ComputeNodeList.get_all_by_host',
+        side_effect=exception.ComputeHostNotFound(host='fake-compute-host'))
+    def test_services_delete_compute_host_not_found(
+            self, mock_get_all_by_host):
+        compute = objects.Service(self.ctxt,
+                                  **{'host': 'fake-compute-host',
+                                     'binary': 'nova-compute',
+                                     'topic': 'compute',
+                                     'report_count': 0})
+        compute.create()
+        self.controller.delete(self.req, compute.id)
+        mock_get_all_by_host.assert_called_with(
+            self.req.environ['nova.context'], 'fake-compute-host')
+
     def test_services_delete_not_found(self):
 
         self.assertRaises(webob.exc.HTTPNotFound,

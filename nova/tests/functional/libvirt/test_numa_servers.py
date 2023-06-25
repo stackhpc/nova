@@ -21,6 +21,7 @@ from oslo_config import cfg
 from oslo_log import log as logging
 
 import nova
+from nova.compute import manager
 from nova.conf import neutron as neutron_conf
 from nova import context as nova_context
 from nova import objects
@@ -710,6 +711,211 @@ class NUMAServersTest(NUMAServersTestBase):
         self.api.post_server_action(server['id'], post)
 
         server = self._wait_for_state_change(server, 'ACTIVE')
+
+    def _assert_pinned_cpus(self, hostname, expected_number_of_pinned):
+        numa_topology = objects.NUMATopology.obj_from_db_obj(
+            objects.ComputeNode.get_by_nodename(
+                self.ctxt, hostname,
+            ).numa_topology,
+        )
+        self.assertEqual(
+            expected_number_of_pinned, len(numa_topology.cells[0].pinned_cpus))
+
+    def _create_server_and_resize_bug_1944759(self):
+        self.flags(
+            cpu_dedicated_set='0-3', cpu_shared_set='4-7', group='compute')
+        self.flags(vcpu_pin_set=None)
+
+        # start services
+        self.start_compute(hostname='test_compute0')
+        self.start_compute(hostname='test_compute1')
+
+        flavor_a_id = self._create_flavor(
+            vcpu=2, extra_spec={'hw:cpu_policy': 'dedicated'})
+        server = self._create_server(flavor_id=flavor_a_id)
+
+        src_host = server['OS-EXT-SRV-ATTR:host']
+        self._assert_pinned_cpus(src_host, 2)
+
+        # we don't really care what the new flavor is, so long as the old
+        # flavor is using pinning. We use a similar flavor for simplicity.
+        flavor_b_id = self._create_flavor(
+            vcpu=2, extra_spec={'hw:cpu_policy': 'dedicated'})
+
+        orig_rpc_finish_resize = nova.compute.rpcapi.ComputeAPI.finish_resize
+
+        # Simulate that the finish_resize call overlaps with an
+        # update_available_resource periodic job
+        def inject_periodic_to_finish_resize(*args, **kwargs):
+            self._run_periodics()
+            return orig_rpc_finish_resize(*args, **kwargs)
+
+        self.stub_out(
+            'nova.compute.rpcapi.ComputeAPI.finish_resize',
+            inject_periodic_to_finish_resize,
+        )
+
+        # TODO(stephenfin): The mock of 'migrate_disk_and_power_off' should
+        # probably be less...dumb
+        with mock.patch(
+            'nova.virt.libvirt.driver.LibvirtDriver'
+            '.migrate_disk_and_power_off', return_value='{}',
+        ):
+            post = {'resize': {'flavorRef': flavor_b_id}}
+            self.api.post_server_action(server['id'], post)
+            server = self._wait_for_state_change(server, 'VERIFY_RESIZE')
+
+        dst_host = server['OS-EXT-SRV-ATTR:host']
+
+        # we have 2 cpus pinned on both computes. The source should have it
+        # due to the outbound migration and the destination due to the
+        # instance running there
+        self._assert_pinned_cpus(src_host, 2)
+        self._assert_pinned_cpus(dst_host, 2)
+
+        return server, src_host, dst_host
+
+    def test_resize_confirm_bug_1944759(self):
+        server, src_host, dst_host = (
+            self._create_server_and_resize_bug_1944759())
+
+        # Now confirm the resize
+        post = {'confirmResize': None}
+
+        self.api.post_server_action(server['id'], post)
+        self._wait_for_state_change(server, 'ACTIVE')
+
+        # the resource allocation reflects that the VM is running on the dest
+        # node
+        self._assert_pinned_cpus(src_host, 0)
+        self._assert_pinned_cpus(dst_host, 2)
+
+        # and running periodics does not break it either
+        self._run_periodics()
+
+        self._assert_pinned_cpus(src_host, 0)
+        self._assert_pinned_cpus(dst_host, 2)
+
+    def test_resize_revert_bug_1944759(self):
+        server, src_host, dst_host = (
+            self._create_server_and_resize_bug_1944759())
+
+        # Now revert the resize
+        post = {'revertResize': None}
+
+        # reverts actually succeeds (not like confirm) but the resource
+        # allocation is still flaky
+        self.api.post_server_action(server['id'], post)
+        self._wait_for_state_change(server, 'ACTIVE')
+
+        # After the revert the source host should have 2 cpus pinned due to
+        # the instance.
+        self._assert_pinned_cpus(src_host, 2)
+        self._assert_pinned_cpus(dst_host, 0)
+
+        # running the periodic job will not break it either
+        self._run_periodics()
+
+        self._assert_pinned_cpus(src_host, 2)
+        self._assert_pinned_cpus(dst_host, 0)
+
+    def test_resize_dedicated_policy_race_on_dest_bug_1953359(self):
+
+        self.flags(cpu_dedicated_set='0-2', cpu_shared_set=None,
+                   group='compute')
+        self.flags(vcpu_pin_set=None)
+
+        host_info = fakelibvirt.HostInfo(cpu_nodes=1, cpu_sockets=1,
+                                         cpu_cores=2, cpu_threads=1,
+                                         kB_mem=15740000)
+        self.start_compute(host_info=host_info, hostname='compute1')
+
+        extra_spec = {
+            'hw:cpu_policy': 'dedicated',
+        }
+        flavor_id = self._create_flavor(vcpu=1, extra_spec=extra_spec)
+        expected_usage = {'DISK_GB': 20, 'MEMORY_MB': 2048, 'PCPU': 1}
+
+        server = self._run_build_test(flavor_id, expected_usage=expected_usage)
+
+        inst = objects.Instance.get_by_uuid(self.ctxt, server['id'])
+        self.assertEqual(1, len(inst.numa_topology.cells))
+        # assert that the pcpu 0 is used on compute1
+        self.assertEqual({'0': 0}, inst.numa_topology.cells[0].cpu_pinning_raw)
+
+        # start another compute with the same config
+        self.start_compute(host_info=host_info, hostname='compute2')
+
+        # boot another instance but now on compute2 so that it occupies the
+        # pcpu 0 on compute2
+        # NOTE(gibi): _run_build_test cannot be used here as it assumes only
+        # compute1 exists
+        server2 = self._create_server(
+            flavor_id=flavor_id,
+            host='compute2',
+        )
+        inst2 = objects.Instance.get_by_uuid(self.ctxt, server2['id'])
+        self.assertEqual(1, len(inst2.numa_topology.cells))
+        # assert that the pcpu 0 is used
+        self.assertEqual(
+            {'0': 0}, inst2.numa_topology.cells[0].cpu_pinning_raw)
+
+        # migrate the first instance from compute1 to compute2 but stop
+        # migrating at the start of finish_resize. Then start a racing periodic
+        # update_available_resources.
+        orig_finish_resize = manager.ComputeManager.finish_resize
+
+        def fake_finish_resize(*args, **kwargs):
+            # start a racing update_available_resource periodic
+            self._run_periodics()
+            # we expect it that CPU pinning fails on the destination node
+            # as the resource_tracker will use the source node numa_topology
+            # and that does not fit to the dest node as pcpu 0 in the dest
+            # is already occupied.
+            log = self.stdlog.logger.output
+            # The resize_claim correctly calculates that the instance should be
+            # pinned to pcpu id 1 instead of 0
+            self.assertIn(
+                'Computed NUMA topology CPU pinning: usable pCPUs: [[1]], '
+                'vCPUs mapping: [(0, 1)]',
+                log,
+            )
+            # We expect that the periodic not fails as bug 1953359 is fixed.
+            log = self.stdlog.logger.output
+            self.assertIn('Running periodic for compute (compute2)', log)
+            self.assertNotIn('Error updating resources for node compute2', log)
+            self.assertNotIn(
+                'nova.exception.CPUPinningInvalid: CPU set to pin [0] must be '
+                'a subset of free CPU set [1]',
+                log,
+            )
+
+            # now let the resize finishes
+            return orig_finish_resize(*args, **kwargs)
+
+        # TODO(stephenfin): The mock of 'migrate_disk_and_power_off' should
+        # probably be less...dumb
+        with mock.patch('nova.virt.libvirt.driver.LibvirtDriver'
+                        '.migrate_disk_and_power_off', return_value='{}'):
+            with mock.patch(
+                'nova.compute.manager.ComputeManager.finish_resize',
+                new=fake_finish_resize,
+            ):
+                post = {'migrate': None}
+                # this is expected to succeed
+                self.admin_api.post_server_action(server['id'], post)
+
+        server = self._wait_for_state_change(server, 'VERIFY_RESIZE')
+
+        # As bug 1953359 is fixed the revert should succeed too
+        post = {'revertResize': {}}
+        self.admin_api.post_server_action(server['id'], post)
+        self._wait_for_state_change(server, 'ACTIVE')
+        self.assertNotIn(
+            'nova.exception.CPUUnpinningInvalid: CPU set to unpin [1] must be '
+            'a subset of pinned CPU set [0]',
+            self.stdlog.logger.output,
+        )
 
 
 class NUMAServerTestWithCountingQuotaFromPlacement(NUMAServersTest):

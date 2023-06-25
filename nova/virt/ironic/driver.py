@@ -788,10 +788,15 @@ class IronicDriver(virt_driver.ComputeDriver):
     def _refresh_cache(self):
         ctxt = nova_context.get_admin_context()
         self._refresh_hash_ring(ctxt)
-        instances = objects.InstanceList.get_uuids_by_host(ctxt, CONF.host)
         node_cache = {}
 
         def _get_node_list(**kwargs):
+            # NOTE(TheJulia): This call can take a substantial amount
+            # of time as it may be attempting to retrieve thousands of
+            # baremetal nodes. Depending on the version of Ironic,
+            # this can be as long as 2-10 seconds per every thousand
+            # nodes, and this call may retrieve all nodes in a deployment,
+            # depending on if any filter paramters are applied.
             return self._get_node_list(fields=_NODE_FIELDS, **kwargs)
 
         # NOTE(jroll) if partition_key is set, we need to limit nodes that
@@ -814,6 +819,15 @@ class IronicDriver(virt_driver.ComputeDriver):
                 nodes = _get_node_list()
         else:
             nodes = _get_node_list()
+
+        # NOTE(saga): As _get_node_list() will take a long
+        # time to return in large clusters we need to call it before
+        # get_uuids_by_host() method. Otherwise the instances list we get from
+        # get_uuids_by_host() method will become stale.
+        # A stale instances list can cause a node that is managed by this
+        # compute host to be excluded in error and cause the compute node
+        # to be orphaned and associated resource provider to be deleted.
+        instances = objects.InstanceList.get_uuids_by_host(ctxt, CONF.host)
 
         for node in nodes:
             # NOTE(jroll): we always manage the nodes for instances we manage
@@ -1609,13 +1623,21 @@ class IronicDriver(virt_driver.ComputeDriver):
     def plug_vifs(self, instance, network_info):
         """Plug VIFs into networks.
 
+        This method is present for compatability. Any call will result
+        in a DEBUG log entry being generated, and will otherwise be
+        ignored, as Ironic manages VIF attachments through a node
+        lifecycle. Please see ``attach_interface``, which is the
+        proper and current method to utilize.
+
         :param instance: The instance object.
         :param network_info: Instance network information.
 
         """
-        # instance.node is the ironic node's UUID.
-        node = self._get_node(instance.node)
-        self._plug_vifs(node, instance, network_info)
+        LOG.debug('VIF plug called for instance %(instance)s on node '
+                  '%(node)s, however Ironic manages VIF attachments '
+                  'for nodes.',
+                  {'instance': instance.uuid,
+                   'node': instance.node})
 
     def unplug_vifs(self, instance, network_info):
         """Unplug VIFs from networks.
@@ -1646,7 +1668,8 @@ class IronicDriver(virt_driver.ComputeDriver):
         # event from neutron or by _heal_instance_info_cache periodic task. In
         # both cases, this is done asynchronously, so the cache may not be up
         # to date immediately after attachment.
-        self.plug_vifs(instance, [vif])
+        node = self._get_node(instance.node)
+        self._plug_vifs(node, instance, [vif])
 
     def detach_interface(self, context, instance, vif):
         """Use hotunplug to remove a network interface from a running instance.
@@ -1963,7 +1986,9 @@ class IronicDriver(virt_driver.ComputeDriver):
         """
 
         try:
-            self.plug_vifs(instance, network_info)
+            node = self._get_node(instance.node)
+            self._plug_vifs(node, instance, network_info)
+
         except Exception:
             with excutils.save_and_reraise_exception():
                 LOG.error("Error preparing deploy for instance "

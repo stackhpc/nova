@@ -414,8 +414,9 @@ class _TestComputeNodeObject(object):
     def test_destroy(self, mock_delete):
         compute = compute_node.ComputeNode(context=self.context)
         compute.id = 123
+        compute.host = 'fake'
         compute.destroy()
-        mock_delete.assert_called_once_with(self.context, 123)
+        mock_delete.assert_called_once_with(self.context, 123, 'fake')
 
     @mock.patch.object(db, 'compute_node_get_all')
     def test_get_all(self, mock_get_all):
