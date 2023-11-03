@@ -143,6 +143,22 @@ class TestNeutronClient(test.NoDBTestCase):
         self.assertIsInstance(cl.httpclient.auth,
                               service_token.ServiceTokenAuthWrapper)
 
+    @mock.patch('nova.service_auth._SERVICE_AUTH')
+    @mock.patch('nova.network.neutron._ADMIN_AUTH')
+    @mock.patch.object(ks_loading, 'load_auth_from_conf_options')
+    def test_admin_with_service_token(
+        self, mock_load, mock_admin_auth, mock_service_auth
+    ):
+        self.flags(send_service_user_token=True, group='service_user')
+
+        admin_context = context.get_admin_context()
+
+        cl = neutronapi.get_client(admin_context)
+        self.assertIsInstance(cl.httpclient.auth,
+                              service_token.ServiceTokenAuthWrapper)
+        self.assertEqual(mock_admin_auth, cl.httpclient.auth.user_auth)
+        self.assertEqual(mock_service_auth, cl.httpclient.auth.service_auth)
+
     @mock.patch.object(client.Client, "list_networks",
                        side_effect=exceptions.Unauthorized())
     def test_Unauthorized_user(self, mock_list_networks):
@@ -7416,8 +7432,24 @@ class TestAPI(TestAPIBase):
             network_id=uuids.network_id, fields='segment_id')
 
     @mock.patch.object(neutronapi, 'get_client')
-    def test_get_segment_ids_for_network_with_no_segments(self, mock_client):
+    def test_get_segment_ids_for_network_with_segments_none(self, mock_client):
         subnets = {'subnets': [{'segment_id': None}]}
+        mocked_client = mock.create_autospec(client.Client)
+        mock_client.return_value = mocked_client
+        mocked_client.list_subnets.return_value = subnets
+        with mock.patch.object(
+            self.api, 'has_segment_extension', return_value=True,
+        ):
+            res = self.api.get_segment_ids_for_network(
+                self.context, uuids.network_id)
+        self.assertEqual([], res)
+        mock_client.assert_called_once_with(self.context, admin=True)
+        mocked_client.list_subnets.assert_called_once_with(
+            network_id=uuids.network_id, fields='segment_id')
+
+    @mock.patch.object(neutronapi, 'get_client')
+    def test_get_segment_ids_for_network_with_no_segments(self, mock_client):
+        subnets = {'subnets': [{}]}
         mocked_client = mock.create_autospec(client.Client)
         mock_client.return_value = mocked_client
         mocked_client.list_subnets.return_value = subnets

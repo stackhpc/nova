@@ -1639,7 +1639,7 @@ class LibvirtDriver(driver.ComputeDriver):
             try:
                 self._disconnect_volume(
                     context, connection_info, instance,
-                    destroy_secrets=destroy_secrets)
+                    destroy_secrets=destroy_secrets, force=True)
             except Exception as exc:
                 with excutils.save_and_reraise_exception() as ctxt:
                     if cleanup_instance_disks:
@@ -1956,7 +1956,7 @@ class LibvirtDriver(driver.ComputeDriver):
         return (False if connection_count > 1 else True)
 
     def _disconnect_volume(self, context, connection_info, instance,
-                           encryption=None, destroy_secrets=True):
+                           encryption=None, destroy_secrets=True, force=False):
         self._detach_encryptor(
             context,
             connection_info,
@@ -1968,7 +1968,8 @@ class LibvirtDriver(driver.ComputeDriver):
         multiattach = connection_info.get('multiattach', False)
         if self._should_disconnect_target(
                 context, instance, multiattach, vol_driver, volume_id):
-            vol_driver.disconnect_volume(connection_info, instance)
+            vol_driver.disconnect_volume(
+                connection_info, instance, force=force)
         else:
             LOG.info('Detected multiple connections on this host for '
                      'volume: %(volume)s, skipping target disconnect.',
@@ -10469,10 +10470,13 @@ class LibvirtDriver(driver.ComputeDriver):
         :param instance:  the instance being migrated
         :param migrate_date: a LibvirtLiveMigrateData object
         """
-        network_info = network_model.NetworkInfo(
-            [vif.source_vif for vif in migrate_data.vifs
-                            if "source_vif" in vif and vif.source_vif])
-        self._reattach_instance_vifs(context, instance, network_info)
+        # NOTE(artom) migrate_data.vifs might not be set if our Neutron doesn't
+        # have the multiple port bindings extension.
+        if 'vifs' in migrate_data and migrate_data.vifs:
+            network_info = network_model.NetworkInfo(
+                [vif.source_vif for vif in migrate_data.vifs
+                                if "source_vif" in vif and vif.source_vif])
+            self._reattach_instance_vifs(context, instance, network_info)
 
     def rollback_live_migration_at_destination(self, context, instance,
                                                network_info,

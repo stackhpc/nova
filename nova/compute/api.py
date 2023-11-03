@@ -384,7 +384,6 @@ class API:
         self.image_api = image_api or glance.API()
         self.network_api = network_api or neutron.API()
         self.volume_api = volume_api or cinder.API()
-        self._placementclient = None  # Lazy-load on first access.
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
         self.compute_task_api = conductor.ComputeTaskAPI()
         self.servicegroup_api = servicegroup.API()
@@ -2573,9 +2572,7 @@ class API:
 
     @property
     def placementclient(self):
-        if self._placementclient is None:
-            self._placementclient = report.SchedulerReportClient()
-        return self._placementclient
+        return report.report_client_singleton()
 
     def _local_delete(self, context, instance, bdms, delete_type, cb):
         if instance.vm_state == vm_states.SHELVED_OFFLOADED:
@@ -4220,6 +4217,19 @@ class API:
         if not same_flavor:
             request_spec.numa_topology = hardware.numa_get_constraints(
                 new_flavor, instance.image_meta)
+            # if the flavor is changed then we need to recalculate the
+            # pci_requests as well because the new flavor might request
+            # different pci_aliases
+            new_pci_requests = pci_request.get_pci_requests_from_flavor(
+                new_flavor)
+            new_pci_requests.instance_uuid = instance.uuid
+            # The neutron based InstancePCIRequest cannot change during resize,
+            # so we just need to copy them from the old request
+            for request in request_spec.pci_requests.requests or []:
+                if request.source == objects.InstancePCIRequest.NEUTRON_PORT:
+                    new_pci_requests.requests.append(request)
+            request_spec.pci_requests = new_pci_requests
+
             # TODO(huaqiang): Remove in Wallaby
             # check nova-compute nodes have been updated to Victoria to resize
             # instance to a new mixed instance from a dedicated or shared
@@ -4544,6 +4554,7 @@ class API:
                allow_bfv_rescue=False):
         """Rescue the given instance."""
 
+        image_meta = None
         if rescue_image_ref:
             try:
                 image_meta = image_meta_obj.ImageMeta.from_image_ref(
@@ -4564,6 +4575,8 @@ class API:
                             "image properties set")
                 raise exception.UnsupportedRescueImage(
                     image=rescue_image_ref)
+        else:
+            image_meta = instance.image_meta
 
         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
                     context, instance.uuid)
@@ -4571,6 +4584,9 @@ class API:
 
         volume_backed = compute_utils.is_volume_backed_instance(
             context, instance, bdms)
+
+        allow_bfv_rescue &= 'hw_rescue_bus' in image_meta.properties and \
+            'hw_rescue_device' in image_meta.properties
 
         if volume_backed and allow_bfv_rescue:
             cn = objects.ComputeNode.get_by_host_and_nodename(
@@ -6301,13 +6317,10 @@ class AggregateAPI:
     def __init__(self):
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
         self.query_client = query.SchedulerQueryClient()
-        self._placement_client = None  # Lazy-load on first access.
 
     @property
     def placement_client(self):
-        if self._placement_client is None:
-            self._placement_client = report.SchedulerReportClient()
-        return self._placement_client
+        return report.report_client_singleton()
 
     @wrap_exception()
     def create_aggregate(self, context, aggregate_name, availability_zone):
