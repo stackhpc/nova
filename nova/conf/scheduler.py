@@ -147,44 +147,6 @@ Related options:
 
 - ``[scheduler] placement_aggregate_required_for_tenants``
 """),
-    cfg.BoolOpt("query_placement_for_availability_zone",
-        default=True,
-        deprecated_for_removal=True,
-        deprecated_since='24.0.0',
-        deprecated_reason="""
-Since the introduction of placement pre-filters in 18.0.0 (Rocky), we have
-supported tracking Availability Zones either natively in placement or using the
-legacy ``AvailabilityZoneFilter`` scheduler filter. In 24.0.0 (Xena), the
-filter-based approach has been deprecated for removal in favor of the
-placement-based approach. As a result, this config option has also been
-deprecated and will be removed when the ``AvailabilityZoneFilter`` filter is
-removed.
-""",
-        help="""
-Use placement to determine availability zones.
-
-This setting causes the scheduler to look up a host aggregate with the
-metadata key of `availability_zone` set to the value provided by an
-incoming request, and request results from placement be limited to that
-aggregate.
-
-The matching aggregate UUID must be mirrored in placement for proper
-operation. If no host aggregate with the `availability_zone` key is
-found, or that aggregate does not match one in placement, the result will
-be the same as not finding any suitable hosts.
-
-Note that if you disable this flag, you **must** enable the (less efficient)
-``AvailabilityZoneFilter`` in the scheduler in order to availability zones to
-work correctly.
-
-Possible values:
-
-- A boolean value.
-
-Related options:
-
-- ``[filter_scheduler] enabled_filters``
-"""),
     cfg.BoolOpt("query_placement_for_image_type_support",
         default=False,
         help="""
@@ -405,7 +367,7 @@ Possible values:
     cfg.FloatOpt("ram_weight_multiplier",
         default=1.0,
         help="""
-RAM weight multipler ratio.
+RAM weight multiplier ratio.
 
 This option determines how hosts with more or less available RAM are weighed. A
 positive value will result in the scheduler preferring hosts with more
@@ -421,7 +383,7 @@ enabled.
 
 Possible values:
 
-* An integer or float value, where the value corresponds to the multipler
+* An integer or float value, where the value corresponds to the multiplier
   ratio for this weigher.
 
 Related options:
@@ -441,7 +403,7 @@ enabled.
 
 Possible values:
 
-* An integer or float value, where the value corresponds to the multipler
+* An integer or float value, where the value corresponds to the multiplier
   ratio for this weigher.
 
 Related options:
@@ -451,7 +413,7 @@ Related options:
     cfg.FloatOpt("disk_weight_multiplier",
         default=1.0,
         help="""
-Disk weight multipler ratio.
+Disk weight multiplier ratio.
 
 Multiplier used for weighing free disk space. Negative numbers mean to
 stack vs spread.
@@ -461,13 +423,101 @@ is enabled.
 
 Possible values:
 
-* An integer or float value, where the value corresponds to the multipler
+* An integer or float value, where the value corresponds to the multiplier
   ratio for this weigher.
+"""),
+    cfg.FloatOpt("hypervisor_version_weight_multiplier",
+        default=1.0,
+        help="""
+Hypervisor Version weight multiplier ratio.
+
+The multiplier is used for weighting hosts based on the reported
+hypervisor version.
+Negative numbers indicate preferring older hosts,
+the default is to prefer newer hosts to aid with upgrades.
+
+Possible values:
+
+* An integer or float value, where the value corresponds to the multiplier
+  ratio for this weigher.
+
+Example:
+
+* Strongly prefer older hosts
+
+  .. code-block:: ini
+
+    [filter_scheduler]
+    hypervisor_version_weight_multiplier=-1000
+
+
+* Moderately prefer new hosts
+
+  .. code-block:: ini
+
+    [filter_scheduler]
+    hypervisor_version_weight_multiplier=2.5
+
+* Disable weigher influence
+
+  .. code-block:: ini
+
+    [filter_scheduler]
+    hypervisor_version_weight_multiplier=0
+
+Related options:
+
+* ``[filter_scheduler] weight_classes``
+"""),
+    cfg.FloatOpt("num_instances_weight_multiplier",
+        default=0.0,
+        help="""
+Number of instances weight multiplier ratio.
+
+The multiplier is used for weighting hosts based on the reported
+number of instances they have.
+Negative numbers indicate preferring hosts with fewer instances (i.e. choosing
+to spread instances), while positive numbers mean preferring hosts with more
+hosts (ie. choosing to pack).
+The default is 0.0 which means that you have to choose a strategy if you want
+to use it.
+
+Possible values:
+
+* An integer or float value, where the value corresponds to the multiplier
+  ratio for this weigher.
+
+Example:
+
+* Strongly prefer to pack instances to hosts.
+
+  .. code-block:: ini
+
+    [filter_scheduler]
+    num_instances_weight_multiplier=1000
+
+* Softly prefer to spread instances between hosts.
+
+  .. code-block:: ini
+
+    [filter_scheduler]
+    num_instances_weight_multiplier=1.0
+
+* Disable weigher influence
+
+  .. code-block:: ini
+
+    [filter_scheduler]
+    num_instances_weight_multiplier=0
+
+Related options:
+
+* ``[filter_scheduler] weight_classes``
 """),
     cfg.FloatOpt("io_ops_weight_multiplier",
         default=-1.0,
         help="""
-IO operations weight multipler ratio.
+IO operations weight multiplier ratio.
 
 This option determines how hosts with differing workloads are weighed. Negative
 values, such as the default, will result in the scheduler preferring hosts with
@@ -483,7 +533,7 @@ is enabled.
 
 Possible values:
 
-* An integer or float value, where the value corresponds to the multipler
+* An integer or float value, where the value corresponds to the multiplier
   ratio for this weigher.
 
 Related options:
@@ -745,7 +795,26 @@ Possible values:
 Related options:
 
 * ``[filter_scheduler] aggregate_image_properties_isolation_namespace``
-""")]
+"""),
+    cfg.BoolOpt(
+        "pci_in_placement",
+        default=False,
+        help="""
+Enable scheduling and claiming PCI devices in Placement.
+
+This can be enabled after ``[pci]report_in_placement`` is enabled on all
+compute hosts.
+
+When enabled the scheduler queries Placement about the PCI device
+availability to select destination for a server with PCI request. The scheduler
+also allocates the selected PCI devices in Placement. Note that this logic
+does not replace the PCIPassthroughFilter but extends it.
+
+* ``[pci] report_in_placement``
+* ``[pci] alias``
+* ``[pci] device_spec``
+"""),
+]
 
 metrics_group = cfg.OptGroup(
     name="metrics",
@@ -780,7 +849,7 @@ follows:
 
 Possible values:
 
-* An integer or float value, where the value corresponds to the multipler
+* An integer or float value, where the value corresponds to the multiplier
   ratio for this weigher.
 
 Related options:
@@ -857,7 +926,7 @@ of any actual metric value:
 
 Possible values:
 
-* An integer or float value, where the value corresponds to the multipler
+* An integer or float value, where the value corresponds to the multiplier
   ratio for this weigher.
 
 Related options:

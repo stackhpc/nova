@@ -60,25 +60,26 @@ class LibvirtISCSIVolumeDriver(libvirt_volume.LibvirtBaseVolumeDriver):
     def connect_volume(self, connection_info, instance):
         """Attach the volume to instance_name."""
 
-        LOG.debug("Calling os-brick to attach iSCSI Volume")
+        LOG.debug("Calling os-brick to attach iSCSI Volume", instance=instance)
         device_info = self.connector.connect_volume(connection_info['data'])
-        LOG.debug("Attached iSCSI volume %s", device_info)
+        LOG.debug("Attached iSCSI volume %s", device_info, instance=instance)
 
         connection_info['data']['device_path'] = device_info['path']
 
-    def disconnect_volume(self, connection_info, instance):
+    def disconnect_volume(self, connection_info, instance, force=False):
         """Detach the volume from instance_name."""
 
         LOG.debug("calling os-brick to detach iSCSI Volume", instance=instance)
         try:
-            self.connector.disconnect_volume(connection_info['data'], None)
+            self.connector.disconnect_volume(
+                connection_info['data'], None, force=force)
         except os_brick_exception.VolumeDeviceNotFound as exc:
             LOG.warning('Ignoring VolumeDeviceNotFound: %s', exc)
             return
         LOG.debug("Disconnected iSCSI Volume", instance=instance)
 
         super(LibvirtISCSIVolumeDriver,
-              self).disconnect_volume(connection_info, instance)
+              self).disconnect_volume(connection_info, instance, force=force)
 
     def extend_volume(self, connection_info, instance, requested_size):
         """Extend the volume."""

@@ -28,6 +28,7 @@ import re
 import sys
 import time
 import traceback
+import typing as ty
 from urllib import parse as urlparse
 
 from dateutil import parser as dateutil_parser
@@ -57,6 +58,8 @@ from nova.db.main import api as db
 from nova.db import migration
 from nova import exception
 from nova.i18n import _
+from nova.limit import local as local_limit
+from nova.limit import placement as placement_limit
 from nova.network import constants
 from nova.network import neutron as neutron_api
 from nova import objects
@@ -69,6 +72,7 @@ from nova.objects import instance_mapping as instance_mapping_obj
 from nova.objects import pci_device as pci_device_obj
 from nova.objects import quotas as quotas_obj
 from nova.objects import virtual_interface as virtual_interface_obj
+import nova.quota
 from nova import rpc
 from nova.scheduler.client import report
 from nova.scheduler import utils as scheduler_utils
@@ -121,6 +125,10 @@ def format_dict(dct, dict_property="Property", dict_value='Value',
     """
     pt = prettytable.PrettyTable([dict_property, dict_value])
     pt.align = 'l'
+    # starting in PrettyTable 3.4.0 we need to also set the header
+    # as align now only applies to the data.
+    if hasattr(pt, 'header_align'):
+        pt.header_align = 'l'
     for k, v in sorted(dct.items(), key=sort_key):
         # convert dict to str to check length
         if isinstance(v, dict):
@@ -180,6 +188,8 @@ class DbCommands(object):
         instance_mapping_obj.populate_user_id,
         # Added in Victoria
         pci_device_obj.PciDevice.populate_dev_uuids,
+        # Added in 2023.2
+        instance_obj.populate_instance_compute_id,
     )
 
     @args('--local_cell', action='store_true',
@@ -224,10 +234,10 @@ class DbCommands(object):
         print(migration.db_version())
 
     @args('--max_rows', type=int, metavar='<number>', dest='max_rows',
-          help='Maximum number of deleted rows to archive. Defaults to 1000. '
-               'Note that this number does not include the corresponding '
-               'rows, if any, that are removed from the API database for '
-               'deleted instances.')
+          help='Maximum number of deleted rows to archive per table. Defaults '
+               'to 1000. Note that this number is a soft limit and does not '
+               'include the corresponding rows, if any, that are removed '
+               'from the API database for deleted instances.')
     @args('--before', metavar='<date>',
           help=('Archive rows that have been deleted before this date. '
                 'Accepts date strings in the default format output by the '
@@ -399,7 +409,10 @@ class DbCommands(object):
              'cell1.instances': 5}
         :param cctxt: Cell-targeted nova.context.RequestContext if archiving
             across all cells
-        :param max_rows: Maximum number of deleted rows to archive
+        :param max_rows: Maximum number of deleted rows to archive per table.
+            Note that this number is a soft limit and does not include the
+            corresponding rows, if any, that are removed from the API database
+            for deleted instances.
         :param until_complete: Whether to run continuously until all deleted
             rows are archived
         :param verbose: Whether to print how many rows were archived per table
@@ -412,15 +425,26 @@ class DbCommands(object):
         """
         ctxt = context.get_admin_context()
         while True:
-            run, deleted_instance_uuids, total_rows_archived = \
+            # table_to_rows = {table_name: number_of_rows_archived}
+            # deleted_instance_uuids = ['uuid1', 'uuid2', ...]
+            table_to_rows, deleted_instance_uuids, total_rows_archived = \
                 db.archive_deleted_rows(
                     cctxt, max_rows, before=before_date, task_log=task_log)
-            for table_name, rows_archived in run.items():
+
+            for table_name, rows_archived in table_to_rows.items():
                 if cell_name:
                     table_name = cell_name + '.' + table_name
                 table_to_rows_archived.setdefault(table_name, 0)
                 table_to_rows_archived[table_name] += rows_archived
-            if deleted_instance_uuids:
+
+            # deleted_instance_uuids does not necessarily mean that any
+            # instances rows were archived because it is obtained by a query
+            # separate from the archive queries. For example, if a
+            # DBReferenceError was raised while processing the instances table,
+            # we would have skipped the table and had 0 rows archived even
+            # though deleted instances rows were found.
+            instances_archived = table_to_rows.get('instances', 0)
+            if deleted_instance_uuids and instances_archived:
                 table_to_rows_archived.setdefault(
                     'API_DB.instance_mappings', 0)
                 table_to_rows_archived.setdefault(
@@ -443,8 +467,9 @@ class DbCommands(object):
 
             # If we're not archiving until there is nothing more to archive, we
             # have reached max_rows in this cell DB or there was nothing to
-            # archive.
-            if not until_complete or not run:
+            # archive. We check the values() in case we get something like
+            # table_to_rows = {'instances': 0} back somehow.
+            if not until_complete or not any(table_to_rows.values()):
                 break
             if verbose:
                 sys.stdout.write('.')
@@ -735,7 +760,7 @@ class CellV2Commands(object):
         return 0
 
     def _map_cell0(self, database_connection=None):
-        """Faciliate creation of a cell mapping for cell0.
+        """Facilitate creation of a cell mapping for cell0.
         See map_cell0 for more.
         """
         def cell0_default_connection():
@@ -751,17 +776,9 @@ class CellV2Commands(object):
             # worry about parsing and splitting a URL which could have special
             # characters in the password, which makes parsing a nightmare.
             url = sqla_url.make_url(connection)
+            url = url.set(database=url.database + '_cell0')
 
-            # TODO(gibi): remove hasattr() conditional in favor of "url.set()"
-            # when SQLAlchemy 1.4 is the minimum version in requirements
-            if hasattr(url, "set"):
-                url = url.set(database=url.database + '_cell0')
-            else:
-                # TODO(zzzeek): remove when SQLAlchemy 1.4
-                # is the minimum version in requirements
-                url.database = url.database + '_cell0'
-
-            return urlparse.unquote(str(url))
+            return urlparse.unquote(url.render_as_string(hide_password=False))
 
         dbc = database_connection or cell0_default_connection()
         ctxt = context.RequestContext()
@@ -838,7 +855,7 @@ class CellV2Commands(object):
         # iteration, we search for the special name and unmunge the UUID to
         # pick up where we left off. This is done until all mappings are
         # processed. The munging is necessary as there's a unique constraint on
-        # the UUID field and we need something reversable. For more
+        # the UUID field and we need something reversible. For more
         # information, see commit 9038738d0.
 
         if max_count is not None:
@@ -1458,48 +1475,13 @@ class PlacementCommands(object):
                 instance_uuid=instance.uuid, error=str(e))
 
     @staticmethod
-    def _has_request_but_no_allocation(port):
-        request = port.get(constants.RESOURCE_REQUEST)
+    def _has_request_but_no_allocation(port, neutron):
+        has_res_req = neutron_api.API()._has_resource_request(
+            context.get_admin_context(), port, neutron)
+
         binding_profile = neutron_api.get_binding_profile(port)
         allocation = binding_profile.get(constants.ALLOCATION)
-        # We are defensive here about 'resources' and 'required' in the
-        # 'resource_request' as neutron API is not clear about those fields
-        # being optional.
-        return (request and request.get('resources') and
-                request.get('required') and
-                not allocation)
-
-    @staticmethod
-    def _get_rps_in_tree_with_required_traits(
-            ctxt, rp_uuid, required_traits, placement):
-        """Find the RPs that have all the required traits in the given rp tree.
-
-        :param ctxt: nova.context.RequestContext
-        :param rp_uuid: the RP uuid that will be used to query the tree.
-        :param required_traits: the traits that need to be supported by
-            the returned resource providers.
-        :param placement: nova.scheduler.client.report.SchedulerReportClient
-            to communicate with the Placement service API.
-        :raise PlacementAPIConnectFailure: if placement API cannot be reached
-        :raise ResourceProviderRetrievalFailed: if the resource provider does
-            not exist.
-        :raise ResourceProviderTraitRetrievalFailed: if resource provider
-            trait information cannot be read from placement.
-        :return: A list of RP UUIDs that supports every required traits and
-            in the tree for the provider rp_uuid.
-        """
-        try:
-            rps = placement.get_providers_in_tree(ctxt, rp_uuid)
-            matching_rps = [
-                rp['uuid']
-                for rp in rps
-                if set(required_traits).issubset(
-                    placement.get_provider_traits(ctxt, rp['uuid']).traits)
-            ]
-        except ks_exc.ClientException:
-            raise exception.PlacementAPIConnectFailure()
-
-        return matching_rps
+        return has_res_req and not allocation
 
     @staticmethod
     def _merge_allocations(alloc1, alloc2):
@@ -1525,67 +1507,105 @@ class PlacementCommands(object):
                     allocations[rp_uuid]['resources'][rc] += amount
         return allocations
 
-    def _get_port_allocation(
-            self, ctxt, node_uuid, port, instance_uuid, placement):
-        """Return the extra allocation the instance needs due to the given
-        port.
+    @staticmethod
+    def _get_resource_request_from_ports(
+        ctxt: context.RequestContext,
+        ports: ty.List[ty.Dict[str, ty.Any]]
+    ) -> ty.Tuple[
+            ty.Dict[str, ty.List['objects.RequestGroup']],
+            'objects.RequestLevelParams']:
+        """Collect RequestGroups and RequestLevelParams for all ports
 
-        :param ctxt: nova.context.RequestContext
-        :param node_uuid: the ComputeNode uuid the instance is running on.
-        :param port: the port dict returned from neutron
-        :param instance_uuid: The uuid of the instance the port is bound to
-        :param placement: nova.scheduler.client.report.SchedulerReportClient
-            to communicate with the Placement service API.
-        :raise PlacementAPIConnectFailure: if placement API cannot be reached
-        :raise ResourceProviderRetrievalFailed: compute node resource provider
-            does not exist.
-        :raise ResourceProviderTraitRetrievalFailed: if resource provider
-            trait information cannot be read from placement.
-        :raise MoreThanOneResourceProviderToHealFrom: if it cannot be decided
-            unambiguously which resource provider to heal from.
-        :raise NoResourceProviderToHealFrom: if there is no resource provider
-            found to heal from.
-        :return: A dict of resources keyed by RP uuid to be included in the
-            instance allocation dict.
+        :param ctxt: the request context
+        :param ports: a list of port dicts
+        :returns: A two tuple where the first item is a dict mapping port
+            uuids to a list of request groups coming from that port, the
+            second item is a combined RequestLevelParams object from all ports.
         """
-        matching_rp_uuids = self._get_rps_in_tree_with_required_traits(
-            ctxt, node_uuid, port[constants.RESOURCE_REQUEST]['required'],
-            placement)
+        groups = {}
+        request_level_params = objects.RequestLevelParams()
+        extended_res_req = (
+            neutron_api.API().has_extended_resource_request_extension(
+                ctxt)
+        )
 
-        if len(matching_rp_uuids) > 1:
-            # If there is more than one such RP then it is an ambiguous
-            # situation that we cannot handle here efficiently because that
-            # would require the reimplementation of most of the allocation
-            # candidate query functionality of placement. Also if more
-            # than one such RP exists then selecting the right one might
-            # need extra information from the compute node. For example
-            # which PCI PF the VF is allocated from and which RP represents
-            # that PCI PF in placement. When migration is supported with such
-            # servers then we can ask the admin to migrate these servers
-            # instead to heal their allocation.
-            raise exception.MoreThanOneResourceProviderToHealFrom(
-                rp_uuids=','.join(matching_rp_uuids),
-                port_id=port['id'],
-                instance_uuid=instance_uuid)
+        for port in ports:
+            resource_request = port.get(constants.RESOURCE_REQUEST)
+            if extended_res_req:
+                groups[port['id']] = (
+                    objects.RequestGroup.from_extended_port_request(
+                        ctxt, resource_request
+                    )
+                )
+                request_level_params.extend_with(
+                    objects.RequestLevelParams.from_port_request(
+                        resource_request
+                    )
+                )
+            else:
+                # This is the legacy format, only one group per port and no
+                # request level param support
+                # TODO(gibi): remove this path once the extended resource
+                # request extension is mandatory in neutron
+                groups[port['id']] = [
+                    objects.RequestGroup.from_port_request(
+                        ctxt, port['id'], resource_request
+                    )
+                ]
 
-        if len(matching_rp_uuids) == 0:
-            raise exception.NoResourceProviderToHealFrom(
-                port_id=port['id'],
-                instance_uuid=instance_uuid,
-                traits=port[constants.RESOURCE_REQUEST]['required'],
-                node_uuid=node_uuid)
+        return groups, request_level_params
 
-        # We found one RP that matches the traits. Assume that we can allocate
-        # the resources from it. If there is not enough inventory left on the
-        # RP then the PUT /allocations placement call will detect that.
-        rp_uuid = matching_rp_uuids[0]
+    @staticmethod
+    def _get_port_binding_profile_allocation(
+        ctxt: context.RequestContext,
+        neutron: neutron_api.ClientWrapper,
+        port: ty.Dict[str, ty.Any],
+        request_groups: ty.List['objects.RequestGroup'],
+        resource_provider_mapping: ty.Dict[str, ty.List[str]],
+    ) -> ty.Dict[str, str]:
+        """Generate the value of the allocation key of the port binding profile
+        based on the provider mapping returned from placement
 
-        port_allocation = {
-            rp_uuid: {
-                'resources': port[constants.RESOURCE_REQUEST]['resources']
+        :param ctxt: the request context
+        :param neutron: the neutron client
+        :param port: the port dict from neutron
+        :param request_groups: the list of RequestGroups object generated from
+            the port resource request
+        :param resource_provider_mapping: The dict of request group to resource
+            provider mapping returned by the Placement allocation candidate
+            query
+        :returns: a dict mapping request group ids to resource provider uuids
+            in the form as Neutron expects in the port binding profile.
+        """
+        if neutron_api.API().has_extended_resource_request_extension(
+            ctxt, neutron
+        ):
+            # The extended resource request format also means that a
+            # port has more than a one request groups.
+            # Each request group id from the port needs to be mapped to
+            # a single provider id from the provider mappings. Each
+            # group from the port is mapped to a numbered request group
+            # in placement so we can assume that they are mapped to
+            # a single provider and therefore the provider mapping list
+            # has a single provider id.
+            allocation = {
+                group.requester_id: resource_provider_mapping[
+                    group.requester_id][0]
+                for group in request_groups
             }
-        }
-        return port_allocation
+        else:
+            # This is the legacy resource request format where a port
+            # is mapped to a single request group
+            # NOTE(gibi): In the resource provider mapping there can be
+            # more than one RP fulfilling a request group. But resource
+            # requests of a Neutron port is always mapped to a
+            # numbered request group that is always fulfilled by one
+            # resource provider. So we only pass that single RP UUID
+            # here.
+            allocation = resource_provider_mapping[
+                port['id']][0]
+
+        return allocation
 
     def _get_port_allocations_to_heal(
             self, ctxt, instance, node_cache, placement, neutron, output):
@@ -1604,15 +1624,10 @@ class PlacementCommands(object):
         :raise nova.exception.ComputeHostNotFound: if compute node of the
             instance not found in the db.
         :raise PlacementAPIConnectFailure: if placement API cannot be reached
-        :raise ResourceProviderRetrievalFailed: if the resource provider
-            representing the compute node the instance is running on does not
-            exist.
-        :raise ResourceProviderTraitRetrievalFailed: if resource provider
-            trait information cannot be read from placement.
-        :raise MoreThanOneResourceProviderToHealFrom: if it cannot be decided
-            unambiguously which resource provider to heal from.
-        :raise NoResourceProviderToHealFrom: if there is no resource provider
-            found to heal from.
+        :raise AllocationUpdateFailed: if there is either no allocation
+            candidate returned from placement for the missing port allocations
+            or there are more than one candidates making the healing
+            ambiguous.
         :return: A two tuple where the first item is a dict of resources keyed
             by RP uuid to be included in the instance allocation dict. The
             second item is a list of port dicts to be updated in Neutron.
@@ -1629,7 +1644,7 @@ class PlacementCommands(object):
         # are not on any host.
         ports_to_heal = [
             port for port in self._get_ports(ctxt, instance, neutron)
-            if self._has_request_but_no_allocation(port)]
+            if self._has_request_but_no_allocation(port, neutron)]
 
         if not ports_to_heal:
             # nothing to do, return early
@@ -1638,26 +1653,107 @@ class PlacementCommands(object):
         node_uuid = self._get_compute_node_uuid(
             ctxt, instance, node_cache)
 
-        allocations = {}
+        # NOTE(gibi): We need to handle both legacy and extended resource
+        # request. So we need to handle ports with multiple request groups
+        # allocating from multiple providers.
+        # The logic what we follow here is pretty similar to the logic
+        # implemented in ComputeManager._allocate_port_resource_for_instance
+        # for the interface attach case. We just apply it to more then one
+        # ports here.
+        request_groups_per_port, req_lvl_params = (
+            self._get_resource_request_from_ports(ctxt, ports_to_heal)
+        )
+        # flatten the list of list of groups
+        request_groups = [
+            group
+            for groups in request_groups_per_port.values()
+            for group in groups
+        ]
+
+        # we can have multiple request groups, it would be enough to restrict
+        # only one of them to the compute tree but for symmetry we restrict
+        # all of them
+        for request_group in request_groups:
+            request_group.in_tree = node_uuid
+
+        # If there are multiple groups then the group_policy is mandatory in
+        # the allocation candidate query. We can assume that if this instance
+        # booted successfully then we have the policy in the flavor. If there
+        # is only one group and therefore no policy then the value of the
+        # policy in the allocation candidate query is ignored, so we simply
+        # default it here.
+        group_policy = instance.flavor.extra_specs.get("group_policy", "none")
+
+        rr = scheduler_utils.ResourceRequest.from_request_groups(
+            request_groups, req_lvl_params, group_policy)
+        res = placement.get_allocation_candidates(ctxt, rr)
+        # NOTE(gibi): the get_allocation_candidates method has the
+        # @safe_connect decorator applied. Such decorator will return None
+        # if the connection to Placement is failed. So we raise an exception
+        # here. The case when Placement successfully return a response, even
+        # if it is a negative or empty response, the method will return a three
+        # tuple. That case is handled couple of lines below.
+        if not res:
+            raise exception.PlacementAPIConnectFailure()
+        alloc_reqs, __, __ = res
+
+        if not alloc_reqs:
+            port_ids = [port['id'] for port in ports_to_heal]
+            raise exception.AllocationUpdateFailed(
+                consumer_uuid=instance.uuid,
+                error=f'Placement returned no allocation candidate to fulfill '
+                      f'the resource request of the port(s) {port_ids}'
+            )
+        if len(alloc_reqs) > 1:
+            # If there is more than one candidates then it is an ambiguous
+            # situation that we cannot handle here because selecting the right
+            # one might need extra information from the compute node. For
+            # example which PCI PF the VF is allocated from and which RP
+            # represents that PCI PF in placement.
+            # TODO(gibi): One way to get that missing information to resolve
+            # ambiguity would be to load up the InstancePciRequest objects and
+            # try to use the parent_if_name in their spec to find the proper
+            # candidate that allocates for the same port from the PF RP that
+            # has the same name.
+            port_ids = [port['id'] for port in ports_to_heal]
+            raise exception.AllocationUpdateFailed(
+                consumer_uuid=instance.uuid,
+                error=f'Placement returned more than one possible allocation '
+                      f'candidates to fulfill the resource request of the '
+                      f'port(s) {port_ids}. This script does not have enough '
+                      f'information to select the proper candidate to heal the'
+                      f'missing allocations. A possible way to heal the'
+                      f'allocation of this instance is to migrate it to '
+                      f'another compute as the migration process re-creates '
+                      f'the full allocation on the target host.'
+            )
+
+        # so we have one candidate, lets use that to get the needed allocations
+        # and the provider mapping for the ports' binding profile
+        alloc_req = alloc_reqs[0]
+        allocations = alloc_req["allocations"]
+        provider_mappings = alloc_req["mappings"]
+
         for port in ports_to_heal:
-            port_allocation = self._get_port_allocation(
-                ctxt, node_uuid, port, instance.uuid, placement)
-            rp_uuid = list(port_allocation)[0]
-            allocations = self._merge_allocations(
-                allocations, port_allocation)
-            # We also need to record the RP we are allocated from in the
+            # We also need to record the RPs we are allocated from in the
             # port. This will be sent back to Neutron before the allocation
             # is updated in placement
+            profile_allocation = self._get_port_binding_profile_allocation(
+                ctxt, neutron, port, request_groups_per_port[port['id']],
+                provider_mappings
+            )
             binding_profile = neutron_api.get_binding_profile(port)
-            binding_profile[constants.ALLOCATION] = rp_uuid
+            binding_profile[constants.ALLOCATION] = profile_allocation
             port[constants.BINDING_PROFILE] = binding_profile
 
-            output(_("Found resource provider %(rp_uuid)s having matching "
-                     "traits for port %(port_uuid)s with resource request "
-                     "%(request)s attached to instance %(instance_uuid)s") %
-                     {"rp_uuid": rp_uuid, "port_uuid": port["id"],
-                      "request": port.get(constants.RESOURCE_REQUEST),
-                      "instance_uuid": instance.uuid})
+            output(_(
+                "Found a request group : resource provider mapping "
+                "%(mapping)s for the port %(port_uuid)s with resource request "
+                "%(request)s attached to the instance %(instance_uuid)s") %
+                {"mapping": profile_allocation, "port_uuid": port['id'],
+                 "request": port.get(constants.RESOURCE_REQUEST),
+                 "instance_uuid": instance.uuid}
+            )
 
         return allocations, ports_to_heal
 
@@ -1791,15 +1887,6 @@ class PlacementCommands(object):
             a given instance with consumer project/user information
         :raise UnableToQueryPorts: If the neutron list ports query fails.
         :raise PlacementAPIConnectFailure: if placement API cannot be reached
-        :raise ResourceProviderRetrievalFailed: if the resource provider
-            representing the compute node the instance is running on does not
-            exist.
-        :raise ResourceProviderTraitRetrievalFailed: if resource provider
-            trait information cannot be read from placement.
-        :raise MoreThanOneResourceProviderToHealFrom: if it cannot be decided
-            unambiguously which resource provider to heal from.
-        :raise NoResourceProviderToHealFrom: if there is no resource provider
-            found to heal from.
         :raise UnableToUpdatePorts: if a port update failed in neutron but any
             partial update was rolled back successfully.
         :raise UnableToRollbackPortUpdates: if a port update failed in neutron
@@ -1956,15 +2043,6 @@ class PlacementCommands(object):
             a given instance with consumer project/user information
         :raise UnableToQueryPorts: If the neutron list ports query fails.
         :raise PlacementAPIConnectFailure: if placement API cannot be reached
-        :raise ResourceProviderRetrievalFailed: if the resource provider
-            representing the compute node the instance is running on does not
-            exist.
-        :raise ResourceProviderTraitRetrievalFailed: if resource provider
-            trait information cannot be read from placement.
-        :raise MoreThanOneResourceProviderToHealFrom: if it cannot be decided
-            unambiguously which resource provider to heal from.
-        :raise NoResourceProviderToHealFrom: if there is no resource provider
-            found to heal from.
         :raise UnableToUpdatePorts: if a port update failed in neutron but any
             partial update was rolled back successfully.
         :raise UnableToRollbackPortUpdates: if a port update failed in neutron
@@ -2155,7 +2233,7 @@ class PlacementCommands(object):
                 output(_('No cells to process.'))
                 return 4
 
-        placement = report.SchedulerReportClient()
+        placement = report.report_client_singleton()
 
         neutron = None
         if heal_port_allocations:
@@ -2186,13 +2264,11 @@ class PlacementCommands(object):
                 except exception.ComputeHostNotFound as e:
                     print(e.format_message())
                     return 2
-                except (exception.AllocationCreateFailed,
-                        exception.AllocationUpdateFailed,
-                        exception.NoResourceProviderToHealFrom,
-                        exception.MoreThanOneResourceProviderToHealFrom,
-                        exception.PlacementAPIConnectFailure,
-                        exception.ResourceProviderRetrievalFailed,
-                        exception.ResourceProviderTraitRetrievalFailed) as e:
+                except (
+                    exception.AllocationCreateFailed,
+                    exception.AllocationUpdateFailed,
+                    exception.PlacementAPIConnectFailure
+                ) as e:
                     print(e.format_message())
                     return 3
                 except exception.UnableToQueryPorts as e:
@@ -2548,7 +2624,7 @@ class PlacementCommands(object):
                     # By default we suspect the orphaned allocation was for a
                     # migration...
                     consumer_type = 'migration'
-                    if not(consumer_uuid in inst_uuids):
+                    if consumer_uuid not in inst_uuids:
                         # ... but if we can't find it either for an instance,
                         # that means it was for this.
                         consumer_type = 'instance'
@@ -2658,7 +2734,7 @@ class PlacementCommands(object):
         if verbose:
             output = lambda msg: print(msg)
 
-        placement = report.SchedulerReportClient()
+        placement = report.report_client_singleton()
         # Resets two in-memory dicts for knowing instances per compute node
         self.cn_uuid_mapping = collections.defaultdict(tuple)
         self.instances_mapping = collections.defaultdict(list)
@@ -2722,8 +2798,8 @@ class LibvirtCommands(object):
                 print(mtype)
                 return 0
             else:
-                print(_('No machine type registered for instance %s' %
-                        instance_uuid))
+                print(_('No machine type registered for instance %s') %
+                      instance_uuid)
                 return 3
         except (exception.InstanceNotFound,
                 exception.InstanceMappingNotFound) as e:
@@ -2869,7 +2945,7 @@ class VolumeAttachmentCommands(object):
             im = objects.InstanceMapping.get_by_instance_uuid(
                 ctxt, instance_uuid)
             with context.target_cell(ctxt, im.cell_mapping) as cctxt:
-                bdm = objects.BlockDeviceMapping.get_by_volume(
+                bdm = objects.BlockDeviceMapping.get_by_volume_and_instance(
                     cctxt, volume_id, instance_uuid)
                 if connection_info and json:
                     print(bdm.connection_info)
@@ -2937,7 +3013,7 @@ class VolumeAttachmentCommands(object):
 
         We can do that here as the command requires that the instance is
         stopped, something that isn't always the case with the current driver
-        BDM approach and thus the two are kept seperate for the time being.
+        BDM approach and thus the two are kept separate for the time being.
 
         :param instance_uuid: UUID of instance
         :param volume_id: ID of volume attached to the instance
@@ -3132,6 +3208,361 @@ class VolumeAttachmentCommands(object):
             return 1
 
 
+class ImagePropertyCommands:
+
+    @action_description(_("Show the value of an instance image property."))
+    @args(
+        'instance_uuid', metavar='<instance_uuid>',
+        help='UUID of the instance')
+    @args(
+        'property', metavar='<image_property>',
+        help='Image property to show')
+    def show(self, instance_uuid=None, image_property=None):
+        """Show value of a given instance image property.
+
+        Return codes:
+        * 0: Command completed successfully.
+        * 1: An unexpected error happened.
+        * 2: Instance not found.
+        * 3: Image property not found.
+        """
+        try:
+            ctxt = context.get_admin_context()
+            im = objects.InstanceMapping.get_by_instance_uuid(
+                ctxt, instance_uuid)
+            with context.target_cell(ctxt, im.cell_mapping) as cctxt:
+                instance = objects.Instance.get_by_uuid(
+                    cctxt, instance_uuid, expected_attrs=['system_metadata'])
+                image_property = instance.system_metadata.get(
+                    f'image_{image_property}')
+                if image_property:
+                    print(image_property)
+                    return 0
+                else:
+                    print(f'Image property {image_property} not found '
+                          f'for instance {instance_uuid}.')
+                    return 3
+        except (
+            exception.InstanceNotFound,
+            exception.InstanceMappingNotFound,
+        ) as e:
+            print(str(e))
+            return 2
+        except Exception as e:
+            print(f'Unexpected error, see nova-manage.log for the full '
+                  f'trace: {str(e)}')
+            LOG.exception('Unexpected error')
+            return 1
+
+    def _validate_image_properties(self, image_properties):
+        """Validate the provided image property names and values
+
+        :param image_properties: List of image property names and values
+        """
+        # Sanity check the format of the provided properties, this should be
+        # in the format of name=value.
+        if any(x for x in image_properties if '=' not in x):
+            raise exception.InvalidInput(
+                "--property should use the format key=value")
+
+        # Transform the list of delimited properties to a dict
+        image_properties = dict(prop.split('=') for prop in image_properties)
+
+        # Validate the names of each property by checking against the o.vo
+        # fields currently listed by ImageProps. We can't use from_dict to
+        # do this as it silently ignores invalid property keys.
+        for image_property_name in image_properties.keys():
+            if image_property_name not in objects.ImageMetaProps.fields:
+                raise exception.InvalidImagePropertyName(
+                    image_property_name=image_property_name)
+
+        # Validate the values by creating an object from the provided dict.
+        objects.ImageMetaProps.from_dict(image_properties)
+
+        # Return the dict so we can update the instance system_metadata
+        return image_properties
+
+    def _update_image_properties(self, instance, image_properties):
+        """Update instance image properties
+
+        :param instance: The instance to update
+        :param image_properties: List of image properties and values to update
+        """
+        # Check the state of the instance
+        allowed_states = [
+            obj_fields.InstanceState.STOPPED,
+            obj_fields.InstanceState.SHELVED,
+            obj_fields.InstanceState.SHELVED_OFFLOADED,
+        ]
+        if instance.vm_state not in allowed_states:
+            raise exception.InstanceInvalidState(
+                instance_uuid=instance.uuid, attr='vm_state',
+                state=instance.vm_state,
+                method='image_property set (must be STOPPED, SHELVED, OR '
+                       'SHELVED_OFFLOADED).')
+
+        # Validate the property names and values
+        image_properties = self._validate_image_properties(image_properties)
+
+        # Update the image properties and save the instance record
+        for image_property, value in image_properties.items():
+            instance.system_metadata[f'image_{image_property}'] = value
+
+        # Save and return 0
+        instance.save()
+        return 0
+
+    @action_description(_(
+        "Set the values of instance image properties stored in the database. "
+        "This is only allowed for " "instances with a STOPPED, SHELVED or "
+        "SHELVED_OFFLOADED vm_state."))
+    @args(
+        'instance_uuid', metavar='<instance_uuid>',
+        help='UUID of the instance')
+    @args(
+        '--property', metavar='<image_property>', action='append',
+        dest='image_properties',
+        help='Image property to set using the format name=value. For example: '
+             '--property hw_disk_bus=virtio --property hw_cdrom_bus=sata')
+    def set(self, instance_uuid=None, image_properties=None):
+        """Set instance image property values
+
+        Return codes:
+        * 0: Command completed successfully.
+        * 1: An unexpected error happened.
+        * 2: Unable to find instance.
+        * 3: Instance is in an invalid state.
+        * 4: Invalid input format.
+        * 5: Invalid image property name.
+        * 6: Invalid image property value.
+        """
+        try:
+            ctxt = context.get_admin_context()
+            im = objects.InstanceMapping.get_by_instance_uuid(
+                ctxt, instance_uuid)
+            with context.target_cell(ctxt, im.cell_mapping) as cctxt:
+                instance = objects.Instance.get_by_uuid(
+                    cctxt, instance_uuid, expected_attrs=['system_metadata'])
+                return self._update_image_properties(
+                    instance, image_properties)
+        except ValueError as e:
+            print(str(e))
+            return 6
+        except exception.InvalidImagePropertyName as e:
+            print(str(e))
+            return 5
+        except exception.InvalidInput as e:
+            print(str(e))
+            return 4
+        except exception.InstanceInvalidState as e:
+            print(str(e))
+            return 3
+        except (
+            exception.InstanceNotFound,
+            exception.InstanceMappingNotFound,
+        ) as e:
+            print(str(e))
+            return 2
+        except Exception as e:
+            print('Unexpected error, see nova-manage.log for the full '
+                  'trace: %s ' % str(e))
+            LOG.exception('Unexpected error')
+            return 1
+
+
+class LimitsCommands():
+
+    def _create_unified_limits(self, ctxt, legacy_defaults, project_id,
+                               region_id, output, dry_run):
+        return_code = 0
+
+        # Create registered (default) limits first.
+        unified_to_legacy_names = dict(
+            **local_limit.LEGACY_LIMITS, **placement_limit.LEGACY_LIMITS)
+
+        legacy_to_unified_names = dict(
+            zip(unified_to_legacy_names.values(),
+                unified_to_legacy_names.keys()))
+
+        # Handle the special case of PCPU. With legacy quotas, there is no
+        # dedicated quota limit for PCPUs, so they share the quota limit for
+        # VCPUs: 'cores'. With unified limits, class:PCPU has its own dedicated
+        # quota limit, so we will just mirror the limit for class:VCPU and
+        # create a limit with the same value for class:PCPU.
+        if 'cores' in legacy_defaults:
+            # Just make up a dummy legacy resource 'pcores' for this.
+            legacy_defaults['pcores'] = legacy_defaults['cores']
+            unified_to_legacy_names['class:PCPU'] = 'pcores'
+            legacy_to_unified_names['pcores'] = 'class:PCPU'
+
+        # For auth, a section for [keystone] is required in the config:
+        #
+        # [keystone]
+        # region_name = RegionOne
+        # user_domain_name = Default
+        # password = <password>
+        # username = <username>
+        # auth_url = http://127.0.0.1/identity
+        # auth_type = password
+        # system_scope = all
+        #
+        # The configured user needs 'role:admin and system_scope:all' by
+        # default in order to create limits in Keystone.
+        keystone_api = utils.get_sdk_adapter('identity')
+
+        # Service ID is required in unified limits APIs.
+        service_id = keystone_api.find_service('nova').id
+
+        # Retrieve the existing resource limits from Keystone.
+        registered_limits = keystone_api.registered_limits(region_id=region_id)
+
+        unified_defaults = {
+            rl.resource_name: rl.default_limit for rl in registered_limits}
+
+        # f-strings don't seem to work well with the _() translation function.
+        msg = f'Found default limits in Keystone: {unified_defaults} ...'
+        output(_(msg))
+
+        # Determine which resource limits are missing in Keystone so that we
+        # can create them.
+        output(_('Creating default limits in Keystone ...'))
+        for resource, rlimit in legacy_defaults.items():
+            resource_name = legacy_to_unified_names[resource]
+            if resource_name not in unified_defaults:
+                msg = f'Creating default limit: {resource_name} = {rlimit}'
+                if region_id:
+                    msg += f' in region {region_id}'
+                output(_(msg))
+                if not dry_run:
+                    try:
+                        keystone_api.create_registered_limit(
+                            resource_name=resource_name,
+                            default_limit=rlimit, region_id=region_id,
+                            service_id=service_id)
+                    except Exception as e:
+                        msg = f'Failed to create default limit: {str(e)}'
+                        print(_(msg))
+                        return_code = 1
+            else:
+                existing_rlimit = unified_defaults[resource_name]
+                msg = (f'A default limit: {resource_name} = {existing_rlimit} '
+                        'already exists in Keystone, skipping ...')
+                output(_(msg))
+
+        # Create project limits if there are any.
+        if not project_id:
+            return return_code
+
+        output(_('Reading project limits from the Nova API database ...'))
+        legacy_projects = objects.Quotas.get_all_by_project(ctxt, project_id)
+        legacy_projects.pop('project_id', None)
+        msg = f'Found project limits in the database: {legacy_projects} ...'
+        output(_(msg))
+
+        # Handle the special case of PCPU again for project limits.
+        if 'cores' in legacy_projects:
+            # Just make up a dummy legacy resource 'pcores' for this.
+            legacy_projects['pcores'] = legacy_projects['cores']
+
+        # Retrieve existing limits from Keystone.
+        project_limits = keystone_api.limits(
+            project_id=project_id, region_id=region_id)
+        unified_projects = {
+            pl.resource_name: pl.resource_limit for pl in project_limits}
+        msg = f'Found project limits in Keystone: {unified_projects} ...'
+        output(_(msg))
+
+        output(_('Creating project limits in Keystone ...'))
+        for resource, plimit in legacy_projects.items():
+            resource_name = legacy_to_unified_names[resource]
+            if resource_name not in unified_projects:
+                msg = (
+                    f'Creating project limit: {resource_name} = {plimit} '
+                    f'for project {project_id}')
+                if region_id:
+                    msg += f' in region {region_id}'
+                output(_(msg))
+                if not dry_run:
+                    try:
+                        keystone_api.create_limit(
+                            resource_name=resource_name,
+                            resource_limit=plimit, project_id=project_id,
+                            region_id=region_id, service_id=service_id)
+                    except Exception as e:
+                        msg = f'Failed to create project limit: {str(e)}'
+                        print(_(msg))
+                        return_code = 1
+            else:
+                existing_plimit = unified_projects[resource_name]
+                msg = (f'A project limit: {resource_name} = {existing_plimit} '
+                        'already exists in Keystone, skipping ...')
+                output(_(msg))
+
+        return return_code
+
+    @action_description(
+        _("Copy quota limits from the Nova API database to Keystone."))
+    @args('--project-id', metavar='<project-id>', dest='project_id',
+          help='Project ID for which to migrate quota limits')
+    @args('--region-id', metavar='<region-id>', dest='region_id',
+          help='Region ID for which to migrate quota limits')
+    @args('--verbose', action='store_true', dest='verbose', default=False,
+          help='Provide verbose output during execution.')
+    @args('--dry-run', action='store_true', dest='dry_run', default=False,
+          help='Show what limits would be created without actually '
+               'creating them.')
+    def migrate_to_unified_limits(self, project_id=None, region_id=None,
+                                  verbose=False, dry_run=False):
+        """Migrate quota limits from legacy quotas to unified limits.
+
+        Return codes:
+        * 0: Command completed successfully.
+        * 1: An unexpected error occurred.
+        * 2: Failed to connect to the database.
+        """
+        ctxt = context.get_admin_context()
+
+        output = lambda msg: None
+        if verbose:
+            output = lambda msg: print(msg)
+
+        output(_('Reading default limits from the Nova API database ...'))
+
+        try:
+            # This will look for limits in the 'default' quota class first and
+            # then fall back to the [quota] config options.
+            legacy_defaults = nova.quota.QUOTAS.get_defaults(ctxt)
+        except db_exc.CantStartEngineError:
+            print(_('Failed to connect to the database so aborting this '
+                    'migration attempt. Please check your config file to make '
+                    'sure that [api_database]/connection and '
+                    '[database]/connection are set and run this '
+                    'command again.'))
+            return 2
+
+        # Remove obsolete resource limits.
+        for resource in ('fixed_ips', 'floating_ips', 'security_groups',
+                         'security_group_rules'):
+            if resource in legacy_defaults:
+                msg = f'Skipping obsolete limit for {resource} ...'
+                output(_(msg))
+                legacy_defaults.pop(resource)
+
+        msg = (
+            f'Found default limits in the database: {legacy_defaults} ...')
+        output(_(msg))
+
+        try:
+            return self._create_unified_limits(
+                ctxt, legacy_defaults, project_id, region_id, output, dry_run)
+        except Exception as e:
+            msg = (f'Unexpected error, see nova-manage.log for the full '
+                   f'trace: {str(e)}')
+            print(_(msg))
+            LOG.exception('Unexpected error')
+            return 1
+
+
 CATEGORIES = {
     'api_db': ApiDbCommands,
     'cell_v2': CellV2Commands,
@@ -3139,6 +3570,8 @@ CATEGORIES = {
     'placement': PlacementCommands,
     'libvirt': LibvirtCommands,
     'volume_attachment': VolumeAttachmentCommands,
+    'image_property': ImagePropertyCommands,
+    'limits': LimitsCommands,
 }
 
 

@@ -71,11 +71,20 @@ class ExtensionsScopeTypePolicyTest(ExtensionsPolicyTest):
     def setUp(self):
         super(ExtensionsScopeTypePolicyTest, self).setUp()
         self.flags(enforce_scope=True, group="oslo_policy")
+        self.everyone_authorized_contexts = [
+            self.legacy_admin_context,
+            self.project_admin_context, self.project_member_context,
+            self.project_reader_context, self.project_foo_context,
+            self.other_project_reader_context,
+            self.other_project_member_context
+        ]
+        self.everyone_unauthorized_contexts = [
+            self.system_admin_context, self.system_member_context,
+            self.system_reader_context, self.system_foo_context]
 
 
 class ExtensionsNoLegacyPolicyTest(ExtensionsScopeTypePolicyTest):
     """Test Extensions APIs policies with system scope enabled,
-    and no more deprecated rules that allow the legacy admin API to
-    access system_admin_or_owner APIs.
+    and no more deprecated rules.
     """
     without_deprecated_rules = True

@@ -166,7 +166,7 @@ OpenStack CI environment and replicate it in your test environment.
 Using the pre-commit hook
 =========================
 
-Nova makes use of the `pre-commit framework <https://pre-commit.com/>`__ to
+Nova can make use of the `pre-commit framework <https://pre-commit.com/>`__ to
 allow running of some linters on each commit. This must be enabled locally to
 function:
 
@@ -174,6 +174,10 @@ function:
 
     $ pip install --user pre-commit
     $ pre-commit install --allow-missing-config
+
+As a reminder, the hooks are optional and you are not enforced to run them.
+You can either not install pre-commit or skip the hooks once by using the
+`--no-verify` flag on `git commit`.
 
 Using a remote debugger
 =======================
@@ -197,7 +201,7 @@ Using fake computes for tests
 The number of instances supported by fake computes is not limited by physical
 constraints. It allows you to perform stress tests on a deployment with few
 resources (typically a laptop). Take care to avoid using scheduler filters
-that will limit the number of instances per compute, such as ``AggregateCoreFilter``.
+that will limit the number of instances per compute, such as ``NumInstancesFilter``.
 
 Fake computes can also be used in multi hypervisor-type deployments in order to
 take advantage of fake and "real" computes during tests:

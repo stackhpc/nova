@@ -15,14 +15,15 @@
 #    under the License.
 
 import collections
+from unittest import mock
 
-import mock
 from oslo_service import fixture as oslo_svc_fixture
 from oslo_utils import units
 from oslo_utils import uuidutils
 from oslo_vmware import exceptions as vexc
 from oslo_vmware.objects import datastore as ds_obj
 from oslo_vmware import pbm
+from oslo_vmware import vim_util as vutil
 
 from nova import exception
 from nova.network import model as network_model
@@ -31,7 +32,7 @@ from nova.tests.unit import fake_instance
 from nova.tests.unit.virt.vmwareapi import fake
 from nova.tests.unit.virt.vmwareapi import stubs
 from nova.virt.vmwareapi import constants
-from nova.virt.vmwareapi import driver
+from nova.virt.vmwareapi import session as vmware_session
 from nova.virt.vmwareapi import vm_util
 
 
@@ -375,7 +376,7 @@ class VMwareVMUtilTestCase(test.NoDBTestCase):
         ide_controller = fake.VirtualIDEController()
         devices.append(scsi_controller)
         devices.append(ide_controller)
-        fake._update_object("VirtualMachine", vm)
+        fake.update_object(vm)
         # return the scsi type, not ide
         self.assertEqual(constants.DEFAULT_ADAPTER_TYPE,
                          vm_util.get_scsi_adapter_type(devices))
@@ -387,7 +388,7 @@ class VMwareVMUtilTestCase(test.NoDBTestCase):
         ide_controller = fake.VirtualIDEController()
         devices.append(scsi_controller)
         devices.append(ide_controller)
-        fake._update_object("VirtualMachine", vm)
+        fake.update_object(vm)
         # the controller is not suitable since the device under this controller
         # has exceeded SCSI_MAX_CONNECT_NUMBER
         for i in range(0, constants.SCSI_MAX_CONNECT_NUMBER):
@@ -1024,7 +1025,7 @@ class VMwareVMUtilTestCase(test.NoDBTestCase):
         """Ensure we warn when create_vm() fails after we passed an
         unrecognised guestId
         """
-        # avoid real sleeps during test due to te retry decorator on create_vm
+        # avoid real sleeps during test due to the retry decorator on create_vm
         self.useFixture(oslo_svc_fixture.SleepFixture())
 
         found = [False]
@@ -1036,7 +1037,7 @@ class VMwareVMUtilTestCase(test.NoDBTestCase):
                 found[0] = True
         mock_log_warn.side_effect = fake_log_warn
 
-        session = driver.VMwareAPISession()
+        session = vmware_session.VMwareAPISession()
 
         config_spec = vm_util.get_vm_create_spec(
             session.vim.client.factory,
@@ -1987,23 +1988,85 @@ class VMwareVMUtilTestCase(test.NoDBTestCase):
         mock_get_name.assert_called_once_with(self._instance.display_name,
                                               self._instance.uuid)
 
+    def test_create_fcd_id_obj(self):
+        fcd_id_obj = mock.Mock()
+        client_factory = mock.Mock()
+        client_factory.create.return_value = fcd_id_obj
+        fcd_id = mock.sentinel.fcd_id
+        ret = vm_util._create_fcd_id_obj(client_factory, fcd_id)
 
-@mock.patch.object(driver.VMwareAPISession, 'vim', stubs.fake_vim_prop)
+        self.assertEqual(fcd_id_obj, ret)
+        self.assertEqual(fcd_id, ret.id)
+        client_factory.create.assert_called_once_with('ns0:ID')
+
+    @mock.patch.object(vm_util, '_create_fcd_id_obj')
+    @mock.patch.object(vutil, 'get_moref')
+    def test_attach_fcd(self, get_moref, create_fcd_id_obj):
+        disk_id = mock.sentinel.disk_id
+        create_fcd_id_obj.return_value = disk_id
+
+        ds_ref = mock.sentinel.ds_ref
+        get_moref.return_value = ds_ref
+
+        task = mock.sentinel.task
+        session = mock.Mock()
+        session._call_method.return_value = task
+
+        vm_ref = mock.sentinel.vm_ref
+        fcd_id = mock.sentinel.fcd_id
+        ds_ref_val = mock.sentinel.ds_ref_val
+        controller_key = mock.sentinel.controller_key
+        unit_number = mock.sentinel.unit_number
+        vm_util.attach_fcd(
+            session, vm_ref, fcd_id, ds_ref_val, controller_key, unit_number)
+
+        create_fcd_id_obj.assert_called_once_with(
+            session.vim.client.factory, fcd_id)
+        get_moref.assert_called_once_with(ds_ref_val, 'Datastore')
+        session._call_method.assert_called_once_with(
+            session.vim, "AttachDisk_Task", vm_ref, diskId=disk_id,
+            datastore=ds_ref, controllerKey=controller_key,
+            unitNumber=unit_number)
+        session._wait_for_task.assert_called_once_with(task)
+
+    @mock.patch.object(vm_util, '_create_fcd_id_obj')
+    def test_detach_fcd(self, create_fcd_id_obj):
+        disk_id = mock.sentinel.disk_id
+        create_fcd_id_obj.return_value = disk_id
+
+        task = mock.sentinel.task
+        session = mock.Mock()
+        session._call_method.return_value = task
+
+        vm_ref = mock.sentinel.vm_ref
+        fcd_id = mock.sentinel.fcd_id
+        vm_util.detach_fcd(session, vm_ref, fcd_id)
+
+        create_fcd_id_obj.assert_called_once_with(
+            session.vim.client.factory, fcd_id)
+        session._call_method.assert_called_once_with(
+            session.vim, "DetachDisk_Task", vm_ref, diskId=disk_id)
+        session._wait_for_task.assert_called_once_with(task)
+
+
+@mock.patch.object(vmware_session.VMwareAPISession, 'vim',
+                   stubs.fake_vim_prop)
 class VMwareVMUtilGetHostRefTestCase(test.NoDBTestCase):
     # N.B. Mocking on the class only mocks test_*(), but we need
-    # VMwareAPISession.vim to be mocked in both setUp and tests. Not mocking in
-    # setUp causes object initialisation to fail. Not mocking in tests results
-    # in vim calls not using FakeVim.
-    @mock.patch.object(driver.VMwareAPISession, 'vim', stubs.fake_vim_prop)
+    # session.VMwareAPISession.vim to be mocked in both setUp and tests.
+    # Not mocking in setUp causes object initialisation to fail. Not
+    # mocking in tests results in vim calls not using FakeVim.
+    @mock.patch.object(vmware_session.VMwareAPISession, 'vim',
+                       stubs.fake_vim_prop)
     def setUp(self):
         super(VMwareVMUtilGetHostRefTestCase, self).setUp()
         fake.reset()
         vm_util.vm_refs_cache_reset()
 
-        self.session = driver.VMwareAPISession()
+        self.session = vmware_session.VMwareAPISession()
 
         # Create a fake VirtualMachine running on a known host
-        self.host_ref = list(fake._db_content['HostSystem'].keys())[0]
+        self.host_ref = fake.get_first_object_ref("HostSystem")
         self.vm_ref = fake.create_vm(host_ref=self.host_ref)
 
     @mock.patch.object(vm_util, 'get_vm_ref')
@@ -2019,7 +2082,7 @@ class VMwareVMUtilGetHostRefTestCase(test.NoDBTestCase):
     def test_get_host_name_for_vm(self, mock_get_vm_ref):
         mock_get_vm_ref.return_value = self.vm_ref
 
-        host = fake._get_object(self.host_ref)
+        host = fake.get_object(self.host_ref)
 
         ret = vm_util.get_host_name_for_vm(self.session, 'fake-instance')
 

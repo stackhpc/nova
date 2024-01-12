@@ -68,7 +68,6 @@ INVALID_FLAVOR_IMAGE_EXCEPTIONS = (
     exception.ImageNUMATopologyIncomplete,
     exception.ImageNUMATopologyMemoryOutOfRange,
     exception.ImageNUMATopologyRebuildConflict,
-    exception.ImagePMUConflict,
     exception.ImageSerialPortNumberExceedFlavorValue,
     exception.ImageSerialPortNumberInvalid,
     exception.ImageVCPULimitsRangeExceeded,
@@ -409,6 +408,7 @@ class ServersController(wsgi.Controller):
 
         networks = []
         network_uuids = []
+        port_uuids = []
         for network in requested_networks:
             request = objects.NetworkRequest()
             try:
@@ -417,18 +417,31 @@ class ServersController(wsgi.Controller):
                 # it will use one of the available IP address from the network
                 request.address = network.get('fixed_ip', None)
                 request.port_id = network.get('port', None)
-
                 request.tag = network.get('tag', None)
 
                 if request.port_id:
-                    request.network_id = None
-                    if request.address is not None:
-                        msg = _("Specified Fixed IP '%(addr)s' cannot be used "
-                                "with port '%(port)s': the two cannot be "
-                                "specified together.") % {
-                                    "addr": request.address,
-                                    "port": request.port_id}
+                    if request.port_id in port_uuids:
+                        msg = _(
+                            "Port ID '%(port)s' was specified twice: you "
+                            "cannot attach a port multiple times."
+                        ) % {
+                            "port": request.port_id,
+                        }
                         raise exc.HTTPBadRequest(explanation=msg)
+
+                    if request.address is not None:
+                        msg = _(
+                            "Specified Fixed IP '%(addr)s' cannot be used "
+                            "with port '%(port)s': the two cannot be "
+                            "specified together."
+                        ) % {
+                            "addr": request.address,
+                            "port": request.port_id,
+                        }
+                        raise exc.HTTPBadRequest(explanation=msg)
+
+                    request.network_id = None
+                    port_uuids.append(request.port_id)
                 else:
                     request.network_id = network['uuid']
                     self._validate_network_id(
@@ -456,6 +469,7 @@ class ServersController(wsgi.Controller):
 
         instance = self._get_server(
             context, req, id, is_detail=True,
+            columns_to_join=['services'],
             cell_down_support=cell_down_support)
         context.can(server_policies.SERVERS % 'show',
                     target={'project_id': instance.project_id})
@@ -473,7 +487,7 @@ class ServersController(wsgi.Controller):
         :param target: The target dict for ``context.can`` policy checks
         :param server_dict: The POST /servers request body "server" entry
         :param create_kwargs: dict that gets populated by this method and
-            passed to nova.comptue.api.API.create()
+            passed to nova.compute.api.API.create()
         :raises: webob.exc.HTTPBadRequest if the request parameters are invalid
         :raises: nova.exception.Forbidden if a policy check fails
         """
@@ -524,7 +538,7 @@ class ServersController(wsgi.Controller):
         :param target: The target dict for ``context.can`` policy checks
         :param server_dict: The POST /servers request body "server" entry
         :param create_kwargs: dict that gets populated by this method and
-            passed to nova.comptue.api.API.create()
+            passed to nova.compute.api.API.create()
         :raises: webob.exc.HTTPBadRequest if the request parameters are invalid
         :raises: nova.exception.Forbidden if a policy check fails
         """
@@ -630,7 +644,7 @@ class ServersController(wsgi.Controller):
         :param target: The target dict for ``context.can`` policy checks
         :param server_dict: The POST /servers request body "server" entry
         :param create_kwargs: dict that gets populated by this method and
-            passed to nova.comptue.api.API.create()
+            passed to nova.compute.api.API.create()
         :param host: Forced host of availability_zone
         :param node: Forced node of availability_zone
         :raise: webob.exc.HTTPBadRequest if the request parameters are invalid
@@ -664,7 +678,8 @@ class ServersController(wsgi.Controller):
     @validation.schema(schema_servers.create_v263, '2.63', '2.66')
     @validation.schema(schema_servers.create_v267, '2.67', '2.73')
     @validation.schema(schema_servers.create_v274, '2.74', '2.89')
-    @validation.schema(schema_servers.create_v290, '2.90')
+    @validation.schema(schema_servers.create_v290, '2.90', '2.93')
+    @validation.schema(schema_servers.create_v294, '2.94')
     def create(self, req, body):
         """Creates a new server for a given user."""
         context = req.environ['nova.context']
@@ -783,8 +798,7 @@ class ServersController(wsgi.Controller):
                 supports_multiattach=supports_multiattach,
                 supports_port_resource_request=supports_port_resource_request,
                 **create_kwargs)
-        except (exception.QuotaError,
-                exception.PortLimitExceeded) as error:
+        except exception.OverQuota as error:
             raise exc.HTTPForbidden(
                 explanation=error.format_message())
         except exception.ImageNotFound:
@@ -848,6 +862,7 @@ class ServersController(wsgi.Controller):
                 exception.DeviceProfileError,
                 exception.ComputeHostNotFound,
                 exception.ForbiddenPortsWithAccelerator,
+                exception.ForbiddenWithRemoteManagedPorts,
                 exception.ExtendedResourceRequestOldCompute,
                 ) as error:
             raise exc.HTTPBadRequest(explanation=error.format_message())
@@ -893,7 +908,8 @@ class ServersController(wsgi.Controller):
     @validation.schema(schema_servers.update_v20, '2.0', '2.0')
     @validation.schema(schema_servers.update, '2.1', '2.18')
     @validation.schema(schema_servers.update_v219, '2.19', '2.89')
-    @validation.schema(schema_servers.update_v290, '2.90')
+    @validation.schema(schema_servers.update_v290, '2.90', '2.93')
+    @validation.schema(schema_servers.update_v294, '2.94')
     def update(self, req, id, body):
         """Update server then pass on to version-specific controller."""
 
@@ -1031,7 +1047,11 @@ class ServersController(wsgi.Controller):
         """Begin the resize process with given instance/flavor."""
         context = req.environ["nova.context"]
         instance = self._get_server(context, req, instance_id,
-                                    columns_to_join=['services'])
+                                    columns_to_join=['services', 'resources',
+                                                     'pci_requests',
+                                                     'pci_devices',
+                                                     'trusted_certs',
+                                                     'vcpu_model'])
         context.can(server_policies.SERVERS % 'resize',
                     target={'user_id': instance.user_id,
                             'project_id': instance.project_id})
@@ -1039,7 +1059,7 @@ class ServersController(wsgi.Controller):
         try:
             self.compute_api.resize(context, instance, flavor_id,
                                     auto_disk_config=auto_disk_config)
-        except exception.QuotaError as error:
+        except exception.OverQuota as error:
             raise exc.HTTPForbidden(
                 explanation=error.format_message())
         except (
@@ -1134,7 +1154,8 @@ class ServersController(wsgi.Controller):
     @validation.schema(schema_servers.rebuild_v254, '2.54', '2.56')
     @validation.schema(schema_servers.rebuild_v257, '2.57', '2.62')
     @validation.schema(schema_servers.rebuild_v263, '2.63', '2.89')
-    @validation.schema(schema_servers.rebuild_v290, '2.90')
+    @validation.schema(schema_servers.rebuild_v290, '2.90', '2.93')
+    @validation.schema(schema_servers.rebuild_v294, '2.94')
     def _action_rebuild(self, req, id, body):
         """Rebuild an instance with the given attributes."""
         rebuild_dict = body['rebuild']
@@ -1144,7 +1165,12 @@ class ServersController(wsgi.Controller):
         password = self._get_server_admin_password(rebuild_dict)
 
         context = req.environ['nova.context']
-        instance = self._get_server(context, req, id)
+        instance = self._get_server(context, req, id,
+                                    columns_to_join=['trusted_certs',
+                                                     'pci_requests',
+                                                     'pci_devices',
+                                                     'resources',
+                                                     'migration_context'])
         target = {'user_id': instance.user_id,
                   'project_id': instance.project_id}
         context.can(server_policies.SERVERS % 'rebuild', target=target)
@@ -1192,6 +1218,9 @@ class ServersController(wsgi.Controller):
         ):
             kwargs['hostname'] = rebuild_dict['hostname']
 
+        if api_version_request.is_supported(req, min_version='2.93'):
+            kwargs['reimage_boot_volume'] = True
+
         for request_attribute, instance_attribute in attr_map.items():
             try:
                 if request_attribute == 'name':
@@ -1223,7 +1252,7 @@ class ServersController(wsgi.Controller):
         except exception.KeypairNotFound:
             msg = _("Invalid key_name provided.")
             raise exc.HTTPBadRequest(explanation=msg)
-        except exception.QuotaError as error:
+        except exception.OverQuota as error:
             raise exc.HTTPForbidden(explanation=error.format_message())
         except (exception.AutoDiskConfigDisabledByImage,
                 exception.CertificateValidationFailed,
@@ -1337,6 +1366,8 @@ class ServersController(wsgi.Controller):
         except exception.InstanceInvalidState as state_error:
             common.raise_http_conflict_for_instance_invalid_state(state_error,
                         'createImage', id)
+        except exception.InstanceQuiesceFailed as err:
+            raise exc.HTTPConflict(explanation=err.format_message())
         except exception.Invalid as err:
             raise exc.HTTPBadRequest(explanation=err.format_message())
         except exception.OverQuota as e:

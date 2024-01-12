@@ -13,7 +13,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from oslo_utils import timeutils
 import webob
 
@@ -39,10 +40,6 @@ class CreateBackupTestsV21(admin_only_action_common.CommonMixin,
         super(CreateBackupTestsV21, self).setUp()
         self.controller = getattr(self.create_backup, self.controller_name)()
         self.compute_api = self.controller.compute_api
-
-        patch_get = mock.patch.object(self.compute_api, 'get')
-        self.mock_get = patch_get.start()
-        self.addCleanup(patch_get.stop)
 
     @mock.patch.object(common, 'check_img_metadata_properties_quota')
     @mock.patch.object(api.API, 'backup')

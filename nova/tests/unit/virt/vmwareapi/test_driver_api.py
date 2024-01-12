@@ -21,9 +21,9 @@ Test suite for VMwareAPI.
 
 import collections
 import datetime
+from unittest import mock
 
 from eventlet import greenthread
-import mock
 import os_resource_classes as orc
 from oslo_utils import fixture as utils_fixture
 from oslo_utils.fixture import uuidsentinel
@@ -61,6 +61,7 @@ from nova.virt.vmwareapi import ds_util
 from nova.virt.vmwareapi import error_util
 from nova.virt.vmwareapi import imagecache
 from nova.virt.vmwareapi import images
+from nova.virt.vmwareapi import session
 from nova.virt.vmwareapi import vif
 from nova.virt.vmwareapi import vim_util
 from nova.virt.vmwareapi import vm_util
@@ -109,20 +110,11 @@ DEFAULT_FLAVOR_OBJS = [
 ]
 
 
-def _fake_create_session(inst):
-    session = vmwareapi_fake.DataObject()
-    session.key = 'fake_key'
-    session.userName = 'fake_username'
-    session._pbm_wsdl_loc = None
-    session._pbm = None
-    inst._session = session
-
-
 class VMwareDriverStartupTestCase(test.NoDBTestCase):
     def _start_driver_with_flags(self, expected_exception_type, startup_flags):
         self.flags(**startup_flags)
         with mock.patch(
-                'nova.virt.vmwareapi.driver.VMwareAPISession.__init__'):
+                'nova.virt.vmwareapi.session.VMwareAPISession.__init__'):
             e = self.assertRaises(Exception, driver.VMwareVCDriver, None)  # noqa
             self.assertIs(type(e), expected_exception_type)
 
@@ -152,36 +144,6 @@ class VMwareDriverStartupTestCase(test.NoDBTestCase):
                 dict(host_ip='ip', host_password='password',
                      host_username="user", datastore_regex="bad(regex",
                      group='vmware'))
-
-
-class VMwareSessionTestCase(test.NoDBTestCase):
-
-    @mock.patch.object(driver.VMwareAPISession, '_is_vim_object',
-                       return_value=False)
-    def test_call_method(self, mock_is_vim):
-        with test.nested(
-                mock.patch.object(driver.VMwareAPISession, '_create_session',
-                                  _fake_create_session),
-                mock.patch.object(driver.VMwareAPISession, 'invoke_api'),
-        ) as (fake_create, fake_invoke):
-            session = driver.VMwareAPISession()
-            session._vim = mock.Mock()
-            module = mock.Mock()
-            session._call_method(module, 'fira')
-            fake_invoke.assert_called_once_with(module, 'fira', session._vim)
-
-    @mock.patch.object(driver.VMwareAPISession, '_is_vim_object',
-                       return_value=True)
-    def test_call_method_vim(self, mock_is_vim):
-        with test.nested(
-                mock.patch.object(driver.VMwareAPISession, '_create_session',
-                                  _fake_create_session),
-                mock.patch.object(driver.VMwareAPISession, 'invoke_api'),
-        ) as (fake_create, fake_invoke):
-            session = driver.VMwareAPISession()
-            module = mock.Mock()
-            session._call_method(module, 'fira')
-            fake_invoke.assert_called_once_with(module, 'fira')
 
 
 class VMwareAPIVMTestCase(test.NoDBTestCase,
@@ -337,7 +299,7 @@ class VMwareAPIVMTestCase(test.NoDBTestCase,
                        _fake_check_session)
 
         with mock.patch.object(greenthread, 'sleep'):
-            self.conn = driver.VMwareAPISession()
+            self.conn = session.VMwareAPISession()
         self.assertEqual(2, self.attempts)
 
     def _get_flavor_by_name(self, type):
@@ -411,8 +373,8 @@ class VMwareAPIVMTestCase(test.NoDBTestCase,
 
     def _get_vm_record(self):
         # Get record for VM
-        vms = vmwareapi_fake._get_objects("VirtualMachine")
-        for vm in vms.objects:
+        vms = vmwareapi_fake.get_objects("VirtualMachine")
+        for vm in vms:
             if vm.get('name') == vm_util._get_vm_name(self._display_name,
                                                       self.uuid):
                 return vm
@@ -1307,7 +1269,7 @@ class VMwareAPIVMTestCase(test.NoDBTestCase,
 
     def _snapshot_delete_vm_snapshot_exception(self, exception, call_count=1):
         self._create_vm()
-        fake_vm = vmwareapi_fake._get_objects("VirtualMachine").objects[0].obj
+        fake_vm = vmwareapi_fake.get_first_object_ref("VirtualMachine")
         snapshot_ref = vmwareapi_fake.ManagedObjectReference(
                                value="Snapshot-123",
                                name="VirtualMachineSnapshot")
@@ -1801,8 +1763,7 @@ class VMwareAPIVMTestCase(test.NoDBTestCase,
 
             get_vm_ref.assert_called_once_with(self.conn._session,
                                                self.instance)
-            get_volume_ref.assert_called_once_with(
-                connection_info['data']['volume'])
+            get_volume_ref.assert_called_once_with(connection_info['data'])
             self.assertTrue(get_vmdk_info.called)
             attach_disk_to_vm.assert_called_once_with(mock.sentinel.vm_ref,
                 self.instance, adapter_type, disk_type, vmdk_path='fake-path')
@@ -1878,8 +1839,8 @@ class VMwareAPIVMTestCase(test.NoDBTestCase,
 
     def test_iscsi_rescan_hba(self):
         fake_target_portal = 'fake_target_host:port'
-        host_storage_sys = vmwareapi_fake._get_objects(
-            "HostStorageSystem").objects[0]
+        host_storage_sys = vmwareapi_fake.get_first_object(
+            "HostStorageSystem")
         iscsi_hba_array = host_storage_sys.get('storageDeviceInfo'
                                                '.hostBusAdapter')
         iscsi_hba = iscsi_hba_array.HostHostBusAdapter[0]
@@ -1899,7 +1860,7 @@ class VMwareAPIVMTestCase(test.NoDBTestCase,
     def test_iscsi_get_target(self):
         data = {'target_portal': 'fake_target_host:port',
                 'target_iqn': 'fake_target_iqn'}
-        host = vmwareapi_fake._get_objects('HostSystem').objects[0]
+        host = vmwareapi_fake.get_first_object('HostSystem')
         host._add_iscsi_target(data)
         vops = volumeops.VMwareVolumeOps(self.conn._session)
         result = vops._iscsi_get_target(data)
@@ -2162,7 +2123,7 @@ class VMwareAPIVMTestCase(test.NoDBTestCase,
                 'min_unit': 1,
                 'max_unit': 16,
                 'step_size': 1,
-                'allocation_ratio': 16.0,
+                'allocation_ratio': 4.0,
             },
             orc.MEMORY_MB: {
                 'total': 2048,
@@ -2170,7 +2131,7 @@ class VMwareAPIVMTestCase(test.NoDBTestCase,
                 'min_unit': 1,
                 'max_unit': 1024,
                 'step_size': 1,
-                'allocation_ratio': 1.5,
+                'allocation_ratio': 1.0,
             },
             orc.DISK_GB: {
                 'total': 95,

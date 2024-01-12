@@ -31,6 +31,7 @@ LOG = logging.getLogger(__name__)
 @profiler.trace_cls("volume_api")
 class LibvirtBaseVolumeDriver(object):
     """Base class for volume drivers."""
+
     def __init__(self, host, is_block_dev):
         self.host = host
         self.is_block_dev = is_block_dev
@@ -117,6 +118,7 @@ class LibvirtBaseVolumeDriver(object):
             conf.shareable = True
 
         volume_id = driver_block_device.get_volume_id(connection_info)
+        conf.alias = vconfig.make_libvirt_device_alias(volume_id)
         volume_secret = None
         if volume_id:
             volume_secret = self.host.find_secret('volume', volume_id)
@@ -134,7 +136,7 @@ class LibvirtBaseVolumeDriver(object):
         """Connect the volume."""
         pass
 
-    def disconnect_volume(self, connection_info, instance):
+    def disconnect_volume(self, connection_info, instance, force=False):
         """Disconnect the volume."""
         pass
 
@@ -156,6 +158,7 @@ class LibvirtBaseVolumeDriver(object):
 
 class LibvirtVolumeDriver(LibvirtBaseVolumeDriver):
     """Class for volumes backed by local file."""
+
     def __init__(self, host):
         super(LibvirtVolumeDriver,
               self).__init__(host, is_block_dev=True)
@@ -171,6 +174,7 @@ class LibvirtVolumeDriver(LibvirtBaseVolumeDriver):
 
 class LibvirtFakeVolumeDriver(LibvirtBaseVolumeDriver):
     """Driver to attach fake volumes to libvirt."""
+
     def __init__(self, host):
         super(LibvirtFakeVolumeDriver,
               self).__init__(host, is_block_dev=True)

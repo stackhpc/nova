@@ -18,10 +18,10 @@
 
 import copy
 import datetime
+from unittest import mock
 
 from dateutil import parser as dateutil_parser
 import iso8601
-import mock
 import netaddr
 from oslo_db import api as oslo_db_api
 from oslo_db import exception as db_exc
@@ -167,27 +167,25 @@ class DbTestCase(test.TestCase):
 class HelperTestCase(test.TestCase):
     @mock.patch('sqlalchemy.orm.joinedload')
     def test_joinedload_helper(self, mock_jl):
-        query = db._joinedload_all('foo.bar.baz')
+        query = db._joinedload_all(
+            models.SecurityGroup, 'instances.info_cache'
+        )
 
         # We call sqlalchemy.orm.joinedload() on the first element
-        mock_jl.assert_called_once_with('foo')
+        mock_jl.assert_called_once_with(models.SecurityGroup.instances)
 
         # Then first.joinedload(second)
         column2 = mock_jl.return_value
-        column2.joinedload.assert_called_once_with('bar')
+        column2.joinedload.assert_called_once_with(models.Instance.info_cache)
 
-        # Then second.joinedload(third)
-        column3 = column2.joinedload.return_value
-        column3.joinedload.assert_called_once_with('baz')
-
-        self.assertEqual(column3.joinedload.return_value, query)
+        self.assertEqual(column2.joinedload.return_value, query)
 
     @mock.patch('sqlalchemy.orm.joinedload')
     def test_joinedload_helper_single(self, mock_jl):
-        query = db._joinedload_all('foo')
+        query = db._joinedload_all(models.SecurityGroup, 'instances')
 
         # We call sqlalchemy.orm.joinedload() on the first element
-        mock_jl.assert_called_once_with('foo')
+        mock_jl.assert_called_once_with(models.SecurityGroup.instances)
 
         # We should have gotten back just the result of the joinedload()
         # call if there were no other elements
@@ -279,33 +277,21 @@ class DecoratorTestCase(test.TestCase):
             'No DB access allowed in ',
             mock_log.error.call_args[0][0])
 
-    @mock.patch.object(db, 'LOG')
-    @mock.patch.object(db, 'DISABLE_DB_ACCESS', return_value=True)
-    def test_pick_context_manager_writer_disable_db_access(
-        self, mock_DISABLE_DB_ACCESS, mock_log,
-    ):
+    def test_pick_context_manager_writer_disable_db_access(self):
         @db.pick_context_manager_writer
         def func(context, value):
             pass
 
         self._test_pick_context_manager_disable_db_access(func)
 
-    @mock.patch.object(db, 'LOG')
-    @mock.patch.object(db, 'DISABLE_DB_ACCESS', return_value=True)
-    def test_pick_context_manager_reader_disable_db_access(
-        self, mock_DISABLE_DB_ACCESS, mock_log,
-    ):
+    def test_pick_context_manager_reader_disable_db_access(self):
         @db.pick_context_manager_reader
         def func(context, value):
             pass
 
         self._test_pick_context_manager_disable_db_access(func)
 
-    @mock.patch.object(db, 'LOG')
-    @mock.patch.object(db, 'DISABLE_DB_ACCESS', return_value=True)
-    def test_pick_context_manager_reader_allow_async_disable_db_access(
-        self, mock_DISABLE_DB_ACCESS, mock_log,
-    ):
+    def test_pick_context_manager_reader_allow_async_disable_db_access(self):
         @db.pick_context_manager_reader_allow_async
         def func(context, value):
             pass
@@ -1683,28 +1669,40 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
         instances = db.instance_get_all_by_filters_sort(self.ctxt, filters)
         self.assertEqual([], instances)
 
-    @mock.patch('sqlalchemy.orm.undefer')
     @mock.patch('sqlalchemy.orm.joinedload')
-    def test_instance_get_all_by_filters_extra_columns(self,
-                                                       mock_joinedload,
-                                                       mock_undefer):
+    def test_instance_get_all_by_filters_extra_columns(self, mock_joinedload):
         db.instance_get_all_by_filters_sort(
             self.ctxt, {},
-            columns_to_join=['info_cache', 'extra.pci_requests'])
-        mock_joinedload.assert_called_once_with('info_cache')
-        mock_undefer.assert_called_once_with('extra.pci_requests')
+            columns_to_join=['info_cache', 'extra.pci_requests'],
+        )
+        mock_joinedload.assert_has_calls(
+            [
+                mock.call(models.Instance.info_cache),
+                mock.ANY,
+                mock.call(models.Instance.extra),
+                mock.ANY,
+                mock.ANY,
+            ]
+        )
 
-    @mock.patch('sqlalchemy.orm.undefer')
     @mock.patch('sqlalchemy.orm.joinedload')
-    def test_instance_get_active_by_window_extra_columns(self,
-                                                         mock_joinedload,
-                                                         mock_undefer):
+    def test_instance_get_active_by_window_extra_columns(
+        self, mock_joinedload,
+    ):
         now = datetime.datetime(2013, 10, 10, 17, 16, 37, 156701)
         db.instance_get_active_by_window_joined(
             self.ctxt, now,
-            columns_to_join=['info_cache', 'extra.pci_requests'])
-        mock_joinedload.assert_called_once_with('info_cache')
-        mock_undefer.assert_called_once_with('extra.pci_requests')
+            columns_to_join=['info_cache', 'extra.pci_requests'],
+        )
+        mock_joinedload.assert_has_calls(
+            [
+                mock.call(models.Instance.info_cache),
+                mock.ANY,
+                mock.call(models.Instance.extra),
+                mock.ANY,
+                mock.ANY,
+            ]
+        )
 
     def test_instance_get_all_by_filters_with_meta(self):
         self.create_instance_with_args()
@@ -2314,12 +2312,12 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
             ])
 
     def test_instance_update_and_get_original_conflict_race_fallthrough(self):
-        # Ensure that is update_match continuously fails for no discernable
+        # Ensure that is update_match continuously fails for no discernible
         # reason, we evantually raise UnknownInstanceUpdateConflict
         instance = self.create_instance_with_args()
 
         # Reproduce the conditions of a race between fetching and updating the
-        # instance by making update_on_match fail for no discernable reason.
+        # instance by making update_on_match fail for no discernible reason.
         with mock.patch.object(update_match, 'update_on_match',
                         side_effect=update_match.NoRowsMatched):
             self.assertRaises(exception.UnknownInstanceUpdateConflict,
@@ -2671,7 +2669,7 @@ class InstanceTestCase(test.TestCase, ModelsObjectComparatorMixin):
         block_dev = block_device.BlockDeviceDict(bdm_values)
         db.block_device_mapping_create(self.ctxt, block_dev, legacy=False)
 
-        # Crate a second BDM that is soft-deleted to simulate that the
+        # Create a second BDM that is soft-deleted to simulate that the
         # volume was detached and the BDM was deleted before the instance
         # was hard destroyed.
         bdm2_values = {
@@ -3349,7 +3347,7 @@ class InstanceActionTestCase(test.TestCase, ModelsObjectComparatorMixin):
         self._assertEqualListsOfObjects(expected, actions)
 
     def test_instance_actions_get_are_in_order(self):
-        """Ensure retrived actions are in order."""
+        """Ensure retrieved actions are in order."""
         uuid1 = uuidsentinel.uuid1
 
         extra = {
@@ -3608,7 +3606,7 @@ class InstanceActionTestCase(test.TestCase, ModelsObjectComparatorMixin):
         self._assertActionEventSaved(event, action['id'])
 
     def test_instance_action_events_get_are_in_order(self):
-        """Ensure retrived action events are in order."""
+        """Ensure retrieved action events are in order."""
         uuid1 = uuidsentinel.uuid1
 
         action = db.action_start(self.ctxt,
@@ -4752,202 +4750,6 @@ class VirtualInterfaceTestCase(test.TestCase, ModelsObjectComparatorMixin):
         self._assertEqualObjects(updated, updated_vif, ignored_keys)
 
 
-class KeyPairTestCase(test.TestCase, ModelsObjectComparatorMixin):
-    def setUp(self):
-        super(KeyPairTestCase, self).setUp()
-        self.ctxt = context.get_admin_context()
-
-    def _create_key_pair(self, values):
-        return db.key_pair_create(self.ctxt, values)
-
-    def test_key_pair_create(self):
-        param = {
-            'name': 'test_1',
-            'type': 'ssh',
-            'user_id': 'test_user_id_1',
-            'public_key': 'test_public_key_1',
-            'fingerprint': 'test_fingerprint_1'
-        }
-        key_pair = self._create_key_pair(param)
-
-        self.assertIsNotNone(key_pair['id'])
-        ignored_keys = ['deleted', 'created_at', 'updated_at',
-                        'deleted_at', 'id']
-        self._assertEqualObjects(key_pair, param, ignored_keys)
-
-    def test_key_pair_create_with_duplicate_name(self):
-        params = {'name': 'test_name', 'user_id': 'test_user_id',
-                  'type': 'ssh'}
-        self._create_key_pair(params)
-        self.assertRaises(exception.KeyPairExists, self._create_key_pair,
-                          params)
-
-    def test_key_pair_get(self):
-        params = [
-            {'name': 'test_1', 'user_id': 'test_user_id_1', 'type': 'ssh'},
-            {'name': 'test_2', 'user_id': 'test_user_id_2', 'type': 'ssh'},
-            {'name': 'test_3', 'user_id': 'test_user_id_3', 'type': 'ssh'}
-        ]
-        key_pairs = [self._create_key_pair(p) for p in params]
-
-        for key in key_pairs:
-            real_key = db.key_pair_get(self.ctxt, key['user_id'], key['name'])
-            self._assertEqualObjects(key, real_key)
-
-    def test_key_pair_get_no_results(self):
-        param = {'name': 'test_1', 'user_id': 'test_user_id_1'}
-        self.assertRaises(exception.KeypairNotFound, db.key_pair_get,
-                          self.ctxt, param['user_id'], param['name'])
-
-    def test_key_pair_get_deleted(self):
-        param = {'name': 'test_1', 'user_id': 'test_user_id_1', 'type': 'ssh'}
-        key_pair_created = self._create_key_pair(param)
-
-        db.key_pair_destroy(self.ctxt, param['user_id'], param['name'])
-        self.assertRaises(exception.KeypairNotFound, db.key_pair_get,
-                          self.ctxt, param['user_id'], param['name'])
-
-        ctxt = self.ctxt.elevated(read_deleted='yes')
-        key_pair_deleted = db.key_pair_get(ctxt, param['user_id'],
-                                           param['name'])
-        ignored_keys = ['deleted', 'created_at', 'updated_at', 'deleted_at']
-        self._assertEqualObjects(key_pair_deleted, key_pair_created,
-                                 ignored_keys)
-        self.assertEqual(key_pair_deleted['deleted'], key_pair_deleted['id'])
-
-    def test_key_pair_get_all_by_user(self):
-        params = [
-            {'name': 'test_1', 'user_id': 'test_user_id_1', 'type': 'ssh'},
-            {'name': 'test_2', 'user_id': 'test_user_id_1', 'type': 'ssh'},
-            {'name': 'test_3', 'user_id': 'test_user_id_2', 'type': 'ssh'}
-        ]
-        key_pairs_user_1 = [self._create_key_pair(p) for p in params
-                            if p['user_id'] == 'test_user_id_1']
-        key_pairs_user_2 = [self._create_key_pair(p) for p in params
-                            if p['user_id'] == 'test_user_id_2']
-
-        real_keys_1 = db.key_pair_get_all_by_user(self.ctxt, 'test_user_id_1')
-        real_keys_2 = db.key_pair_get_all_by_user(self.ctxt, 'test_user_id_2')
-
-        self._assertEqualListsOfObjects(key_pairs_user_1, real_keys_1)
-        self._assertEqualListsOfObjects(key_pairs_user_2, real_keys_2)
-
-    def test_key_pair_get_all_by_user_limit_and_marker(self):
-        params = [
-            {'name': 'test_1', 'user_id': 'test_user_id', 'type': 'ssh'},
-            {'name': 'test_2', 'user_id': 'test_user_id', 'type': 'ssh'},
-            {'name': 'test_3', 'user_id': 'test_user_id', 'type': 'ssh'}
-        ]
-
-        # check all 3 keypairs
-        keys = [self._create_key_pair(p) for p in params]
-        db_keys = db.key_pair_get_all_by_user(self.ctxt, 'test_user_id')
-        self._assertEqualListsOfObjects(keys, db_keys)
-
-        # check only 1 keypair
-        expected_keys = [keys[0]]
-        db_keys = db.key_pair_get_all_by_user(self.ctxt, 'test_user_id',
-                                              limit=1)
-        self._assertEqualListsOfObjects(expected_keys, db_keys)
-
-        # check keypairs after 'test_1'
-        expected_keys = [keys[1], keys[2]]
-        db_keys = db.key_pair_get_all_by_user(self.ctxt, 'test_user_id',
-                                              marker='test_1')
-        self._assertEqualListsOfObjects(expected_keys, db_keys)
-
-        # check only 1 keypairs after 'test_1'
-        expected_keys = [keys[1]]
-        db_keys = db.key_pair_get_all_by_user(self.ctxt, 'test_user_id',
-                                              limit=1,
-                                              marker='test_1')
-        self._assertEqualListsOfObjects(expected_keys, db_keys)
-
-        # check non-existing keypair
-        self.assertRaises(exception.MarkerNotFound,
-                          db.key_pair_get_all_by_user,
-                          self.ctxt, 'test_user_id',
-                          limit=1, marker='unknown_kp')
-
-    def test_key_pair_get_all_by_user_different_users(self):
-        params1 = [
-            {'name': 'test_1', 'user_id': 'test_user_1', 'type': 'ssh'},
-            {'name': 'test_2', 'user_id': 'test_user_1', 'type': 'ssh'},
-            {'name': 'test_3', 'user_id': 'test_user_1', 'type': 'ssh'}
-        ]
-        params2 = [
-            {'name': 'test_1', 'user_id': 'test_user_2', 'type': 'ssh'},
-            {'name': 'test_2', 'user_id': 'test_user_2', 'type': 'ssh'},
-            {'name': 'test_3', 'user_id': 'test_user_2', 'type': 'ssh'}
-        ]
-
-        # create keypairs for two users
-        keys1 = [self._create_key_pair(p) for p in params1]
-        keys2 = [self._create_key_pair(p) for p in params2]
-
-        # check all 2 keypairs for test_user_1
-        db_keys = db.key_pair_get_all_by_user(self.ctxt, 'test_user_1')
-        self._assertEqualListsOfObjects(keys1, db_keys)
-
-        # check all 2 keypairs for test_user_2
-        db_keys = db.key_pair_get_all_by_user(self.ctxt, 'test_user_2')
-        self._assertEqualListsOfObjects(keys2, db_keys)
-
-        # check only 1 keypair for test_user_1
-        expected_keys = [keys1[0]]
-        db_keys = db.key_pair_get_all_by_user(self.ctxt, 'test_user_1',
-                                              limit=1)
-        self._assertEqualListsOfObjects(expected_keys, db_keys)
-
-        # check keypairs after 'test_1' for test_user_2
-        expected_keys = [keys2[1], keys2[2]]
-        db_keys = db.key_pair_get_all_by_user(self.ctxt, 'test_user_2',
-                                              marker='test_1')
-        self._assertEqualListsOfObjects(expected_keys, db_keys)
-
-        # check only 1 keypairs after 'test_1' for test_user_1
-        expected_keys = [keys1[1]]
-        db_keys = db.key_pair_get_all_by_user(self.ctxt, 'test_user_1',
-                                              limit=1,
-                                              marker='test_1')
-        self._assertEqualListsOfObjects(expected_keys, db_keys)
-
-        # check non-existing keypair for test_user_2
-        self.assertRaises(exception.MarkerNotFound,
-                          db.key_pair_get_all_by_user,
-                          self.ctxt, 'test_user_2',
-                          limit=1, marker='unknown_kp')
-
-    def test_key_pair_count_by_user(self):
-        params = [
-            {'name': 'test_1', 'user_id': 'test_user_id_1', 'type': 'ssh'},
-            {'name': 'test_2', 'user_id': 'test_user_id_1', 'type': 'ssh'},
-            {'name': 'test_3', 'user_id': 'test_user_id_2', 'type': 'ssh'}
-        ]
-        for p in params:
-            self._create_key_pair(p)
-
-        count_1 = db.key_pair_count_by_user(self.ctxt, 'test_user_id_1')
-        self.assertEqual(count_1, 2)
-
-        count_2 = db.key_pair_count_by_user(self.ctxt, 'test_user_id_2')
-        self.assertEqual(count_2, 1)
-
-    def test_key_pair_destroy(self):
-        param = {'name': 'test_1', 'user_id': 'test_user_id_1', 'type': 'ssh'}
-        self._create_key_pair(param)
-
-        db.key_pair_destroy(self.ctxt, param['user_id'], param['name'])
-        self.assertRaises(exception.KeypairNotFound, db.key_pair_get,
-                          self.ctxt, param['user_id'], param['name'])
-
-    def test_key_pair_destroy_no_such_key(self):
-        param = {'name': 'test_1', 'user_id': 'test_user_id_1'}
-        self.assertRaises(exception.KeypairNotFound,
-                          db.key_pair_destroy, self.ctxt,
-                          param['user_id'], param['name'])
-
-
 class QuotaTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
     """Tests for db.api.quota_* methods."""
@@ -5848,8 +5650,7 @@ class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
     def setUp(self):
         super(ArchiveTestCase, self).setUp()
         self.engine = db.get_engine()
-        self.metadata = sa.MetaData(self.engine)
-        self.conn = self.engine.connect()
+        self.metadata = sa.MetaData()
         self.instance_id_mappings = models.InstanceIdMapping.__table__
         self.shadow_instance_id_mappings = sqlalchemyutils.get_table(
             self.engine, "shadow_instance_id_mappings")
@@ -5877,23 +5678,26 @@ class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
         """Ensure shadow tables are empty
 
         This method ensures that all the shadow tables in the schema,
-        except for specificially named exceptions, are empty. This
+        except for specifically named exceptions, are empty. This
         makes sure that archiving isn't moving unexpected content.
         """
-        metadata = sa.MetaData(bind=self.engine)
-        metadata.reflect()
-        for table in metadata.tables:
-            if table.startswith("shadow_") and table not in exceptions:
-                rows = self.conn.execute("select * from %s" % table).fetchall()
-                self.assertEqual(rows, [], "Table %s not empty" % table)
+        metadata = sa.MetaData()
+        metadata.reflect(bind=self.engine)
+        with self.engine.connect() as conn, conn.begin():
+            for table in metadata.tables:
+                if table.startswith("shadow_") and table not in exceptions:
+                    rows = conn.exec_driver_sql(
+                        "SELECT * FROM %s" % table
+                    ).fetchall()
+                    self.assertEqual(rows, [], "Table %s not empty" % table)
 
     def test_shadow_tables(self):
         """Validate shadow table schema.
 
         Shadow tables should have an identical schema to the main table.
         """
-        metadata = sa.MetaData(bind=self.engine)
-        metadata.reflect()
+        metadata = sa.MetaData()
+        metadata.reflect(bind=self.engine)
         for table_name in metadata.tables:
             # some tables don't have shadow tables so skip these
             if table_name in [
@@ -5910,8 +5714,10 @@ class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
             shadow_table_name = f'shadow_{table_name}'
 
-            table = sa.Table(table_name, metadata, autoload=True)
-            shadow_table = sa.Table(shadow_table_name, metadata, autoload=True)
+            table = sa.Table(table_name, metadata, autoload_with=self.engine)
+            shadow_table = sa.Table(
+                shadow_table_name, metadata, autoload_with=self.engine,
+            )
 
             columns = {c.name: c for c in table.columns}
             shadow_columns = {c.name: c for c in shadow_table.columns}
@@ -5936,56 +5742,72 @@ class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
         self._assert_shadow_tables_empty_except()
 
     def test_archive_deleted_rows(self):
-        # Add 6 rows to table
-        for uuidstr in self.uuidstrs:
-            ins_stmt = self.instance_id_mappings.insert().values(uuid=uuidstr)
-            self.conn.execute(ins_stmt)
+        with self.engine.connect() as conn, conn.begin():
+            # Add 6 rows to table
+            for uuidstr in self.uuidstrs:
+                ins_stmt = self.instance_id_mappings.insert().values(
+                    uuid=uuidstr,
+                )
+                conn.execute(ins_stmt)
+
         # Set 4 to deleted
-        update_statement = self.instance_id_mappings.update().\
-                where(self.instance_id_mappings.c.uuid.in_(self.uuidstrs[:4]))\
-                .values(deleted=1, deleted_at=timeutils.utcnow())
-        self.conn.execute(update_statement)
-        qiim = sql.select([self.instance_id_mappings]).where(self.
-                                instance_id_mappings.c.uuid.in_(self.uuidstrs))
-        rows = self.conn.execute(qiim).fetchall()
-        # Verify we have 6 in main
-        self.assertEqual(len(rows), 6)
-        qsiim = sql.select([self.shadow_instance_id_mappings]).\
-                where(self.shadow_instance_id_mappings.c.uuid.in_(
-                                                                self.uuidstrs))
-        rows = self.conn.execute(qsiim).fetchall()
-        # Verify we have 0 in shadow
-        self.assertEqual(len(rows), 0)
-        # Archive 2 rows
+        with self.engine.connect() as conn, conn.begin():
+            update_statement = self.instance_id_mappings.update().where(
+                self.instance_id_mappings.c.uuid.in_(self.uuidstrs[:4])
+            ).values(deleted=1, deleted_at=timeutils.utcnow())
+            conn.execute(update_statement)
+
+        qiim = sql.select(self.instance_id_mappings).where(
+            self.instance_id_mappings.c.uuid.in_(self.uuidstrs)
+        )
+        qsiim = sql.select(self.shadow_instance_id_mappings).where(
+            self.shadow_instance_id_mappings.c.uuid.in_(self.uuidstrs)
+        )
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 6 in main
+            rows = conn.execute(qiim).fetchall()
+            self.assertEqual(len(rows), 6)
+            # Verify we have 0 in shadow
+            rows = conn.execute(qsiim).fetchall()
+            self.assertEqual(len(rows), 0)
+
         results = db.archive_deleted_rows(max_rows=2)
         expected = dict(instance_id_mappings=2)
         self._assertEqualObjects(expected, results[0])
-        rows = self.conn.execute(qiim).fetchall()
-        # Verify we have 4 left in main
-        self.assertEqual(len(rows), 4)
-        rows = self.conn.execute(qsiim).fetchall()
-        # Verify we have 2 in shadow
-        self.assertEqual(len(rows), 2)
+
+        with self.engine.connect() as conn, conn.begin():
+            # Archive 2 rows and verify we have 4 left in main
+            rows = conn.execute(qiim).fetchall()
+            self.assertEqual(len(rows), 4)
+            # Verify we have 2 in shadow
+            rows = conn.execute(qsiim).fetchall()
+            self.assertEqual(len(rows), 2)
         # Archive 2 more rows
         results = db.archive_deleted_rows(max_rows=2)
         expected = dict(instance_id_mappings=2)
         self._assertEqualObjects(expected, results[0])
-        rows = self.conn.execute(qiim).fetchall()
-        # Verify we have 2 left in main
-        self.assertEqual(len(rows), 2)
-        rows = self.conn.execute(qsiim).fetchall()
-        # Verify we have 4 in shadow
-        self.assertEqual(len(rows), 4)
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 2 left in main
+            rows = conn.execute(qiim).fetchall()
+            self.assertEqual(len(rows), 2)
+            # Verify we have 4 in shadow
+            rows = conn.execute(qsiim).fetchall()
+            self.assertEqual(len(rows), 4)
+
         # Try to archive more, but there are no deleted rows left.
         results = db.archive_deleted_rows(max_rows=2)
         expected = dict()
         self._assertEqualObjects(expected, results[0])
-        rows = self.conn.execute(qiim).fetchall()
-        # Verify we still have 2 left in main
-        self.assertEqual(len(rows), 2)
-        rows = self.conn.execute(qsiim).fetchall()
-        # Verify we still have 4 in shadow
-        self.assertEqual(len(rows), 4)
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we still have 2 left in main
+            rows = conn.execute(qiim).fetchall()
+            self.assertEqual(len(rows), 2)
+            # Verify we still have 4 in shadow
+            rows = conn.execute(qsiim).fetchall()
+            self.assertEqual(len(rows), 4)
 
         # Ensure only deleted rows were deleted
         self._assert_shadow_tables_empty_except(
@@ -5995,42 +5817,57 @@ class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
         # Add 6 rows to table
         for uuidstr in self.uuidstrs:
             ins_stmt = self.instances.insert().values(uuid=uuidstr)
-            self.conn.execute(ins_stmt)
-            ins_stmt = self.instance_actions.insert().\
-                    values(instance_uuid=uuidstr)
-            result = self.conn.execute(ins_stmt)
+            with self.engine.connect() as conn, conn.begin():
+                conn.execute(ins_stmt)
+
+            ins_stmt = self.instance_actions.insert().values(
+                instance_uuid=uuidstr,
+            )
+            with self.engine.connect() as conn, conn.begin():
+                result = conn.execute(ins_stmt)
+
             instance_action_uuid = result.inserted_primary_key[0]
-            ins_stmt = self.instance_actions_events.insert().\
-                    values(action_id=instance_action_uuid)
-            self.conn.execute(ins_stmt)
+            ins_stmt = self.instance_actions_events.insert().values(
+                action_id=instance_action_uuid,
+            )
+            with self.engine.connect() as conn, conn.begin():
+                conn.execute(ins_stmt)
 
         # Set 1 to deleted before 2017-01-01
         deleted_at = timeutils.parse_strtime('2017-01-01T00:00:00.0')
-        update_statement = self.instances.update().\
-                where(self.instances.c.uuid.in_(self.uuidstrs[0:1]))\
-                .values(deleted=1, deleted_at=deleted_at)
-        self.conn.execute(update_statement)
+        update_statement = self.instances.update().where(
+            self.instances.c.uuid.in_(self.uuidstrs[0:1])
+        ).values(deleted=1, deleted_at=deleted_at)
+        with self.engine.connect() as conn, conn.begin():
+            conn.execute(update_statement)
 
         # Set 1 to deleted before 2017-01-02
         deleted_at = timeutils.parse_strtime('2017-01-02T00:00:00.0')
-        update_statement = self.instances.update().\
-                where(self.instances.c.uuid.in_(self.uuidstrs[1:2]))\
-                .values(deleted=1, deleted_at=deleted_at)
-        self.conn.execute(update_statement)
+        update_statement = self.instances.update().where(
+            self.instances.c.uuid.in_(self.uuidstrs[1:2])
+        ).values(deleted=1, deleted_at=deleted_at)
+        with self.engine.connect() as conn, conn.begin():
+            conn.execute(update_statement)
 
         # Set 2 to deleted now
-        update_statement = self.instances.update().\
-                where(self.instances.c.uuid.in_(self.uuidstrs[2:4]))\
-                .values(deleted=1, deleted_at=timeutils.utcnow())
-        self.conn.execute(update_statement)
-        qiim = sql.select([self.instances]).where(self.
-                                instances.c.uuid.in_(self.uuidstrs))
-        qsiim = sql.select([self.shadow_instances]).\
-                where(self.shadow_instances.c.uuid.in_(self.uuidstrs))
+        update_statement = self.instances.update().where(
+            self.instances.c.uuid.in_(self.uuidstrs[2:4])
+        ).values(deleted=1, deleted_at=timeutils.utcnow())
+        with self.engine.connect() as conn, conn.begin():
+            conn.execute(update_statement)
 
-        # Verify we have 6 in main
-        rows = self.conn.execute(qiim).fetchall()
-        self.assertEqual(len(rows), 6)
+        qiim = sql.select(self.instances).where(
+            self. instances.c.uuid.in_(self.uuidstrs)
+        )
+        qsiim = sql.select(self.shadow_instances).where(
+            self.shadow_instances.c.uuid.in_(self.uuidstrs)
+        )
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 6 in main
+            rows = conn.execute(qiim).fetchall()
+            self.assertEqual(len(rows), 6)
+
         # Make sure 'before' comparison is for < not <=, nothing deleted
         before_date = dateutil_parser.parse('2017-01-01', fuzzy=True)
         _, uuids, _ = db.archive_deleted_rows(max_rows=1, before=before_date)
@@ -6064,22 +5901,25 @@ class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
         expected = {}
         self._assertEqualObjects(expected, results[0])
 
-        # Verify we have 4 left in main
-        rows = self.conn.execute(qiim).fetchall()
-        self.assertEqual(len(rows), 4)
-        # Verify we have 2 in shadow
-        rows = self.conn.execute(qsiim).fetchall()
-        self.assertEqual(len(rows), 2)
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 4 left in main
+            rows = conn.execute(qiim).fetchall()
+            self.assertEqual(len(rows), 4)
+            # Verify we have 2 in shadow
+            rows = conn.execute(qsiim).fetchall()
+            self.assertEqual(len(rows), 2)
 
         # Archive everything else, make sure default operation without
         # before argument didn't break
         results = db.archive_deleted_rows(max_rows=1000)
-        # Verify we have 2 left in main
-        rows = self.conn.execute(qiim).fetchall()
-        self.assertEqual(len(rows), 2)
-        # Verify we have 4 in shadow
-        rows = self.conn.execute(qsiim).fetchall()
-        self.assertEqual(len(rows), 4)
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 2 left in main
+            rows = conn.execute(qiim).fetchall()
+            self.assertEqual(len(rows), 2)
+            # Verify we have 4 in shadow
+            rows = conn.execute(qsiim).fetchall()
+            self.assertEqual(len(rows), 4)
 
     def test_archive_deleted_rows_for_every_uuid_table(self):
         tablenames = []
@@ -6107,85 +5947,117 @@ class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
         for uuidstr in self.uuidstrs:
             ins_stmt = main_table.insert().values(uuid=uuidstr)
             try:
-                self.conn.execute(ins_stmt)
+                with self.engine.connect() as conn, conn.begin():
+                    conn.execute(ins_stmt)
             except (db_exc.DBError, sqla_exc.OperationalError):
                 # This table has constraints that require a table-specific
                 # insert, so skip it.
                 return 2
         # Set 4 to deleted
-        update_statement = main_table.update().\
-                where(main_table.c.uuid.in_(self.uuidstrs[:4]))\
-                .values(deleted=1, deleted_at=timeutils.utcnow())
-        self.conn.execute(update_statement)
-        qmt = sql.select([main_table]).where(main_table.c.uuid.in_(
-                                             self.uuidstrs))
-        rows = self.conn.execute(qmt).fetchall()
-        # Verify we have 6 in main
-        self.assertEqual(len(rows), 6)
-        qst = sql.select([shadow_table]).\
-                where(shadow_table.c.uuid.in_(self.uuidstrs))
-        rows = self.conn.execute(qst).fetchall()
-        # Verify we have 0 in shadow
-        self.assertEqual(len(rows), 0)
+        update_statement = main_table.update().where(
+            main_table.c.uuid.in_(self.uuidstrs[:4])
+        ).values(deleted=1, deleted_at=timeutils.utcnow())
+        with self.engine.connect() as conn, conn.begin():
+            conn.execute(update_statement)
+
+        qmt = sql.select(main_table).where(
+            main_table.c.uuid.in_(self.uuidstrs)
+        )
+        qst = sql.select(shadow_table).where(
+            shadow_table.c.uuid.in_(self.uuidstrs)
+        )
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 6 in main
+            rows = conn.execute(qmt).fetchall()
+            self.assertEqual(len(rows), 6)
+            # Verify we have 0 in shadow
+            rows = conn.execute(qst).fetchall()
+            self.assertEqual(len(rows), 0)
+
         # Archive 2 rows
         db._archive_deleted_rows_for_table(
-            self.metadata, tablename, max_rows=2, before=None, task_log=False)
-        # Verify we have 4 left in main
-        rows = self.conn.execute(qmt).fetchall()
-        self.assertEqual(len(rows), 4)
-        # Verify we have 2 in shadow
-        rows = self.conn.execute(qst).fetchall()
-        self.assertEqual(len(rows), 2)
+            self.metadata, self.engine, tablename, max_rows=2, before=None,
+            task_log=False,
+        )
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 4 left in main
+            rows = conn.execute(qmt).fetchall()
+            self.assertEqual(len(rows), 4)
+            # Verify we have 2 in shadow
+            rows = conn.execute(qst).fetchall()
+            self.assertEqual(len(rows), 2)
+
         # Archive 2 more rows
         db._archive_deleted_rows_for_table(
-            self.metadata, tablename, max_rows=2, before=None, task_log=False)
-        # Verify we have 2 left in main
-        rows = self.conn.execute(qmt).fetchall()
-        self.assertEqual(len(rows), 2)
-        # Verify we have 4 in shadow
-        rows = self.conn.execute(qst).fetchall()
-        self.assertEqual(len(rows), 4)
+            self.metadata, self.engine, tablename, max_rows=2, before=None,
+            task_log=False,
+        )
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 2 left in main
+            rows = conn.execute(qmt).fetchall()
+            self.assertEqual(len(rows), 2)
+            # Verify we have 4 in shadow
+            rows = conn.execute(qst).fetchall()
+            self.assertEqual(len(rows), 4)
+
         # Try to archive more, but there are no deleted rows left.
         db._archive_deleted_rows_for_table(
-            self.metadata, tablename, max_rows=2, before=None, task_log=False)
-        # Verify we still have 2 left in main
-        rows = self.conn.execute(qmt).fetchall()
-        self.assertEqual(len(rows), 2)
-        # Verify we still have 4 in shadow
-        rows = self.conn.execute(qst).fetchall()
-        self.assertEqual(len(rows), 4)
+            self.metadata, self.engine, tablename, max_rows=2, before=None,
+            task_log=False,
+        )
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we still have 2 left in main
+            rows = conn.execute(qmt).fetchall()
+            self.assertEqual(len(rows), 2)
+            # Verify we still have 4 in shadow
+            rows = conn.execute(qst).fetchall()
+            self.assertEqual(len(rows), 4)
+
         return 0
 
     def test_archive_deleted_rows_shadow_insertions_equals_deletions(self):
         # Add 2 rows to table
         for uuidstr in self.uuidstrs[:2]:
             ins_stmt = self.instance_id_mappings.insert().values(uuid=uuidstr)
-            self.conn.execute(ins_stmt)
-        # Set both to deleted
-        update_statement = self.instance_id_mappings.update().\
-                where(self.instance_id_mappings.c.uuid.in_(self.uuidstrs[:2]))\
-                .values(deleted=1)
-        self.conn.execute(update_statement)
-        qiim = sql.select([self.instance_id_mappings]).where(self.
-                            instance_id_mappings.c.uuid.in_(self.uuidstrs[:2]))
-        rows = self.conn.execute(qiim).fetchall()
-        # Verify we have 2 in main
-        self.assertEqual(len(rows), 2)
+            with self.engine.connect() as conn, conn.begin():
+                conn.execute(ins_stmt)
 
-        qsiim = sql.select([self.shadow_instance_id_mappings]).\
-                where(self.shadow_instance_id_mappings.c.uuid.in_(
-                                                            self.uuidstrs[:2]))
-        shadow_rows = self.conn.execute(qsiim).fetchall()
-        # Verify we have 0 in shadow
-        self.assertEqual(len(shadow_rows), 0)
+        # Set both to deleted
+        update_statement = self.instance_id_mappings.update().where(
+            self.instance_id_mappings.c.uuid.in_(self.uuidstrs[:2])
+        ).values(deleted=1)
+        with self.engine.connect() as conn, conn.begin():
+            conn.execute(update_statement)
+
+        qiim = sql.select(self.instance_id_mappings).where(
+            self. instance_id_mappings.c.uuid.in_(self.uuidstrs[:2])
+        )
+        qsiim = sql.select(self.shadow_instance_id_mappings).where(
+            self.shadow_instance_id_mappings.c.uuid.in_(self.uuidstrs[:2])
+        )
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 2 in main
+            rows = conn.execute(qiim).fetchall()
+            self.assertEqual(len(rows), 2)
+            # Verify we have 0 in shadow
+            rows = conn.execute(qsiim).fetchall()
+            self.assertEqual(len(rows), 0)
 
         # Archive the rows
         db.archive_deleted_rows(max_rows=2)
 
-        main_rows = self.conn.execute(qiim).fetchall()
-        shadow_rows = self.conn.execute(qsiim).fetchall()
-        # Verify the insertions into shadow is same as deletions from main
-        self.assertEqual(len(shadow_rows), len(rows) - len(main_rows))
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we now have 0 in main
+            rows = conn.execute(qiim).fetchall()
+            self.assertEqual(len(rows), 0)
+            # Verify we now have 2 in shadow
+            rows = conn.execute(qsiim).fetchall()
+            self.assertEqual(len(rows), 2)
 
     def test_archive_deleted_rows_for_migrations(self):
         # migrations.instance_uuid depends on instances.uuid
@@ -6195,18 +6067,23 @@ class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
 
         instance_uuid = uuidsentinel.instance
         ins_stmt = self.instances.insert().values(
-                        uuid=instance_uuid,
-                        deleted=1,
-                        deleted_at=timeutils.utcnow())
-        self.conn.execute(ins_stmt)
-        ins_stmt = self.migrations.insert().values(instance_uuid=instance_uuid,
-                                                   deleted=0)
-        self.conn.execute(ins_stmt)
+            uuid=instance_uuid,
+            deleted=1,
+            deleted_at=timeutils.utcnow(),
+        )
+        with self.engine.connect() as conn, conn.begin():
+            conn.execute(ins_stmt)
+
+        ins_stmt = self.migrations.insert().values(
+            instance_uuid=instance_uuid, deleted=0,
+        )
+        with self.engine.connect() as conn, conn.begin():
+            conn.execute(ins_stmt)
         # Archiving instances should result in migrations related to the
         # instances also being archived.
         num = db._archive_deleted_rows_for_table(
-            self.metadata, "instances", max_rows=None, before=None,
-            task_log=False)
+            self.metadata, self.engine, "instances", max_rows=None,
+            before=None, task_log=False)
         self.assertEqual(1, num[0])
         self._assert_shadow_tables_empty_except(
             'shadow_instances',
@@ -6217,67 +6094,86 @@ class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
         # Add 6 rows to each table
         for uuidstr in self.uuidstrs:
             ins_stmt = self.instance_id_mappings.insert().values(uuid=uuidstr)
-            self.conn.execute(ins_stmt)
+            with self.engine.connect() as conn, conn.begin():
+                conn.execute(ins_stmt)
             ins_stmt2 = self.instances.insert().values(uuid=uuidstr)
-            self.conn.execute(ins_stmt2)
+            with self.engine.connect() as conn, conn.begin():
+                conn.execute(ins_stmt2)
         # Set 4 of each to deleted
         update_statement = self.instance_id_mappings.update().\
                 where(self.instance_id_mappings.c.uuid.in_(self.uuidstrs[:4]))\
                 .values(deleted=1, deleted_at=timeutils.utcnow())
-        self.conn.execute(update_statement)
+        with self.engine.connect() as conn, conn.begin():
+            conn.execute(update_statement)
         update_statement2 = self.instances.update().\
                 where(self.instances.c.uuid.in_(self.uuidstrs[:4]))\
                 .values(deleted=1, deleted_at=timeutils.utcnow())
-        self.conn.execute(update_statement2)
-        # Verify we have 6 in each main table
-        qiim = sql.select([self.instance_id_mappings]).where(
-                         self.instance_id_mappings.c.uuid.in_(self.uuidstrs))
-        rows = self.conn.execute(qiim).fetchall()
-        self.assertEqual(len(rows), 6)
-        qi = sql.select([self.instances]).where(self.instances.c.uuid.in_(
-                                             self.uuidstrs))
-        rows = self.conn.execute(qi).fetchall()
-        self.assertEqual(len(rows), 6)
-        # Verify we have 0 in each shadow table
-        qsiim = sql.select([self.shadow_instance_id_mappings]).\
-                where(self.shadow_instance_id_mappings.c.uuid.in_(
-                                                            self.uuidstrs))
-        rows = self.conn.execute(qsiim).fetchall()
-        self.assertEqual(len(rows), 0)
-        qsi = sql.select([self.shadow_instances]).\
-                where(self.shadow_instances.c.uuid.in_(self.uuidstrs))
-        rows = self.conn.execute(qsi).fetchall()
-        self.assertEqual(len(rows), 0)
+        with self.engine.connect() as conn, conn.begin():
+            conn.execute(update_statement2)
+
+        qiim = sql.select(self.instance_id_mappings).where(
+            self.instance_id_mappings.c.uuid.in_(self.uuidstrs)
+        )
+        qi = sql.select(self.instances).where(
+            self.instances.c.uuid.in_(self.uuidstrs)
+        )
+        qsiim = sql.select(self.shadow_instance_id_mappings).where(
+            self.shadow_instance_id_mappings.c.uuid.in_(self.uuidstrs)
+        )
+        qsi = sql.select(self.shadow_instances).where(
+            self.shadow_instances.c.uuid.in_(self.uuidstrs)
+        )
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 6 in each main table
+            rows = conn.execute(qiim).fetchall()
+            self.assertEqual(len(rows), 6)
+            rows = conn.execute(qi).fetchall()
+            self.assertEqual(len(rows), 6)
+            # Verify we have 0 in each shadow table
+            rows = conn.execute(qsiim).fetchall()
+            self.assertEqual(len(rows), 0)
+            rows = conn.execute(qsi).fetchall()
+            self.assertEqual(len(rows), 0)
+
         # Archive 7 rows, which should be 4 in one table and 3 in the other.
         db.archive_deleted_rows(max_rows=7)
-        # Verify we have 5 left in the two main tables combined
-        iim_rows = self.conn.execute(qiim).fetchall()
-        i_rows = self.conn.execute(qi).fetchall()
-        self.assertEqual(len(iim_rows) + len(i_rows), 5)
-        # Verify we have 7 in the two shadow tables combined.
-        siim_rows = self.conn.execute(qsiim).fetchall()
-        si_rows = self.conn.execute(qsi).fetchall()
-        self.assertEqual(len(siim_rows) + len(si_rows), 7)
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 5 left in the two main tables combined
+            iim_rows = conn.execute(qiim).fetchall()
+            i_rows = conn.execute(qi).fetchall()
+            self.assertEqual(len(iim_rows) + len(i_rows), 5)
+            # Verify we have 7 in the two shadow tables combined.
+            siim_rows = conn.execute(qsiim).fetchall()
+            si_rows = conn.execute(qsi).fetchall()
+            self.assertEqual(len(siim_rows) + len(si_rows), 7)
         # Archive the remaining deleted rows.
         db.archive_deleted_rows(max_rows=1)
-        # Verify we have 4 total left in both main tables.
-        iim_rows = self.conn.execute(qiim).fetchall()
-        i_rows = self.conn.execute(qi).fetchall()
-        self.assertEqual(len(iim_rows) + len(i_rows), 4)
-        # Verify we have 8 in shadow
-        siim_rows = self.conn.execute(qsiim).fetchall()
-        si_rows = self.conn.execute(qsi).fetchall()
-        self.assertEqual(len(siim_rows) + len(si_rows), 8)
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 4 total left in both main tables.
+            iim_rows = conn.execute(qiim).fetchall()
+            i_rows = conn.execute(qi).fetchall()
+            self.assertEqual(len(iim_rows) + len(i_rows), 4)
+            # Verify we have 8 in shadow
+            siim_rows = conn.execute(qsiim).fetchall()
+            si_rows = conn.execute(qsi).fetchall()
+            self.assertEqual(len(siim_rows) + len(si_rows), 8)
+
         # Try to archive more, but there are no deleted rows left.
         db.archive_deleted_rows(max_rows=500)
-        # Verify we have 4 total left in both main tables.
-        iim_rows = self.conn.execute(qiim).fetchall()
-        i_rows = self.conn.execute(qi).fetchall()
-        self.assertEqual(len(iim_rows) + len(i_rows), 4)
-        # Verify we have 8 in shadow
-        siim_rows = self.conn.execute(qsiim).fetchall()
-        si_rows = self.conn.execute(qsi).fetchall()
-        self.assertEqual(len(siim_rows) + len(si_rows), 8)
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 4 total left in both main tables.
+            iim_rows = conn.execute(qiim).fetchall()
+            i_rows = conn.execute(qi).fetchall()
+            self.assertEqual(len(iim_rows) + len(i_rows), 4)
+            # Verify we have 8 in shadow
+            siim_rows = conn.execute(qsiim).fetchall()
+            si_rows = conn.execute(qsi).fetchall()
+            self.assertEqual(len(siim_rows) + len(si_rows), 8)
+
         self._assert_shadow_tables_empty_except(
             'shadow_instances',
             'shadow_instance_id_mappings'
@@ -6289,32 +6185,47 @@ class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
             ins_stmt = self.task_log.insert().values(
                 id=i, task_name='instance_usage_audit', state='DONE',
                 host='host', message='message')
-            self.conn.execute(ins_stmt)
+            with self.engine.connect() as conn, conn.begin():
+                conn.execute(ins_stmt)
+
         # Set 1 to updated before 2017-01-01
         updated_at = timeutils.parse_strtime('2017-01-01T00:00:00.0')
         update_statement = self.task_log.update().where(
-            self.task_log.c.id == 1).values(updated_at=updated_at)
-        self.conn.execute(update_statement)
+            self.task_log.c.id == 1
+        ).values(updated_at=updated_at)
+        with self.engine.connect() as conn, conn.begin():
+            conn.execute(update_statement)
+
         # Set 1 to updated before 2017-01-02
         updated_at = timeutils.parse_strtime('2017-01-02T00:00:00.0')
         update_statement = self.task_log.update().where(
-            self.task_log.c.id == 2).values(updated_at=updated_at)
-        self.conn.execute(update_statement)
+            self.task_log.c.id == 2
+        ).values(updated_at=updated_at)
+        with self.engine.connect() as conn, conn.begin():
+            conn.execute(update_statement)
+
         # Set 2 to updated now
         update_statement = self.task_log.update().where(
-            self.task_log.c.id.in_(range(3, 5))).values(
-            updated_at=timeutils.utcnow())
-        self.conn.execute(update_statement)
-        # Verify we have 6 in main
-        qtl = sql.select([self.task_log]).where(
-            self.task_log.c.id.in_(range(1, 7)))
-        rows = self.conn.execute(qtl).fetchall()
-        self.assertEqual(len(rows), 6)
-        # Verify we have 0 in shadow
-        qstl = sql.select([self.shadow_task_log]).where(
-            self.shadow_task_log.c.id.in_(range(1, 7)))
-        rows = self.conn.execute(qstl).fetchall()
-        self.assertEqual(len(rows), 0)
+            self.task_log.c.id.in_(range(3, 5))
+        ).values(updated_at=timeutils.utcnow())
+        with self.engine.connect() as conn, conn.begin():
+            conn.execute(update_statement)
+
+        qtl = sql.select(self.task_log).where(
+            self.task_log.c.id.in_(range(1, 7))
+        )
+        qstl = sql.select(self.shadow_task_log).where(
+            self.shadow_task_log.c.id.in_(range(1, 7))
+        )
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 6 in main
+            rows = conn.execute(qtl).fetchall()
+            self.assertEqual(len(rows), 6)
+            # Verify we have 0 in shadow
+            rows = conn.execute(qstl).fetchall()
+            self.assertEqual(len(rows), 0)
+
         # Make sure 'before' comparison is for < not <=
         before_date = dateutil_parser.parse('2017-01-01', fuzzy=True)
         _, _, rows = db.archive_deleted_rows(
@@ -6336,22 +6247,27 @@ class ArchiveTestCase(test.TestCase, ModelsObjectComparatorMixin):
         results = db.archive_deleted_rows(max_rows=2, task_log=True)
         expected = dict(task_log=2)
         self._assertEqualObjects(expected, results[0])
-        # Verify we have 2 left in main
-        rows = self.conn.execute(qtl).fetchall()
-        self.assertEqual(len(rows), 2)
-        # Verify we have 4 in shadow
-        rows = self.conn.execute(qstl).fetchall()
-        self.assertEqual(len(rows), 4)
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 2 left in main
+            rows = conn.execute(qtl).fetchall()
+            self.assertEqual(len(rows), 2)
+            # Verify we have 4 in shadow
+            rows = conn.execute(qstl).fetchall()
+            self.assertEqual(len(rows), 4)
+
         # Archive the rest
         results = db.archive_deleted_rows(max_rows=100, task_log=True)
         expected = dict(task_log=2)
         self._assertEqualObjects(expected, results[0])
-        # Verify we have 0 left in main
-        rows = self.conn.execute(qtl).fetchall()
-        self.assertEqual(len(rows), 0)
-        # Verify we have 6 in shadow
-        rows = self.conn.execute(qstl).fetchall()
-        self.assertEqual(len(rows), 6)
+
+        with self.engine.connect() as conn, conn.begin():
+            # Verify we have 0 left in main
+            rows = conn.execute(qtl).fetchall()
+            self.assertEqual(len(rows), 0)
+            # Verify we have 6 in shadow
+            rows = conn.execute(qstl).fetchall()
+            self.assertEqual(len(rows), 6)
 
 
 class PciDeviceDBApiTestCase(test.TestCase, ModelsObjectComparatorMixin):
@@ -6567,7 +6483,8 @@ class RetryOnDeadlockTestCase(test.TestCase):
 
 
 class TestSqlalchemyTypesRepr(
-        test_fixtures.OpportunisticDBTestMixin, test.NoDBTestCase):
+    test_fixtures.OpportunisticDBTestMixin, test.NoDBTestCase,
+):
 
     def setUp(self):
         # NOTE(sdague): the oslo_db base test case completely
@@ -6578,15 +6495,15 @@ class TestSqlalchemyTypesRepr(
 
         super(TestSqlalchemyTypesRepr, self).setUp()
         self.engine = enginefacade.writer.get_engine()
-        meta = sa.MetaData(bind=self.engine)
+        meta = sa.MetaData()
         self.table = sa.Table(
             'cidr_tbl',
             meta,
             sa.Column('id', sa.Integer, primary_key=True),
             sa.Column('addr', col_types.CIDR())
         )
-        self.table.create()
-        self.addCleanup(meta.drop_all)
+        meta.create_all(self.engine)
+        self.addCleanup(meta.drop_all, self.engine)
 
     def test_cidr_repr(self):
         addrs = [('192.168.3.0/24', '192.168.3.0/24'),
@@ -6700,7 +6617,7 @@ class TestDBInstanceTags(test.TestCase):
         db.instance_tag_set(self.context, uuid, [tag1, tag2])
 
         # Check insert() was called to insert 'tag1' and 'tag2'
-        mock_insert.assert_called_once_with(None)
+        mock_insert.assert_called_once_with()
 
         mock_insert.reset_mock()
         db.instance_tag_set(self.context, uuid, [tag1])

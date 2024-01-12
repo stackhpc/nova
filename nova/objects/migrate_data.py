@@ -55,7 +55,7 @@ class VIFMigrateData(obj_base.NovaObject):
         # destination host is configured for all vif types. See the note in
         # the libvirt driver here: https://review.opendev.org/#/c/551370/
         # 29/nova/virt/libvirt/driver.py@7036
-        'source_vif': fields.Field(fields.NetworkVIFModel()),
+        'source_vif': fields.NetworkVIFModelField(),
     }
 
     @property
@@ -279,6 +279,9 @@ class LibvirtLiveMigrateData(LiveMigrateData):
         if (target_version < (1, 10) and
                 'src_supports_numa_live_migration' in primitive):
             del primitive['src_supports_numa_live_migration']
+        if (target_version < (1, 10) and
+                'dst_supports_numa_live_migration' in primitive):
+            del primitive['dst_supports_numa_live_migration']
         if target_version < (1, 10) and 'dst_numa_info' in primitive:
             del primitive['dst_numa_info']
         if target_version < (1, 9) and 'vifs' in primitive:
@@ -335,42 +338,6 @@ class HyperVLiveMigrateData(LiveMigrateData):
         if target_version < (1, 1):
             if 'is_shared_instance_path' in primitive:
                 del primitive['is_shared_instance_path']
-
-
-@obj_base.NovaObjectRegistry.register
-class PowerVMLiveMigrateData(LiveMigrateData):
-    # Version 1.0: Initial version
-    # Version 1.1: Added the Virtual Ethernet Adapter VLAN mappings.
-    # Version 1.2: Added old_vol_attachment_ids
-    # Version 1.3: Added wait_for_vif_plugged
-    # Version 1.4: Inherited vifs from LiveMigrateData
-    VERSION = '1.4'
-
-    fields = {
-        'host_mig_data': fields.DictOfNullableStringsField(),
-        'dest_ip': fields.StringField(),
-        'dest_user_id': fields.StringField(),
-        'dest_sys_name': fields.StringField(),
-        'public_key': fields.StringField(),
-        'dest_proc_compat': fields.StringField(),
-        'vol_data': fields.DictOfNullableStringsField(),
-        'vea_vlan_mappings': fields.DictOfNullableStringsField(),
-    }
-
-    def obj_make_compatible(self, primitive, target_version):
-        super(PowerVMLiveMigrateData, self).obj_make_compatible(
-            primitive, target_version)
-        target_version = versionutils.convert_version_to_tuple(target_version)
-        if target_version < (1, 4) and 'vifs' in primitive:
-            del primitive['vifs']
-        if target_version < (1, 3) and 'wait_for_vif_plugged' in primitive:
-            del primitive['wait_for_vif_plugged']
-        if target_version < (1, 2):
-            if 'old_vol_attachment_ids' in primitive:
-                del primitive['old_vol_attachment_ids']
-        if target_version < (1, 1):
-            if 'vea_vlan_mappings' in primitive:
-                del primitive['vea_vlan_mappings']
 
 
 @obj_base.NovaObjectRegistry.register

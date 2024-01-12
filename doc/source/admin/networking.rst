@@ -37,6 +37,42 @@ A full guide on configuring and using SR-IOV is provided in the
    Nova will ignore PCI devices reported by the hypervisor if the address is
    outside of these ranges.
 
+.. versionadded:: 25.0.0
+
+   For information on creating servers with remotely-managed SR-IOV network
+   interfaces of SmartNIC DPUs, refer to the relevant section in
+   :neutron-doc:`Networking Guide <admin/ovn/smartnic_dpu>`.
+
+   **Limitations**
+
+   * Only VFs are supported and they must be tagged in the Nova Compute
+     configuration in the :oslo.config:option:`pci.device_spec` option as
+     ``remote_managed: "true"``. There is no auto-discovery of this based
+     on vendor and product IDs;
+   * Either VF or its respective PF must expose a PCI VPD capability with a
+     unique card serial number according to the PCI/PCIe specifications
+     (see `the Libvirt docs <https://libvirt.org/drvnodedev.html#VPDCap>`_ to
+     get an example of how VPD data is represented and what to expect). If
+     this is not the case, those devices will not appear in allocation pools;
+   * Only the Libvirt driver is capable of supporting this feature at the
+     time of writing;
+   * The support for VPD capability handling in Libvirt was added in release
+     `7.9.0 <https://libvirt.org/news.html#v7-9-0-2021-11-01>`_ - older
+     versions are not supported by this feature;
+   * All compute nodes must be upgraded to the Yoga release in order for
+     scheduling of nodes with ``VNIC_TYPE_REMOTE_MANAGED`` ports to succeed;
+   * The same limitations apply to operations like live migration as with
+     `legacy SR-IOV ports <https://docs.openstack.org/neutron/latest/admin/config-sriov.html#known-limitations>`_;
+   * Clearing a VLAN by programming VLAN 0 must not result in errors in the
+     VF kernel driver at the compute host. Before v8.1.0 Libvirt clears
+     a VLAN by programming VLAN 0 before passing a VF through to the guest
+     which may result in an error depending on your driver and kernel version
+     (see, for example, `this bug <https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1957753>`_
+     which discusses a case relevant to one driver). As of Libvirt v8.1.0,
+     EPERM errors encountered while programming VLAN 0 are ignored if
+     VLAN clearing is not explicitly requested in the device XML (i.e.
+     VLAN 0 is not specified explicitly).
+
 NUMA Affinity
 -------------
 
@@ -199,3 +235,93 @@ As with the L2-type networks, this configuration will ensure instances using
 one or more L3-type networks must be scheduled on host cores from NUMA node 0.
 It is also possible to define more than one NUMA node, in which case the
 instance must be split across these nodes.
+
+
+virtio-net Multiqueue
+---------------------
+
+.. versionadded:: 12.0.0 (Liberty)
+
+.. versionchanged:: 25.0.0 (Yoga)
+
+   Support for configuring multiqueue via the ``hw:vif_multiqueue_enabled``
+   flavor extra spec was introduced in the Yoga (25.0.0) release.
+
+.. important::
+
+   The functionality described below is currently only supported by the
+   libvirt/KVM driver.
+
+Virtual NICs using the virtio-net driver support the multiqueue feature. By
+default, these vNICs will only use a single virtio-net TX/RX queue pair,
+meaning guests will not transmit or receive packets in parallel. As a result,
+the scale of the protocol stack in a guest may be restricted as the network
+performance will not scale as the number of vCPUs increases and per-queue data
+processing limits in the underlying vSwitch are encountered. The solution to
+this issue is to enable virtio-net multiqueue, which can allow the guest
+instances to increase the total network throughput by scaling the number of
+receive and transmit queue pairs with CPU count.
+
+Multiqueue virtio-net isn't always necessary, but it can provide a significant
+performance benefit when:
+
+- Traffic packets are relatively large.
+- The guest is active on many connections at the same time, with traffic
+  running between guests, guest to host, or guest to an external system.
+- The number of queues is equal to the number of vCPUs. This is because
+  multi-queue support optimizes RX interrupt affinity and TX queue selection in
+  order to make a specific queue private to a specific vCPU.
+
+However, while the virtio-net multiqueue feature will often provide a welcome
+performance benefit, it has some limitations and therefore should not be
+unconditionally enabled:
+
+- Enabling virtio-net multiqueue increases the total network throughput, but in
+  parallel it also increases the CPU consumption.
+- Enabling virtio-net multiqueue in the host QEMU config does not enable the
+  functionality in the guest OS. The guest OS administrator needs to manually
+  turn it on for each guest NIC that requires this feature, using
+  :command:`ethtool`.
+- In case the number of vNICs in a guest instance is proportional to the number
+  of vCPUs, enabling the multiqueue feature is less important.
+
+Having considered these points, multiqueue can be enabled or explicitly
+disabled using either the :nova:extra-spec:`hw:vif_multiqueue_enabled` flavor
+extra spec or equivalent ``hw_vif_multiqueue_enabled`` image metadata property.
+For example, to enable virtio-net multiqueue for a chosen flavor:
+
+.. code-block:: bash
+
+    $ openstack flavor set --property hw:vif_multiqueue_enabled=true $FLAVOR
+
+Alternatively, to explicitly disable multiqueue for a chosen image:
+
+.. code-block:: bash
+
+    $ openstack image set --property hw_vif_multiqueue_enabled=false $IMAGE
+
+.. note::
+
+    If both the flavor extra spec and image metadata property are provided,
+    their values must match or an error will be raised.
+
+Once the guest has started, you must enable multiqueue using
+:command:`ethtool`. For example:
+
+.. code-block:: bash
+
+    $ ethtool -L $devname combined $N
+
+where ``$devname`` is the name of the network device, and ``$N`` is the number
+of TX/RX queue pairs to configure corresponding to the number of instance
+vCPUs. Alternatively, you can configure this persistently using udev. For
+example, to configure four TX/RX queue pairs for network device ``eth0``:
+
+.. code-block:: bash
+
+    # cat /etc/udev/rules.d/50-ethtool.rules
+    ACTION=="add", SUBSYSTEM=="net", NAME=="eth0", RUN+="/sbin/ethtool -L eth0 combined 4"
+
+For more information on this feature, refer to the `original spec`__.
+
+.. __: https://specs.openstack.org/openstack/nova-specs/specs/liberty/implemented/libvirt-virtiomq.html

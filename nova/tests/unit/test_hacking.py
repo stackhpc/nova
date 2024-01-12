@@ -13,8 +13,8 @@
 #    under the License.
 
 import textwrap
+from unittest import mock
 
-import mock
 import pycodestyle
 
 from nova.hacking import checks
@@ -51,6 +51,7 @@ class HackingTestCase(test.NoDBTestCase):
     just assertTrue if the check is expected to fail and assertFalse if it
     should pass.
     """
+
     def test_virt_driver_imports(self):
 
         expect = (0, "N311: importing code from other virt drivers forbidden")
@@ -999,3 +1000,67 @@ class HackingTestCase(test.NoDBTestCase):
         self._assert_has_no_errors(
             code, checks.do_not_use_mock_class_as_new_mock_value,
             filename="nova/tests/unit/test_context.py")
+
+    def test_check_lockutils_rwlocks(self):
+        code = """
+                    lockutils.ReaderWriterLock()
+                    lockutils.ReaderWriterLock(condition_cls=MyClass)
+                    oslo_concurrency.lockutils.ReaderWriterLock()
+                    fasteners.ReaderWriterLock()
+                    fasteners.ReaderWriterLock(condition_cls=MyClass)
+               """
+        errors = [(x + 1, 0, 'N369') for x in range(5)]
+        self._assert_has_errors(
+            code, checks.check_lockutils_rwlocks, expected_errors=errors)
+
+        code = """
+                    nova.utils.ReaderWriterLock()
+                    utils.ReaderWriterLock()
+                    utils.ReaderWriterLock(condition_cls=MyClass)
+                    nova_utils.ReaderWriterLock()
+               """
+        self._assert_has_no_errors(code, checks.check_lockutils_rwlocks)
+
+    def test_check_six(self):
+        code = """
+            import six
+            from six import moves
+            from six.moves import range
+            import six.moves.urllib.parse as urlparse
+        """
+        errors = [(x + 1, 0, 'N370') for x in range(4)]
+        self._assert_has_errors(code, checks.check_six, expected_errors=errors)
+
+    def test_import_stock_mock(self):
+        self._assert_has_errors(
+            "import mock",
+            checks.import_stock_mock, expected_errors=[(1, 0, 'N371')])
+        self._assert_has_errors(
+            "from mock import patch",
+            checks.import_stock_mock, expected_errors=[(1, 0, 'N371')])
+        code = """
+                    from unittest import mock
+                    import unittest.mock
+               """
+        self._assert_has_no_errors(code, checks.import_stock_mock)
+
+    def test_check_set_daemon(self):
+        code = """
+                   self.setDaemon(True)
+                   worker.setDaemon(True)
+                   self._event_thread.setDaemon(True)
+                   mythread.setDaemon(False)
+                   self.thread.setDaemon(1)
+               """
+        errors = [(x + 1, 0, 'N372') for x in range(5)]
+        self._assert_has_errors(
+            code, checks.check_set_daemon, expected_errors=errors)
+
+        code = """
+                   self.setDaemon = True
+                   worker.setDaemonFlag(True)
+                   self._event_thread.resetDaemon(True)
+                   self.set.Daemon(True)
+                   self.thread.setdaemon(True)
+               """
+        self._assert_has_no_errors(code, checks.check_set_daemon)

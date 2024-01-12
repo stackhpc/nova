@@ -76,6 +76,11 @@ def get_cpu_dedicated_set():
     return cpu_ids
 
 
+def get_cpu_dedicated_set_nozero():
+    """Return cpu_dedicated_set without CPU0, if present"""
+    return (get_cpu_dedicated_set() or set()) - {0}
+
+
 def get_cpu_shared_set():
     """Parse ``[compute] cpu_shared_set`` config.
 
@@ -869,7 +874,7 @@ def _pack_instance_onto_cores(host_cell, instance_cell,
                 instance_cell.pcpuset)
             cpuset_reserved = _get_reserved(
                 sibling_sets[1], pinning, num_cpu_reserved=num_cpu_reserved)
-            if not pinning or (num_cpu_reserved and not cpuset_reserved):
+            if pinning is None or (num_cpu_reserved and not cpuset_reserved):
                 continue
             break
 
@@ -895,7 +900,7 @@ def _pack_instance_onto_cores(host_cell, instance_cell,
             cpuset_reserved = _get_reserved(
                 sibling_set, pinning, num_cpu_reserved=num_cpu_reserved)
 
-    if not pinning or (num_cpu_reserved and not cpuset_reserved):
+    if pinning is None or (num_cpu_reserved and not cpuset_reserved):
         return
     LOG.debug('Selected cores for pinning: %s, in cell %s', pinning,
                                                             host_cell.id)
@@ -1213,10 +1218,13 @@ def _check_for_mem_encryption_requirement_conflicts(
             "image %(image_name)s which has hw_mem_encryption property "
             "explicitly set to %(image_val)s"
         )
+        # image_meta.name is not set if image object represents root
+        # Cinder volume.
+        image_name = (image_meta.name if 'name' in image_meta else None)
         data = {
             'flavor_name': flavor.name,
             'flavor_val': flavor_mem_enc_str,
-            'image_name': image_meta.name,
+            'image_name': image_name,
             'image_val': image_mem_enc,
         }
         raise exception.FlavorImageConflict(emsg % data)
@@ -1228,10 +1236,15 @@ def _check_mem_encryption_uses_uefi_image(requesters, image_meta):
 
     emsg = _(
         "Memory encryption requested by %(requesters)s but image "
-        "%(image_name)s doesn't have 'hw_firmware_type' property set to 'uefi'"
+        "%(image_name)s doesn't have 'hw_firmware_type' property set to "
+        "'uefi' or volume-backed instance was requested"
     )
+    # image_meta.name is not set if image object represents root Cinder
+    # volume, for this case FlavorImageConflict should be raised, but
+    # image_meta.name can't be extracted.
+    image_name = (image_meta.name if 'name' in image_meta else None)
     data = {'requesters': " and ".join(requesters),
-            'image_name': image_meta.name}
+            'image_name': image_name}
     raise exception.FlavorImageConflict(emsg % data)
 
 
@@ -1260,12 +1273,14 @@ def _check_mem_encryption_machine_type(image_meta, machine_type=None):
     if mach_type is None:
         return
 
+    # image_meta.name is not set if image object represents root Cinder volume.
+    image_name = (image_meta.name if 'name' in image_meta else None)
     # Could be something like pc-q35-2.11 if a specific version of the
     # machine type is required, so do substring matching.
     if 'q35' not in mach_type:
         raise exception.InvalidMachineType(
             mtype=mach_type,
-            image_id=image_meta.id, image_name=image_meta.name,
+            image_id=image_meta.id, image_name=image_name,
             reason=_("q35 type is required for SEV to work"))
 
 
@@ -1335,6 +1350,48 @@ def _get_constraint_mappings_from_flavor(flavor, key, func):
         hw_numa_map.append(func(extra_specs[prop]))
 
     return hw_numa_map or None
+
+
+def get_locked_memory_constraint(
+    flavor: 'objects.Flavor',
+    image_meta: 'objects.ImageMeta',
+) -> ty.Optional[bool]:
+    """Validate and return the requested locked memory.
+
+    :param flavor: ``nova.objects.Flavor`` instance
+    :param image_meta: ``nova.objects.ImageMeta`` instance
+    :raises: exception.LockMemoryForbidden if mem_page_size is not set
+        while provide locked_memory value in image or flavor.
+    :returns: The locked memory flag requested.
+    """
+    mem_page_size_flavor, mem_page_size_image = _get_flavor_image_meta(
+        'mem_page_size', flavor, image_meta)
+
+    locked_memory_flavor, locked_memory_image = _get_flavor_image_meta(
+        'locked_memory', flavor, image_meta)
+
+    if locked_memory_flavor is not None:
+        # locked_memory_image is boolean type already
+        locked_memory_flavor = strutils.bool_from_string(locked_memory_flavor)
+
+        if locked_memory_image is not None and (
+                locked_memory_flavor != locked_memory_image
+        ):
+            # We don't allow provide different value to flavor and image
+            raise exception.FlavorImageLockedMemoryConflict(
+                image=locked_memory_image, flavor=locked_memory_flavor)
+
+        locked_memory = locked_memory_flavor
+
+    else:
+        locked_memory = locked_memory_image
+
+    if locked_memory and not (
+            mem_page_size_flavor or mem_page_size_image
+    ):
+        raise exception.LockMemoryForbidden()
+
+    return locked_memory
 
 
 def _get_numa_cpu_constraint(
@@ -1784,6 +1841,156 @@ def get_pci_numa_policy_constraint(
     return policy
 
 
+def get_pmu_constraint(
+    flavor: 'objects.Flavor',
+    image_meta: 'objects.ImageMeta',
+) -> ty.Optional[bool]:
+    """Validate and return the requested vPMU configuration.
+
+    This one's a little different since we don't return False in the default
+    case: the PMU should only be configured if explicit configuration is
+    provided, otherwise we leave it to the hypervisor.
+
+    :param flavor: ``nova.objects.Flavor`` instance
+    :param image_meta: ``nova.objects.ImageMeta`` instance
+    :raises: nova.exception.FlavorImageConflict if a value is specified in both
+        the flavor and the image, but the values do not match
+    :raises: nova.exception.Invalid if a value or combination of values is
+        invalid
+    :returns: True if the virtual Performance Monitoring Unit must be enabled,
+        False if it should be disabled, or None if unconfigured.
+    """
+    flavor_value_str, image_value = _get_flavor_image_meta(
+        'pmu', flavor, image_meta)
+
+    flavor_value = None
+    if flavor_value_str is not None:
+        flavor_value = strutils.bool_from_string(flavor_value_str)
+
+    if (
+        image_value is not None and
+        flavor_value is not None and
+        image_value != flavor_value
+    ):
+        msg = _(
+            "Flavor %(flavor_name)s has %(prefix)s:%(key)s extra spec "
+            "explicitly set to %(flavor_val)s, conflicting with image "
+            "%(image_name)s which has %(prefix)s_%(key)s explicitly set to "
+            "%(image_val)s."
+        )
+        raise exception.FlavorImageConflict(
+            msg % {
+                'prefix': 'hw',
+                'key': 'pmu',
+                'flavor_name': flavor.name,
+                'flavor_val': flavor_value,
+                'image_name': image_meta.name,
+                'image_val': image_value,
+            },
+        )
+
+    return flavor_value if flavor_value is not None else image_value
+
+
+def get_vif_multiqueue_constraint(
+    flavor: 'objects.Flavor',
+    image_meta: 'objects.ImageMeta',
+) -> bool:
+    """Validate and return the requested VIF multiqueue configuration.
+
+    :param flavor: ``nova.objects.Flavor`` instance
+    :param image_meta: ``nova.objects.ImageMeta`` instance
+    :raises: nova.exception.FlavorImageConflict if a value is specified in both
+        the flavor and the image, but the values do not match
+    :raises: nova.exception.Invalid if a value or combination of values is
+        invalid
+    :returns: True if the multiqueue must be enabled, else False.
+    """
+    if flavor.vcpus < 2:
+        return False
+
+    flavor_value_str, image_value = _get_flavor_image_meta(
+        'vif_multiqueue_enabled', flavor, image_meta)
+
+    flavor_value = None
+    if flavor_value_str is not None:
+        flavor_value = strutils.bool_from_string(flavor_value_str)
+
+    if (
+        image_value is not None and
+        flavor_value is not None and
+        image_value != flavor_value
+    ):
+        msg = _(
+            "Flavor %(flavor_name)s has %(prefix)s:%(key)s extra spec "
+            "explicitly set to %(flavor_val)s, conflicting with image "
+            "%(image_name)s which has %(prefix)s_%(key)s explicitly set to "
+            "%(image_val)s."
+        )
+        raise exception.FlavorImageConflict(
+            msg % {
+                'prefix': 'hw',
+                'key': 'vif_multiqueue_enabled',
+                'flavor_name': flavor.name,
+                'flavor_val': flavor_value,
+                'image_name': image_meta.name,
+                'image_val': image_value,
+            }
+        )
+
+    return flavor_value or image_value or False
+
+
+def get_packed_virtqueue_constraint(
+    flavor,
+    image_meta,
+) -> bool:
+    """Validate and return the requested Packed virtqueue configuration.
+
+    :param flavor: ``nova.objects.Flavor`` or dict instance
+    :param image_meta: ``nova.objects.ImageMeta`` or dict instance
+    :raises: nova.exception.FlavorImageConflict if a value is specified in both
+        the flavor and the image, but the values do not match
+    :returns: True if the Packed virtqueue must be enabled, else False.
+    """
+    key_value = 'virtio_packed_ring'
+
+    if type(image_meta) is dict:
+        flavor_key = ':'.join(['hw', key_value])
+        image_key = '_'.join(['hw', key_value])
+        flavor_value_str = flavor.get('extra_specs', {}).get(flavor_key, None)
+        image_value = image_meta.get('properties', {}).get(image_key, None)
+    else:
+        flavor_value_str, image_value = _get_flavor_image_meta(
+            key_value, flavor, image_meta)
+
+    flavor_value = None
+    if flavor_value_str is not None:
+        flavor_value = strutils.bool_from_string(flavor_value_str)
+
+    if (
+        image_value is not None and
+        flavor_value is not None and
+        image_value != flavor_value
+    ):
+        msg = _(
+            "Flavor has %(prefix)s:%(key)s extra spec "
+            "explicitly set to %(flavor_val)s, conflicting with image "
+            "which has %(prefix)s_%(key)s explicitly set to "
+            "%(image_val)s."
+        )
+        raise exception.FlavorImageConflict(
+            msg % {
+                'prefix': 'hw',
+                'key': key_value,
+                'flavor_val': flavor_value,
+                'image_val': image_value,
+            }
+        )
+
+    return flavor_value or image_value or False
+
+
 def get_vtpm_constraint(
     flavor: 'objects.Flavor',
     image_meta: 'objects.ImageMeta',
@@ -2007,6 +2214,8 @@ def numa_get_constraints(flavor, image_meta):
     pagesize = _get_numa_pagesize_constraint(flavor, image_meta)
     vpmems = get_vpmems(flavor)
 
+    get_locked_memory_constraint(flavor, image_meta)
+
     # If 'hw:cpu_dedicated_mask' is not found in flavor extra specs, the
     # 'dedicated_cpus' variable is None, while we hope it being an empty set.
     dedicated_cpus = dedicated_cpus or set()
@@ -2099,6 +2308,7 @@ def _numa_cells_support_network_metadata(
         required_tunnel = network_metadata.tunneled
 
     if required_physnets:
+        removed_physnets = False
         # identify requested physnets that have an affinity to any of our
         # chosen host NUMA cells
         for host_cell in chosen_host_cells:
@@ -2109,6 +2319,12 @@ def _numa_cells_support_network_metadata(
             # drop said physnet(s) from the list we're searching for
             required_physnets -= required_physnets.intersection(
                 host_cell.network_metadata.physnets)
+            removed_physnets = True
+
+        if required_physnets and removed_physnets:
+            LOG.debug('Not all requested physnets have affinity to one '
+                      'of the chosen host NUMA cells. Remaining physnets '
+                      'are: %(physnets)s.', {'physnets': required_physnets})
 
         # however, if we still require some level of NUMA affinity, we need
         # to make sure one of the other NUMA cells isn't providing that; note
@@ -2120,8 +2336,15 @@ def _numa_cells_support_network_metadata(
 
             # if one of these cells provides affinity for one or more physnets,
             # we need to fail because we should be using that node and are not
-            if required_physnets.intersection(
-                    host_cell.network_metadata.physnets):
+            required_physnets_outside = required_physnets.intersection(
+                host_cell.network_metadata.physnets)
+
+            if required_physnets_outside:
+                LOG.debug('One or more requested physnets require affinity to '
+                          'a NUMA cell outside of the chosen host cells. This '
+                          'host cell cannot satisfy network requests for '
+                          'these physnets: %(physnets)s',
+                          {'physnets': required_physnets_outside})
                 return False
 
     if required_tunnel:
@@ -2134,6 +2357,9 @@ def _numa_cells_support_network_metadata(
             if host_cell.network_metadata.tunneled:
                 return True
 
+        LOG.debug('Tunneled networks have no affinity to any of the chosen '
+                  'host NUMA cells.')
+
         # however, if we still require some level of NUMA affinity, we need to
         # make sure one of the other NUMA cells isn't providing that; note
         # that, as with physnets, NUMA affinity might not be defined for
@@ -2143,6 +2369,12 @@ def _numa_cells_support_network_metadata(
                 continue
 
             if host_cell.network_metadata.tunneled:
+                LOG.debug('The host declares NUMA affinity for tunneled '
+                          'networks. The current instance requests a '
+                          'tunneled network but this host cell is out of '
+                          'the set declared to be local to the tunnel '
+                          'network endpoint. As such, this host cell cannot '
+                          'support the requested tunneled network.')
                 return False
 
     return True
@@ -2151,6 +2383,7 @@ def _numa_cells_support_network_metadata(
 def numa_fit_instance_to_host(
     host_topology: 'objects.NUMATopology',
     instance_topology: 'objects.InstanceNUMATopology',
+    provider_mapping: ty.Optional[ty.Dict[str, ty.List[str]]],
     limits: ty.Optional['objects.NUMATopologyLimit'] = None,
     pci_requests: ty.Optional['objects.InstancePCIRequests'] = None,
     pci_stats: ty.Optional[stats.PciDeviceStats] = None,
@@ -2166,6 +2399,12 @@ def numa_fit_instance_to_host(
     :param host_topology: objects.NUMATopology object to fit an
                           instance on
     :param instance_topology: objects.InstanceNUMATopology to be fitted
+    :param provider_mapping: A dict keyed by RequestGroup requester_id,
+        to a list of resource provider UUIDs which provide resource
+        for that RequestGroup. If it is None then it signals that the
+        InstancePCIRequest objects already stores a mapping per request.
+        I.e.: we are called _after_ the scheduler made allocations for this
+        request in placement.
     :param limits: objects.NUMATopologyLimits that defines limits
     :param pci_requests: instance pci_requests
     :param pci_stats: pci_stats for the host
@@ -2195,21 +2434,99 @@ def numa_fit_instance_to_host(
 
     host_cells = host_topology.cells
 
-    # If PCI device(s) are not required, prefer host cells that don't have
-    # devices attached. Presence of a given numa_node in a PCI pool is
-    # indicative of a PCI device being associated with that node
-    if not pci_requests and pci_stats:
-        # TODO(stephenfin): pci_stats can't be None here but mypy can't figure
-        # that out for some reason
-        host_cells = sorted(host_cells, key=lambda cell: cell.id in [
-            pool['numa_node'] for pool in pci_stats.pools])  # type: ignore
+    # We need to perform all optimizations only if number of instance's
+    # cells less than host's cells number. If it's equal, we'll use
+    # all cells and no sorting of the cells list is needed.
+    if len(host_topology) > len(instance_topology):
+        pack = CONF.compute.packing_host_numa_cells_allocation_strategy
+        # To balance NUMA cells usage based on several parameters
+        # some sorts performed on host_cells list to move less used cells
+        # to the beginning of the host_cells list (when pack variable is set to
+        # 'False'). When pack is set to 'True', most used cells will be put at
+        # the beginning of the host_cells list.
 
+        # Fist sort is based on memory usage. cell.avail_memory returns free
+        # memory for cell. Revert sorting to get cells with more free memory
+        # first when pack is 'False'
+        host_cells = sorted(
+            host_cells,
+            reverse=not pack,
+            key=lambda cell: cell.avail_memory)
+
+        # Next sort based on available dedicated or shared CPUs.
+        # cpu_policy is set to the same value in all cells so we use
+        # first cell in list (it exists if instance_topology defined)
+        # to get cpu_policy
+        if instance_topology.cells[0].cpu_policy in (
+                None, fields.CPUAllocationPolicy.SHARED):
+            # sort based on used CPUs
+            host_cells = sorted(
+                host_cells,
+                reverse=pack,
+                key=lambda cell: cell.cpu_usage)
+
+        else:
+            # sort based on presence of pinned CPUs
+            host_cells = sorted(
+                host_cells,
+                reverse=not pack,
+                key=lambda cell: len(cell.free_pcpus))
+
+        # Perform sort only if pci_stats exists
+        if pci_stats:
+            # Create dict with numa cell id as key
+            # and total number of free pci devices as value.
+            total_pci_in_cell: ty.Dict[int, int] = {}
+            for pool in pci_stats.pools:
+                if pool['numa_node'] in list(total_pci_in_cell):
+                    total_pci_in_cell[pool['numa_node']] += pool['count']
+                else:
+                    total_pci_in_cell[pool['numa_node']] = pool['count']
+            # For backward compatibility we will always 'spread':
+            # we always move host cells with PCI at the beginning if PCI
+            # requested by VM and move host cells with PCI at the end of the
+            # list if PCI isn't requested by VM
+            if pci_requests:
+                host_cells = sorted(
+                    host_cells,
+                    reverse=True,
+                    key=lambda cell: total_pci_in_cell.get(cell.id, 0))
+            else:
+                host_cells = sorted(
+                    host_cells,
+                    key=lambda cell: total_pci_in_cell.get(cell.id, 0))
+
+    # a set of host_cell.id, instance_cell.id pairs where we already checked
+    # that the instance cell does not fit
+    not_fit_cache = set()
+    # a set of host_cell.id, instance_cell.id pairs where we already checked
+    # that the instance cell does fit
+    fit_cache = set()
     for host_cell_perm in itertools.permutations(
             host_cells, len(instance_topology)):
         chosen_instance_cells: ty.List['objects.InstanceNUMACell'] = []
         chosen_host_cells: ty.List['objects.NUMACell'] = []
         for host_cell, instance_cell in zip(
                 host_cell_perm, instance_topology.cells):
+
+            cell_pair = (host_cell.id, instance_cell.id)
+
+            # if we already checked this pair, and they did not fit then no
+            # need to check again just move to the next permutation
+            if cell_pair in not_fit_cache:
+                break
+
+            # if we already checked this pair, and they fit before that they
+            # will fit now too. So no need to check again. Just continue with
+            # the next cell pair in the permutation
+            if cell_pair in fit_cache:
+                chosen_host_cells.append(host_cell)
+                # Normally this would have done by _numa_fit_instance_cell
+                # but we optimized that out here based on the cache
+                instance_cell.id = host_cell.id
+                chosen_instance_cells.append(instance_cell)
+                continue
+
             try:
                 cpuset_reserved = 0
                 if (instance_topology.emulator_threads_isolated and
@@ -2226,17 +2543,24 @@ def numa_fit_instance_to_host(
                 # This exception will been raised if instance cell's
                 # custom pagesize is not supported with host cell in
                 # _numa_cell_supports_pagesize_request function.
+
+                # cache the result
+                not_fit_cache.add(cell_pair)
                 break
             if got_cell is None:
+                # cache the result
+                not_fit_cache.add(cell_pair)
                 break
             chosen_host_cells.append(host_cell)
             chosen_instance_cells.append(got_cell)
+            # cache the result
+            fit_cache.add(cell_pair)
 
         if len(chosen_instance_cells) != len(host_cell_perm):
             continue
 
         if pci_requests and pci_stats and not pci_stats.support_requests(
-                pci_requests, chosen_instance_cells):
+                pci_requests, provider_mapping, chosen_instance_cells):
             continue
 
         if network_metadata and not _numa_cells_support_network_metadata(
@@ -2337,6 +2661,7 @@ def numa_usage_from_instance_numa(host_topology, instance_topology,
             cpuset=host_cell.cpuset,
             pcpuset=host_cell.pcpuset,
             memory=host_cell.memory,
+            socket=host_cell.socket,
             cpu_usage=0,
             memory_usage=0,
             mempages=host_cell.mempages,
@@ -2361,8 +2686,10 @@ def numa_usage_from_instance_numa(host_topology, instance_topology,
                 None, fields.CPUAllocationPolicy.SHARED,
             ):
                 continue
-
-            pinned_cpus = set(instance_cell.cpu_pinning.values())
+            if instance_cell.cpu_pinning:
+                pinned_cpus = set(instance_cell.cpu_pinning.values())
+            else:
+                pinned_cpus = set()
             if instance_cell.cpuset_reserved:
                 pinned_cpus |= instance_cell.cpuset_reserved
 
@@ -2413,3 +2740,73 @@ def check_hw_rescue_props(image_meta):
     """
     hw_rescue_props = ['hw_rescue_device', 'hw_rescue_bus']
     return any(key in image_meta.properties for key in hw_rescue_props)
+
+
+def get_ephemeral_encryption_constraint(
+    flavor: 'objects.Flavor',
+    image_meta: 'objects.ImageMeta',
+) -> bool:
+    """Get the ephemeral encryption constraints based on the flavor and image.
+
+    :param flavor: an objects.Flavor object
+    :param image_meta: an objects.ImageMeta object
+    :raises: nova.exception.FlavorImageConflict
+    :returns: boolean indicating whether encryption of guest ephemeral storage
+              was requested
+    """
+    flavor_eph_encryption_str, image_eph_encryption = _get_flavor_image_meta(
+        'ephemeral_encryption', flavor, image_meta)
+
+    flavor_eph_encryption = None
+    if flavor_eph_encryption_str is not None:
+        flavor_eph_encryption = strutils.bool_from_string(
+            flavor_eph_encryption_str)
+
+    # Check for conflicts between explicit requirements regarding
+    # ephemeral encryption.
+    # TODO(layrwood): make _check_for_mem_encryption_requirement_conflicts
+    # generic and reuse here
+    if (
+        flavor_eph_encryption is not None and
+        image_eph_encryption is not None and
+        flavor_eph_encryption != image_eph_encryption
+    ):
+        emsg = _(
+            "Flavor %(flavor_name)s has hw:ephemeral_encryption extra spec "
+            "explicitly set to %(flavor_val)s, conflicting with "
+            "image %(image_name)s which has hw_eph_encryption property "
+            "explicitly set to %(image_val)s"
+        )
+        data = {
+            'flavor_name': flavor.name,
+            'flavor_val': flavor_eph_encryption_str,
+            'image_name': image_meta.name,
+            'image_val': image_eph_encryption,
+        }
+        raise exception.FlavorImageConflict(emsg % data)
+
+    return flavor_eph_encryption or image_eph_encryption
+
+
+def get_ephemeral_encryption_format(
+    flavor: 'objects.Flavor',
+    image_meta: 'objects.ImageMeta',
+) -> ty.Optional[str]:
+    """Get the ephemeral encryption format.
+
+    :param flavor: an objects.Flavor object
+    :param image_meta: an objects.ImageMeta object
+    :raises: nova.exception.FlavorImageConflict or nova.exception.Invalid
+    :returns: BlockDeviceEncryptionFormatType or None
+    """
+    eph_format = _get_unique_flavor_image_meta(
+        'ephemeral_encryption_format', flavor, image_meta)
+    if eph_format:
+        if eph_format not in fields.BlockDeviceEncryptionFormatType.ALL:
+            allowed = fields.BlockDeviceEncryptionFormatType.ALL
+            raise exception.Invalid(
+                f"Invalid ephemeral encryption format {eph_format}. "
+                f"Allowed values: {', '.join(allowed)}"
+            )
+        return eph_format
+    return None

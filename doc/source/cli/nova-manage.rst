@@ -258,17 +258,17 @@ stopping at 0, or use the :option:`--until-complete` option.
     ``YYYY-MM-DD[HH:mm:ss]``. For example::
 
         # Purge shadow table rows older than a specific date
-        nova-manage db archive --before 2015-10-21
+        nova-manage db archive_deleted_rows --before 2015-10-21
         # or
-        nova-manage db archive --before "Oct 21 2015"
+        nova-manage db archive_deleted_rows --before "Oct 21 2015"
         # Times are also accepted
-        nova-manage db archive --before "2015-10-21 12:00"
+        nova-manage db archive_deleted_rows --before "2015-10-21 12:00"
 
     Note that relative dates (such as ``yesterday``) are not supported
     natively. The ``date`` command can be helpful here::
 
         # Archive deleted rows more than one month old
-        nova-manage db archive --before "$(date -d 'now - 1 month')"
+        nova-manage db archive_deleted_rows --before "$(date -d 'now - 1 month')"
 
 .. option:: --verbose
 
@@ -520,6 +520,7 @@ This command should be run before ``nova-manage db sync``.
     versions will be rejected.
 
 .. _man-page-cells-v2:
+
 
 Cells v2 Commands
 =================
@@ -1144,6 +1145,7 @@ Delete a host by the given host name and the given cell UUID.
    * - 4
      - The host with the specified name has instances (host not empty).
 
+
 Placement Commands
 ==================
 
@@ -1223,6 +1225,13 @@ This command requires that the
 .. versionchanged:: 22.0.0 (Victoria)
 
     Added :option:`--force` option.
+
+.. versionchanged:: 25.0.0 (Yoga)
+
+    Added support for healing port allocations if port-resource-request-groups
+    neutron API extension is enabled and therefore ports can request multiple
+    group of resources e.g. by using both guaranteed minimum bandwidth and
+    guaranteed minimum packet rate QoS policy rules.
 
 .. rubric:: Options
 
@@ -1524,6 +1533,7 @@ command.
    * - 6
      - Instance is not attached to volume
 
+
 Libvirt Commands
 ================
 
@@ -1597,7 +1607,7 @@ instance changing when moving between machine types.
 
 .. option:: --force
 
-    Skip machine type compatability checks and force machine type update.
+    Skip machine type compatibility checks and force machine type update.
 
 .. rubric:: Return codes
 
@@ -1662,11 +1672,194 @@ within an environment.
      - Instances found without ``hw_machine_type`` set
 
 
+Image Property Commands
+=======================
+
+image_property show
+-------------------
+
+.. program:: nova-manage image_property show
+
+.. code-block:: shell
+
+    nova-manage image_property show [INSTANCE_UUID] [IMAGE_PROPERTY]
+
+Fetch and display the recorded image property ``IMAGE_PROPERTY`` of an
+instance identified by ``INSTANCE_UUID``.
+
+.. versionadded:: 25.0.0 (Yoga)
+
+.. rubric:: Return codes
+
+.. list-table::
+   :widths: 20 80
+   :header-rows: 1
+
+   * - Return code
+     - Description
+   * - 0
+     - Successfully completed
+   * - 1
+     - An unexpected error occurred
+   * - 2
+     - Unable to find instance or instance mapping
+   * - 3
+     - No image property found for instance
+
+image_property set
+------------------
+
+.. program:: nova-manage image_property set
+
+.. code-block:: shell
+
+    nova-manage image_property set \
+        [INSTANCE_UUID] [--property] [IMAGE_PROPERTY]=[VALUE]
+
+Set or update the recorded image property ``IMAGE_PROPERTY`` of instance
+``INSTANCE_UUID`` to value ``VALUE``.
+
+The following criteria must be met when using this command:
+
+* The instance must have a ``vm_state`` of ``STOPPED``, ``SHELVED`` or
+  ``SHELVED_OFFLOADED``.
+
+This command is useful for operators who need to update stored instance image
+properties that have become invalidated by a change of instance machine type,
+for example.
+
+.. versionadded:: 25.0.0 (Yoga)
+
+.. rubric:: Options
+
+.. option:: --property
+
+    Image property to set using the format name=value. For example:
+    ``--property hw_disk_bus=virtio --property hw_cdrom_bus=sata``.
+
+.. rubric:: Return codes
+
+.. list-table::
+   :widths: 20 80
+   :header-rows: 1
+
+   * - Return code
+     - Description
+   * - 0
+     - Update completed successfully
+   * - 1
+     - An unexpected error occurred
+   * - 2
+     - Unable to find instance or instance mapping
+   * - 3
+     - The instance has an invalid ``vm_state``
+   * - 4
+     - The provided image property name is invalid
+   * - 5
+     - The provided image property value is invalid
+
+
+Limits Commands
+===============
+
+limits migrate_to_unified_limits
+--------------------------------
+
+.. program:: nova-manage limits migrate_to_unified_limits
+
+.. code-block:: shell
+
+   nova-manage limits migrate_to_unified_limits [--project-id <project-id>]
+   [--region-id <region-id>] [--verbose] [--dry-run]
+
+Migrate quota limits from the Nova database to unified limits in Keystone.
+
+This command is useful for operators to migrate from legacy quotas to unified
+limits. Limits are migrated by copying them from the Nova database to Keystone
+by creating them using the Keystone API.
+
+The Nova configuration file used by ``nova-manage`` must have a ``[keystone]``
+section that contains authentication settings in order for the Keystone API
+calls to succeed. As an example:
+
+.. code-block:: ini
+
+   [keystone]
+   region_name = RegionOne
+   user_domain_name = Default
+   auth_url = http://127.0.0.1/identity
+   auth_type = password
+   username = admin
+   password = <password>
+   system_scope = all
+
+By default `Keystone policy configuration`_, access to create, update, and
+delete in the `unified limits API`_ is restricted to callers with
+`system-scoped authorization tokens`_. The ``system_scope = all`` setting
+indicates the scope for system operations. You will need to ensure that the
+user configured under ``[keystone]`` has the necessary role and scope.
+
+.. warning::
+
+   The ``limits migrate_to_unified_limits`` command will create limits only
+   for resources that exist in the legacy quota system and any resource that
+   does not have a unified limit in Keystone will use a quota limit of **0**.
+
+   For resource classes that are allocated by the placement service and have no
+   default limit set, you will need to create default limits manually. The most
+   common example is class:DISK_GB. All Nova API requests that need to allocate
+   DISK_GB will fail quota enforcement until a default limit for it is set in
+   Keystone.
+
+   See the :doc:`unified limits documentation
+   </admin/unified-limits>` about creating limits using the OpenStackClient.
+
+.. _Keystone policy configuration: https://docs.openstack.org/keystone/latest/configuration/policy.html
+.. _unified limits API: https://docs.openstack.org/api-ref/identity/v3/index.html#unified-limits
+.. _system-scoped authorization tokens: https://docs.openstack.org/keystone/latest/admin/tokens-overview.html#system-scoped-tokens
+
+.. versionadded:: 28.0.0 (2023.2 Bobcat)
+
+.. rubric:: Options
+
+.. option:: --project-id <project-id>
+
+    The project ID for which to migrate quota limits.
+
+.. option:: --region-id <region-id>
+
+    The region ID for which to migrate quota limits.
+
+.. option:: --verbose
+
+   Provide verbose output during execution.
+
+.. option:: --dry-run
+
+   Show what limits would be created without actually creating them.
+
+.. rubric:: Return codes
+
+.. list-table::
+   :widths: 20 80
+   :header-rows: 1
+
+   * - Return code
+     - Description
+   * - 0
+     - Command completed successfully
+   * - 1
+     - An unexpected error occurred
+   * - 2
+     - Failed to connect to the database
+
+
 See Also
 ========
 
 :doc:`nova-policy(1) <nova-policy>`,
 :doc:`nova-status(1) <nova-status>`
+
 
 Bugs
 ====

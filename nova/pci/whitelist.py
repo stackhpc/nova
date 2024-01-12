@@ -33,7 +33,7 @@ class Whitelist(object):
     assignable.
     """
 
-    def __init__(self, whitelist_spec: str = None) -> None:
+    def __init__(self, whitelist_spec: ty.Optional[str] = None) -> None:
         """White list constructor
 
         For example, the following json string specifies that devices whose
@@ -44,7 +44,7 @@ class Whitelist(object):
 
         :param whitelist_spec: A JSON string for a dictionary or list thereof.
             Each dictionary specifies the pci device properties requirement.
-            See the definition of ``passthrough_whitelist`` in
+            See the definition of ``device_spec`` in
             ``nova.conf.pci`` for details and examples.
         """
         if whitelist_spec:
@@ -62,18 +62,18 @@ class Whitelist(object):
             try:
                 dev_spec = jsonutils.loads(jsonspec)
             except ValueError:
-                raise exception.PciConfigInvalidWhitelist(
+                raise exception.PciConfigInvalidSpec(
                           reason=_("Invalid entry: '%s'") % jsonspec)
             if isinstance(dev_spec, dict):
                 dev_spec = [dev_spec]
             elif not isinstance(dev_spec, list):
-                raise exception.PciConfigInvalidWhitelist(
+                raise exception.PciConfigInvalidSpec(
                           reason=_("Invalid entry: '%s'; "
                                    "Expecting list or dict") % jsonspec)
 
             for ds in dev_spec:
                 if not isinstance(ds, dict):
-                    raise exception.PciConfigInvalidWhitelist(
+                    raise exception.PciConfigInvalidSpec(
                               reason=_("Invalid entry: '%s'; "
                                        "Expecting dict") % ds)
 
@@ -82,7 +82,7 @@ class Whitelist(object):
 
         return specs
 
-    def device_assignable(self, dev: ty.Dict[str, str]) -> bool:
+    def device_assignable(self, dev: ty.Dict[str, ty.Any]) -> bool:
         """Check if a device can be assigned to a guest.
 
         :param dev: A dictionary describing the device properties

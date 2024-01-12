@@ -79,11 +79,28 @@ def _context_manager_from_context(context):
             pass
 
 
-def _joinedload_all(column):
+def _joinedload_all(lead_entity, column):
+    """Do a nested load.
+
+    For example, resolve the following::
+
+        _joinedload_all(models.SecurityGroup, 'instances.info_cache')
+
+    to:
+
+        orm.joinedload(
+            models.SecurityGroup.instances
+        ).joinedload(
+            Instance.info_cache
+        )
+    """
     elements = column.split('.')
-    joined = orm.joinedload(elements.pop(0))
+    relationship_attr = getattr(lead_entity, elements.pop(0))
+    joined = orm.joinedload(relationship_attr)
     for element in elements:
-        joined = joined.joinedload(element)
+        relationship_entity = relationship_attr.entity.class_
+        relationship_attr = getattr(relationship_entity, element)
+        joined = joined.joinedload(relationship_attr)
 
     return joined
 
@@ -562,8 +579,8 @@ def _compute_node_select(context, filters=None, limit=None, marker=None):
     if filters is None:
         filters = {}
 
-    cn_tbl = sa.alias(models.ComputeNode.__table__, name='cn')
-    select = sa.select([cn_tbl])
+    cn_tbl = models.ComputeNode.__table__.alias('cn')
+    select = sa.select(cn_tbl)
 
     if context.read_deleted == "no":
         select = select.where(cn_tbl.c.deleted == 0)
@@ -595,12 +612,12 @@ def _compute_node_select(context, filters=None, limit=None, marker=None):
 def _compute_node_fetchall(context, filters=None, limit=None, marker=None):
     select = _compute_node_select(context, filters, limit=limit, marker=marker)
     engine = get_engine(context=context)
-    conn = engine.connect()
 
-    results = conn.execute(select).fetchall()
+    with engine.connect() as conn, conn.begin():
+        results = conn.execute(select).fetchall()
 
     # Callers expect dict-like objects, not SQLAlchemy RowProxy objects...
-    results = [dict(r) for r in results]
+    results = [dict(r._mapping) for r in results]
     conn.close()
     return results
 
@@ -909,7 +926,7 @@ def compute_node_statistics(context):
     engine = get_engine(context=context)
     services_tbl = models.Service.__table__
 
-    inner_sel = sa.alias(_compute_node_select(context), name='inner_sel')
+    inner_sel = _compute_node_select(context).alias('inner_sel')
 
     # TODO(sbauza): Remove the service_id filter in a later release
     # once we are sure that all compute nodes report the host field
@@ -965,10 +982,10 @@ def compute_node_statistics(context):
             inner_sel.c.disk_available_least
         ).label('disk_available_least'),
     ]
-    select = sql.select(agg_cols).select_from(j)
-    conn = engine.connect()
+    select = sql.select(*agg_cols).select_from(j)
 
-    results = conn.execute(select).fetchone()
+    with engine.connect() as conn, conn.begin():
+        results = conn.execute(select).fetchone()
 
     # Build a dict of the info--making no assumptions about result
     fields = ('count', 'vcpus', 'memory_mb', 'local_gb', 'vcpus_used',
@@ -976,7 +993,6 @@ def compute_node_statistics(context):
               'current_workload', 'running_vms', 'disk_available_least')
     results = {field: int(results[idx] or 0)
                for idx, field in enumerate(fields)}
-    conn.close()
     return results
 
 
@@ -1381,9 +1397,9 @@ def instance_get_by_uuid(context, uuid, columns_to_join=None):
 
 
 def _instance_get_by_uuid(context, uuid, columns_to_join=None):
-    result = _build_instance_get(context, columns_to_join=columns_to_join).\
-                filter_by(uuid=uuid).\
-                first()
+    result = _build_instance_get(
+        context, columns_to_join=columns_to_join
+    ).filter_by(uuid=uuid).first()
 
     if not result:
         raise exception.InstanceNotFound(instance_id=uuid)
@@ -1411,9 +1427,13 @@ def instance_get(context, instance_id, columns_to_join=None):
 
 
 def _build_instance_get(context, columns_to_join=None):
-    query = model_query(context, models.Instance, project_only=True).\
-            options(_joinedload_all('security_groups.rules')).\
-            options(orm.joinedload('info_cache'))
+    query = model_query(
+        context, models.Instance, project_only=True,
+    ).options(
+        orm.joinedload(
+            models.Instance.security_groups
+        ).joinedload(models.SecurityGroup.rules)
+    ).options(orm.joinedload(models.Instance.info_cache))
     if columns_to_join is None:
         columns_to_join = ['metadata', 'system_metadata']
     for column in columns_to_join:
@@ -1421,7 +1441,10 @@ def _build_instance_get(context, columns_to_join=None):
             # Already always joined above
             continue
         if 'extra.' in column:
-            query = query.options(orm.undefer(column))
+            column_ref = getattr(models.InstanceExtra, column.split('.')[1])
+            query = query.options(
+                orm.joinedload(models.Instance.extra).undefer(column_ref)
+            )
         elif column in ['metadata', 'system_metadata']:
             # NOTE(melwitt): We use subqueryload() instead of joinedload() for
             # metadata and system_metadata because of the one-to-many
@@ -1431,13 +1454,16 @@ def _build_instance_get(context, columns_to_join=None):
             # in a large data transfer. Instead, the subqueryload() will
             # perform additional queries to obtain metadata and system_metadata
             # for the instance.
-            query = query.options(orm.subqueryload(column))
+            column_ref = getattr(models.Instance, column)
+            query = query.options(orm.subqueryload(column_ref))
         else:
-            query = query.options(orm.joinedload(column))
+            column_ref = getattr(models.Instance, column)
+            query = query.options(orm.joinedload(column_ref))
     # NOTE(alaski) Stop lazy loading of columns not needed.
-    for col in ['metadata', 'system_metadata']:
-        if col not in columns_to_join:
-            query = query.options(orm.noload(col))
+    for column in ['metadata', 'system_metadata']:
+        if column not in columns_to_join:
+            column_ref = getattr(models.Instance, column)
+            query = query.options(orm.noload(column_ref))
     # NOTE(melwitt): We need to use order_by(<unique column>) so that the
     # additional queries emitted by subqueryload() include the same ordering as
     # used by the parent query.
@@ -1530,7 +1556,8 @@ def instance_get_all(context, columns_to_join=None):
             _manual_join_columns(columns_to_join))
     query = model_query(context, models.Instance)
     for column in columns_to_join_new:
-        query = query.options(orm.joinedload(column))
+        column_ref = getattr(models.Instance, column)
+        query = query.options(orm.joinedload(column_ref))
     if not context.is_admin:
         # If we're not admin context, add appropriate filter..
         if context.project_id:
@@ -1563,7 +1590,7 @@ def instance_get_all_by_filters(
 def _get_query_nova_resource_by_changes_time(query, filters, model_object):
     """Filter resources by changes-since or changes-before.
 
-    Special keys are used to tweek the query further::
+    Special keys are used to tweak the query further::
 
     |   'changes-since' - only return resources updated after
     |   'changes-before' - only return resources updated before
@@ -1619,7 +1646,7 @@ def instance_get_all_by_filters_sort(context, filters, limit=None, marker=None,
     |       ]
     |   }
 
-    Special keys are used to tweek the query further::
+    Special keys are used to tweak the query further::
 
     |   'changes-since' - only return instances updated after
     |   'changes-before' - only return instances updated before
@@ -1671,9 +1698,13 @@ def instance_get_all_by_filters_sort(context, filters, limit=None, marker=None,
     query_prefix = context.session.query(models.Instance)
     for column in columns_to_join_new:
         if 'extra.' in column:
-            query_prefix = query_prefix.options(orm.undefer(column))
+            column_ref = getattr(models.InstanceExtra, column.split('.')[1])
+            query_prefix = query_prefix.options(
+                orm.joinedload(models.Instance.extra).undefer(column_ref)
+            )
         else:
-            query_prefix = query_prefix.options(orm.joinedload(column))
+            column_ref = getattr(models.Instance, column)
+            query_prefix = query_prefix.options(orm.joinedload(column_ref))
 
     # Note: order_by is done in the sqlalchemy.utils.py paginate_query(),
     # no need to do it here as well
@@ -1683,9 +1714,9 @@ def instance_get_all_by_filters_sort(context, filters, limit=None, marker=None,
     filters = copy.deepcopy(filters)
 
     model_object = models.Instance
-    query_prefix = _get_query_nova_resource_by_changes_time(query_prefix,
-                                                            filters,
-                                                            model_object)
+    query_prefix = _get_query_nova_resource_by_changes_time(
+        query_prefix, filters, model_object,
+    )
 
     if 'deleted' in filters:
         # Instances can be soft or hard deleted and the query needs to
@@ -1697,14 +1728,12 @@ def instance_get_all_by_filters_sort(context, filters, limit=None, marker=None,
                     models.Instance.deleted == models.Instance.id,
                     models.Instance.vm_state == vm_states.SOFT_DELETED
                     )
-                query_prefix = query_prefix.\
-                    filter(delete)
+                query_prefix = query_prefix.filter(delete)
             else:
                 query_prefix = query_prefix.\
                     filter(models.Instance.deleted == models.Instance.id)
         else:
-            query_prefix = query_prefix.\
-                    filter_by(deleted=0)
+            query_prefix = query_prefix.filter_by(deleted=0)
             if not filters.pop('soft_deleted', False):
                 # It would be better to have vm_state not be nullable
                 # but until then we test it explicitly as a workaround.
@@ -1794,19 +1823,25 @@ def instance_get_all_by_filters_sort(context, filters, limit=None, marker=None,
     if marker is not None:
         try:
             marker = _instance_get_by_uuid(
-                    context.elevated(read_deleted='yes'), marker)
+                context.elevated(read_deleted='yes'), marker,
+            )
         except exception.InstanceNotFound:
             raise exception.MarkerNotFound(marker=marker)
     try:
-        query_prefix = sqlalchemyutils.paginate_query(query_prefix,
-                               models.Instance, limit,
-                               sort_keys,
-                               marker=marker,
-                               sort_dirs=sort_dirs)
+        query_prefix = sqlalchemyutils.paginate_query(
+            query_prefix,
+            models.Instance,
+            limit,
+            sort_keys,
+            marker=marker,
+            sort_dirs=sort_dirs,
+        )
     except db_exc.InvalidSortKey:
         raise exception.InvalidSortKey()
 
-    return _instances_fill_metadata(context, query_prefix.all(), manual_joins)
+    instances = query_prefix.all()
+
+    return _instances_fill_metadata(context, instances, manual_joins)
 
 
 @require_context
@@ -1951,7 +1986,6 @@ def _get_regexp_ops(connection):
 
 
 def _regex_instance_filter(query, filters):
-
     """Applies regular expression filtering to an Instance query.
 
     Returns the updated query.
@@ -2060,9 +2094,13 @@ def instance_get_active_by_window_joined(context, begin, end=None,
 
     for column in columns_to_join_new:
         if 'extra.' in column:
-            query = query.options(orm.undefer(column))
+            column_ref = getattr(models.InstanceExtra, column.split('.')[1])
+            query = query.options(
+                orm.joinedload(models.Instance.extra).undefer(column_ref)
+            )
         else:
-            query = query.options(orm.joinedload(column))
+            column_ref = getattr(models.Instance, column)
+            query = query.options(orm.joinedload(column_ref))
 
     query = query.filter(sql.or_(
         models.Instance.terminated_at == sql.null(),
@@ -2082,23 +2120,31 @@ def instance_get_active_by_window_joined(context, begin, end=None,
             raise exception.MarkerNotFound(marker=marker)
 
     query = sqlalchemyutils.paginate_query(
-        query, models.Instance, limit, ['project_id', 'uuid'], marker=marker)
+        query, models.Instance, limit, ['project_id', 'uuid'], marker=marker,
+    )
+    instances = query.all()
 
-    return _instances_fill_metadata(context, query.all(), manual_joins)
+    return _instances_fill_metadata(context, instances, manual_joins)
 
 
 def _instance_get_all_query(context, project_only=False, joins=None):
     if joins is None:
         joins = ['info_cache', 'security_groups']
 
-    query = model_query(context,
-                        models.Instance,
-                        project_only=project_only)
+    query = model_query(
+        context,
+        models.Instance,
+        project_only=project_only,
+    )
     for column in joins:
         if 'extra.' in column:
-            query = query.options(orm.undefer(column))
+            column_ref = getattr(models.InstanceExtra, column.split('.')[1])
+            query = query.options(
+                orm.joinedload(models.Instance.extra).undefer(column_ref)
+            )
         else:
-            query = query.options(orm.joinedload(column))
+            column_ref = getattr(models.Instance, column)
+            query = query.options(orm.joinedload(column_ref))
     return query
 
 
@@ -2106,15 +2152,18 @@ def _instance_get_all_query(context, project_only=False, joins=None):
 def instance_get_all_by_host(context, host, columns_to_join=None):
     """Get all instances belonging to a host."""
     query = _instance_get_all_query(context, joins=columns_to_join)
-    return _instances_fill_metadata(context,
-                                    query.filter_by(host=host).all(),
-                                    manual_joins=columns_to_join)
+    instances = query.filter_by(host=host).all()
+    return _instances_fill_metadata(
+        context,
+        instances,
+        manual_joins=columns_to_join,
+    )
 
 
 def _instance_get_all_uuids_by_hosts(context, hosts):
     itbl = models.Instance.__table__
     default_deleted_value = itbl.c.deleted.default.arg
-    sel = sql.select([itbl.c.host, itbl.c.uuid])
+    sel = sql.select(itbl.c.host, itbl.c.uuid)
     sel = sel.where(sql.and_(
             itbl.c.deleted == default_deleted_value,
             itbl.c.host.in_(sa.bindparam('hosts', expanding=True))))
@@ -2148,19 +2197,26 @@ def instance_get_all_by_host_and_node(
         candidates = ['system_metadata', 'metadata']
         manual_joins = [x for x in columns_to_join if x in candidates]
         columns_to_join = list(set(columns_to_join) - set(candidates))
-    return _instances_fill_metadata(context,
-            _instance_get_all_query(
-                context,
-                joins=columns_to_join).filter_by(host=host).
-                filter_by(node=node).all(), manual_joins=manual_joins)
+    instances = _instance_get_all_query(
+        context,
+        joins=columns_to_join,
+    ).filter_by(host=host).filter_by(node=node).all()
+    return _instances_fill_metadata(
+        context,
+        instances,
+        manual_joins=manual_joins,
+    )
 
 
 @pick_context_manager_reader
 def instance_get_all_by_host_and_not_type(context, host, type_id=None):
     """Get all instances belonging to a host with a different type_id."""
-    return _instances_fill_metadata(context,
-        _instance_get_all_query(context).filter_by(host=host).
-                   filter(models.Instance.instance_type_id != type_id).all())
+    instances = _instance_get_all_query(context).filter_by(
+        host=host,
+    ).filter(
+        models.Instance.instance_type_id != type_id
+    ).all()
+    return _instances_fill_metadata(context, instances)
 
 
 # NOTE(hanlind): This method can be removed as conductor RPC API moves to v2.0.
@@ -2173,11 +2229,14 @@ def instance_get_all_hung_in_rebooting(context, reboot_window):
     # NOTE(danms): this is only used in the _poll_rebooting_instances()
     # call in compute/manager, so we can avoid the metadata lookups
     # explicitly
-    return _instances_fill_metadata(context,
-        model_query(context, models.Instance).
-            filter(models.Instance.updated_at <= reboot_window).
-            filter_by(task_state=task_states.REBOOTING).all(),
-        manual_joins=[])
+    instances = model_query(context, models.Instance).filter(
+        models.Instance.updated_at <= reboot_window
+    ).filter_by(task_state=task_states.REBOOTING).all()
+    return _instances_fill_metadata(
+        context,
+        instances,
+        manual_joins=[],
+    )
 
 
 def _retry_instance_update():
@@ -2506,87 +2565,17 @@ def instance_extra_get_by_instance_uuid(
     :param instance_uuid: UUID of the instance tied to the topology record
     :param columns: A list of the columns to load, or None for 'all of them'
     """
-    query = model_query(context, models.InstanceExtra).\
-        filter_by(instance_uuid=instance_uuid)
+    query = model_query(context, models.InstanceExtra).filter_by(
+        instance_uuid=instance_uuid,
+    )
     if columns is None:
         columns = ['numa_topology', 'pci_requests', 'flavor', 'vcpu_model',
                    'trusted_certs', 'resources', 'migration_context']
     for column in columns:
-        query = query.options(orm.undefer(column))
+        column_ref = getattr(models.InstanceExtra, column)
+        query = query.options(orm.undefer(column_ref))
     instance_extra = query.first()
     return instance_extra
-
-
-###################
-
-
-@require_context
-@pick_context_manager_writer
-def key_pair_create(context, values):
-    """Create a key_pair from the values dictionary."""
-    try:
-        key_pair_ref = models.KeyPair()
-        key_pair_ref.update(values)
-        key_pair_ref.save(context.session)
-        return key_pair_ref
-    except db_exc.DBDuplicateEntry:
-        raise exception.KeyPairExists(key_name=values['name'])
-
-
-@require_context
-@pick_context_manager_writer
-def key_pair_destroy(context, user_id, name):
-    """Destroy the key_pair or raise if it does not exist."""
-    result = model_query(context, models.KeyPair).\
-                         filter_by(user_id=user_id).\
-                         filter_by(name=name).\
-                         soft_delete()
-    if not result:
-        raise exception.KeypairNotFound(user_id=user_id, name=name)
-
-
-@require_context
-@pick_context_manager_reader
-def key_pair_get(context, user_id, name):
-    """Get a key_pair or raise if it does not exist."""
-    result = model_query(context, models.KeyPair).\
-                     filter_by(user_id=user_id).\
-                     filter_by(name=name).\
-                     first()
-
-    if not result:
-        raise exception.KeypairNotFound(user_id=user_id, name=name)
-
-    return result
-
-
-@require_context
-@pick_context_manager_reader
-def key_pair_get_all_by_user(context, user_id, limit=None, marker=None):
-    """Get all key_pairs by user."""
-    marker_row = None
-    if marker is not None:
-        marker_row = model_query(context, models.KeyPair, read_deleted="no").\
-            filter_by(name=marker).filter_by(user_id=user_id).first()
-        if not marker_row:
-            raise exception.MarkerNotFound(marker=marker)
-
-    query = model_query(context, models.KeyPair, read_deleted="no").\
-        filter_by(user_id=user_id)
-
-    query = sqlalchemyutils.paginate_query(
-        query, models.KeyPair, limit, ['name'], marker=marker_row)
-
-    return query.all()
-
-
-@require_context
-@pick_context_manager_reader
-def key_pair_count_by_user(context, user_id):
-    """Count number of key pairs for the given user ID."""
-    return model_query(context, models.KeyPair, read_deleted="no").\
-                   filter_by(user_id=user_id).\
-                   count()
 
 
 ###################
@@ -2806,7 +2795,8 @@ def _block_device_mapping_get_query(context, columns_to_join=None):
     query = model_query(context, models.BlockDeviceMapping)
 
     for column in columns_to_join:
-        query = query.options(orm.joinedload(column))
+        column_ref = getattr(models.BlockDeviceMapping, column)
+        query = query.options(orm.joinedload(column_ref))
 
     return query
 
@@ -3023,10 +3013,18 @@ def security_group_create(context, values):
 
 def _security_group_get_query(context, read_deleted=None,
                               project_only=False, join_rules=True):
-    query = model_query(context, models.SecurityGroup,
-            read_deleted=read_deleted, project_only=project_only)
+    query = model_query(
+        context,
+        models.SecurityGroup,
+        read_deleted=read_deleted,
+        project_only=project_only,
+    )
     if join_rules:
-        query = query.options(_joinedload_all('rules.grantee_group'))
+        query = query.options(
+            orm.joinedload(
+                models.SecurityGroup.rules
+            ).joinedload(models.SecurityGroupIngressRule.grantee_group)
+        )
     return query
 
 
@@ -3071,8 +3069,7 @@ def security_group_get(context, security_group_id, columns_to_join=None):
     if columns_to_join is None:
         columns_to_join = []
     for column in columns_to_join:
-        if column.startswith('instances'):
-            query = query.options(_joinedload_all(column))
+        query = query.options(_joinedload_all(models.SecurityGroup, column))
 
     result = query.first()
     if not result:
@@ -3084,25 +3081,27 @@ def security_group_get(context, security_group_id, columns_to_join=None):
 
 @require_context
 @pick_context_manager_reader
-def security_group_get_by_name(
-    context, project_id, group_name, columns_to_join=None,
-):
+def security_group_get_by_name(context, project_id, group_name):
     """Returns a security group with the specified name from a project."""
-    query = _security_group_get_query(context,
-                                      read_deleted="no", join_rules=False).\
-            filter_by(project_id=project_id).\
-            filter_by(name=group_name)
-
-    if columns_to_join is None:
-        columns_to_join = ['instances', 'rules.grantee_group']
-
-    for column in columns_to_join:
-        query = query.options(_joinedload_all(column))
+    query = _security_group_get_query(
+        context, read_deleted="no", join_rules=False,
+    ).filter_by(
+        project_id=project_id,
+    ).filter_by(
+        name=group_name,
+    ).options(
+        orm.joinedload(models.SecurityGroup.instances)
+    ).options(
+        orm.joinedload(
+            models.SecurityGroup.rules
+        ).joinedload(models.SecurityGroupIngressRule.grantee_group)
+    )
 
     result = query.first()
     if not result:
         raise exception.SecurityGroupNotFoundForProject(
-                project_id=project_id, security_group_id=group_name)
+            project_id=project_id, security_group_id=group_name,
+        )
 
     return result
 
@@ -3150,14 +3149,11 @@ def security_group_in_use(context, group_id):
 
 @require_context
 @pick_context_manager_writer
-def security_group_update(context, security_group_id, values,
-                          columns_to_join=None):
+def security_group_update(context, security_group_id, values):
     """Update a security group."""
     query = model_query(context, models.SecurityGroup).filter_by(
-        id=security_group_id)
-    if columns_to_join:
-        for column in columns_to_join:
-            query = query.options(_joinedload_all(column))
+        id=security_group_id,
+    )
     security_group_ref = query.first()
 
     if not security_group_ref:
@@ -3338,20 +3334,36 @@ def migration_get_in_progress_by_host_and_node(context, host, node):
     # 'finished' means a resize is finished on the destination host
     # and the instance is in VERIFY_RESIZE state, so the end state
     # for a resize is actually 'confirmed' or 'reverted'.
-    return model_query(context, models.Migration).\
-            filter(sql.or_(
-                sql.and_(
-                    models.Migration.source_compute == host,
-                    models.Migration.source_node == node),
-                sql.and_(
-                    models.Migration.dest_compute == host,
-                    models.Migration.dest_node == node))).\
-            filter(~models.Migration.status.in_(['confirmed', 'reverted',
-                                                 'error', 'failed',
-                                                 'completed', 'cancelled',
-                                                 'done'])).\
-            options(_joinedload_all('instance.system_metadata')).\
-            all()
+    return model_query(
+        context, models.Migration,
+    ).filter(
+        sql.or_(
+            sql.and_(
+                models.Migration.source_compute == host,
+                models.Migration.source_node == node,
+            ),
+            sql.and_(
+                models.Migration.dest_compute == host,
+                models.Migration.dest_node == node,
+            ),
+        )
+    ).filter(
+        ~models.Migration.status.in_(
+            [
+                'confirmed',
+                'reverted',
+                'error',
+                'failed',
+                'completed',
+                'cancelled',
+                'done',
+            ]
+        )
+    ).options(
+        orm.joinedload(
+            models.Migration.instance
+        ).joinedload(models.Instance.system_metadata)
+    ).all()
 
 
 @pick_context_manager_reader
@@ -3463,12 +3475,12 @@ def migration_get_by_sort_filters(context, sort_keys, sort_dirs, values):
 
 
 @pick_context_manager_writer
-def migration_migrate_to_uuid(context, count):
+def migration_migrate_to_uuid(context, max_count):
     # Avoid circular import
     from nova import objects
 
     db_migrations = model_query(context, models.Migration).filter_by(
-        uuid=None).limit(count).all()
+        uuid=None).limit(max_count).all()
 
     done = 0
     for db_migration in db_migrations:
@@ -3486,19 +3498,32 @@ def migration_get_in_progress_and_error_by_host_and_node(context, host, node):
     """Finds all in progress migrations and error migrations for the given
     host and node.
     """
-    return model_query(context, models.Migration).\
-            filter(sql.or_(
-                sql.and_(
-                    models.Migration.source_compute == host,
-                    models.Migration.source_node == node),
-                sql.and_(
-                    models.Migration.dest_compute == host,
-                    models.Migration.dest_node == node))).\
-            filter(~models.Migration.status.in_(['confirmed', 'reverted',
-                                                 'failed', 'completed',
-                                                 'cancelled', 'done'])).\
-            options(_joinedload_all('instance.system_metadata')).\
-            all()
+    return model_query(
+        context, models.Migration,
+    ).filter(
+        sql.or_(
+            sql.and_(
+                models.Migration.source_compute == host,
+                models.Migration.source_node == node),
+            sql.and_(
+                models.Migration.dest_compute == host,
+                models.Migration.dest_node == node,
+            ),
+        )
+    ).filter(
+        ~models.Migration.status.in_([
+            'confirmed',
+            'reverted',
+            'failed',
+            'completed',
+            'cancelled',
+            'done',
+        ])
+    ).options(
+        orm.joinedload(
+            models.Migration.instance
+        ).joinedload(models.Instance.system_metadata)
+    ).all()
 
 
 ########################
@@ -3616,89 +3641,6 @@ def instance_system_metadata_update(context, instance_uuid, metadata, delete):
         context.session.add(meta_ref)
 
     return metadata
-
-
-####################
-
-@require_context
-@pick_context_manager_reader_allow_async
-def bw_usage_get(context, uuid, start_period, mac):
-    """Return bw usage for instance and mac in a given audit period."""
-    values = {'start_period': start_period}
-    values = convert_objects_related_datetimes(values, 'start_period')
-    return model_query(context, models.BandwidthUsage, read_deleted="yes").\
-                           filter_by(start_period=values['start_period']).\
-                           filter_by(uuid=uuid).\
-                           filter_by(mac=mac).\
-                           first()
-
-
-@require_context
-@pick_context_manager_reader_allow_async
-def bw_usage_get_by_uuids(context, uuids, start_period):
-    """Return bw usages for instance(s) in a given audit period."""
-    values = {'start_period': start_period}
-    values = convert_objects_related_datetimes(values, 'start_period')
-    return (
-        model_query(context, models.BandwidthUsage, read_deleted="yes").
-        filter(models.BandwidthUsage.uuid.in_(uuids)).
-        filter_by(start_period=values['start_period']).
-        all()
-    )
-
-
-@require_context
-@oslo_db_api.wrap_db_retry(max_retries=5, retry_on_deadlock=True)
-@pick_context_manager_writer
-def bw_usage_update(
-    context, uuid, mac, start_period, bw_in, bw_out, last_ctr_in, last_ctr_out,
-    last_refreshed=None,
-):
-    """Update cached bandwidth usage for an instance's network based on mac
-    address.  Creates new record if needed.
-    """
-
-    if last_refreshed is None:
-        last_refreshed = timeutils.utcnow()
-
-    # NOTE(comstud): More often than not, we'll be updating records vs
-    # creating records.  Optimize accordingly, trying to update existing
-    # records.  Fall back to creation when no rows are updated.
-    ts_values = {'last_refreshed': last_refreshed,
-                 'start_period': start_period}
-    ts_keys = ('start_period', 'last_refreshed')
-    ts_values = convert_objects_related_datetimes(ts_values, *ts_keys)
-    values = {'last_refreshed': ts_values['last_refreshed'],
-              'last_ctr_in': last_ctr_in,
-              'last_ctr_out': last_ctr_out,
-              'bw_in': bw_in,
-              'bw_out': bw_out}
-    # NOTE(pkholkin): order_by() is needed here to ensure that the
-    # same record is updated every time. It can be removed after adding
-    # unique constraint to this model.
-    bw_usage = model_query(context, models.BandwidthUsage,
-        read_deleted='yes').\
-            filter_by(start_period=ts_values['start_period']).\
-            filter_by(uuid=uuid).\
-            filter_by(mac=mac).\
-            order_by(expression.asc(models.BandwidthUsage.id)).first()
-
-    if bw_usage:
-        bw_usage.update(values)
-        return bw_usage
-
-    bwusage = models.BandwidthUsage()
-    bwusage.start_period = ts_values['start_period']
-    bwusage.uuid = uuid
-    bwusage.mac = mac
-    bwusage.last_refreshed = ts_values['last_refreshed']
-    bwusage.bw_in = bw_in
-    bwusage.bw_out = bw_out
-    bwusage.last_ctr_in = last_ctr_in
-    bwusage.last_ctr_out = last_ctr_out
-    bwusage.save(context.session)
-
-    return bwusage
 
 
 ####################
@@ -4317,8 +4259,10 @@ def _get_fk_stmts(metadata, conn, table, column, records):
         # Create the shadow table for the referencing table.
         fk_shadow_tablename = _SHADOW_TABLE_PREFIX + fk_table.name
         try:
-            fk_shadow_table = schema.Table(
-                fk_shadow_tablename, metadata, autoload=True)
+            with conn.begin():
+                fk_shadow_table = schema.Table(
+                    fk_shadow_tablename, metadata, autoload_with=conn,
+                )
         except sqla_exc.NoSuchTableError:
             # No corresponding shadow table; skip it.
             continue
@@ -4332,6 +4276,12 @@ def _get_fk_stmts(metadata, conn, table, column, records):
             fk_column = fk_table.c.id
 
         for fk in fk_table.foreign_keys:
+            if table != fk.column.table:
+                # if the foreign key doesn't actually point to the table we're
+                # archiving entries from then it's not relevant; trying to
+                # resolve this would result in a cartesian product
+                continue
+
             # We need to find the records in the referring (child) table that
             # correspond to the records in our (parent) table so we can archive
             # them.
@@ -4347,9 +4297,11 @@ def _get_fk_stmts(metadata, conn, table, column, records):
             #              AND instance.id IN (<ids>)
             #          We need the instance uuids for the <ids> in order to
             #          look up the matching instance_extra records.
-            select = sql.select([fk.column]).where(
-                sql.and_(fk.parent == fk.column, column.in_(records)))
-            rows = conn.execute(select).fetchall()
+            select = sql.select(fk.column).where(
+                sql.and_(fk.parent == fk.column, column.in_(records))
+            )
+            with conn.begin():
+                rows = conn.execute(select).fetchall()
             p_records = [r[0] for r in rows]
             # Then, select rows in the child table that correspond to the
             # parent table records that were passed in.
@@ -4361,23 +4313,27 @@ def _get_fk_stmts(metadata, conn, table, column, records):
             #              AND instances.uuid IN (<uuids>)
             #          We will get the instance_extra ids we need to archive
             #          them.
-            fk_select = sql.select([fk_column]).where(
-                sql.and_(fk.parent == fk.column, fk.column.in_(p_records)))
-            fk_rows = conn.execute(fk_select).fetchall()
+            fk_select = sql.select(fk_column).where(
+                sql.and_(fk.parent == fk.column, fk.column.in_(p_records))
+            )
+            with conn.begin():
+                fk_rows = conn.execute(fk_select).fetchall()
             fk_records = [r[0] for r in fk_rows]
             if fk_records:
                 # If we found any records in the child table, create shadow
                 # table insert statements for them and prepend them to the
                 # deque.
                 fk_columns = [c.name for c in fk_table.c]
-                fk_insert = fk_shadow_table.insert(inline=True).\
-                    from_select(fk_columns, sql.select([fk_table],
-                        fk_column.in_(fk_records)))
+                fk_insert = fk_shadow_table.insert().from_select(
+                    fk_columns,
+                    sql.select(fk_table).where(fk_column.in_(fk_records))
+                ).inline()
                 inserts.appendleft(fk_insert)
                 # Create main table delete statements and prepend them to the
                 # deque.
                 fk_delete = fk_table.delete().where(fk_column.in_(fk_records))
                 deletes.appendleft(fk_delete)
+
         # Repeat for any possible nested child tables.
         i, d = _get_fk_stmts(metadata, conn, fk_table, fk_column, fk_records)
         inserts.extendleft(i)
@@ -4386,13 +4342,14 @@ def _get_fk_stmts(metadata, conn, table, column, records):
     return inserts, deletes
 
 
-def _archive_deleted_rows_for_table(metadata, tablename, max_rows, before,
-                                    task_log):
+def _archive_deleted_rows_for_table(
+    metadata, engine, tablename, max_rows, before, task_log,
+):
     """Move up to max_rows rows from one tables to the corresponding
     shadow table.
 
     Will also follow FK constraints and archive all referring rows.
-    Example: archving a record from the 'instances' table will also archive
+    Example: archiving a record from the 'instances' table will also archive
     the 'instance_extra' record before archiving the 'instances' record.
 
     :returns: 3-item tuple:
@@ -4402,7 +4359,7 @@ def _archive_deleted_rows_for_table(metadata, tablename, max_rows, before,
         - number of extra rows archived (due to FK constraints)
           dict of {tablename: rows_archived}
     """
-    conn = metadata.bind.connect()
+    conn = engine.connect()
     # NOTE(tdurakov): table metadata should be received
     # from models, not db tables. Default value specified by SoftDeleteMixin
     # is known only by models, not DB layer.
@@ -4413,9 +4370,13 @@ def _archive_deleted_rows_for_table(metadata, tablename, max_rows, before,
     rows_archived = 0
     deleted_instance_uuids = []
     try:
-        shadow_table = schema.Table(shadow_tablename, metadata, autoload=True)
+        with conn.begin():
+            shadow_table = schema.Table(
+                shadow_tablename, metadata, autoload_with=conn,
+            )
     except sqla_exc.NoSuchTableError:
         # No corresponding shadow table; skip it.
+        conn.close()
         return rows_archived, deleted_instance_uuids, {}
 
     # TODO(stephenfin): Drop this when we drop the table
@@ -4429,13 +4390,14 @@ def _archive_deleted_rows_for_table(metadata, tablename, max_rows, before,
     deleted_column = table.c.deleted
     columns = [c.name for c in table.c]
 
-    select = sql.select([column],
-                        deleted_column != deleted_column.default.arg)
+    select = sql.select(column).where(
+        deleted_column != deleted_column.default.arg
+    )
 
     if tablename == "task_log" and task_log:
         # task_log table records are never deleted by anything, so we won't
         # base our select statement on the 'deleted' column status.
-        select = sql.select([column])
+        select = sql.select(column)
 
     if before:
         if tablename != "task_log":
@@ -4446,7 +4408,11 @@ def _archive_deleted_rows_for_table(metadata, tablename, max_rows, before,
             select = select.where(table.c.updated_at < before)
 
     select = select.order_by(column).limit(max_rows)
-    rows = conn.execute(select).fetchall()
+    with conn.begin():
+        rows = conn.execute(select).fetchall()
+
+    # This is a list of IDs of rows that should be archived from this table,
+    # limited to a length of max_rows.
     records = [r[0] for r in rows]
 
     # We will archive deleted rows for this table and also generate insert and
@@ -4459,47 +4425,105 @@ def _archive_deleted_rows_for_table(metadata, tablename, max_rows, before,
 
     # Keep track of any extra tablenames to number of rows that we archive by
     # following FK relationships.
-    # {tablename: extra_rows_archived}
+    #
+    # extras = {tablename: number_of_extra_rows_archived}
     extras = collections.defaultdict(int)
-    if records:
-        insert = shadow_table.insert(inline=True).\
-                from_select(columns, sql.select([table], column.in_(records)))
-        delete = table.delete().where(column.in_(records))
+
+    if not records:
+        # Nothing to archive, so return.
+        return rows_archived, deleted_instance_uuids, extras
+
+    # Keep track of how many rows we accumulate for the insert+delete database
+    # transaction and cap it as soon as it is >= max_rows. Because we will
+    # archive all child rows of a parent row along with the parent at the same
+    # time, we end up with extra rows to archive in addition to len(records).
+    num_rows_in_batch = 0
+    # The sequence of query statements we will execute in a batch. These are
+    # ordered: [child1, child1, parent1, child2, child2, child2, parent2, ...]
+    # Parent + child "trees" are kept together to avoid FK constraint
+    # violations.
+    statements_in_batch = []
+    # The list of records in the batch. This is used for collecting deleted
+    # instance UUIDs in the case of the 'instances' table.
+    records_in_batch = []
+
+    # (melwitt): We will gather rows related by foreign key relationship for
+    # each deleted row, one at a time. We do it this way to keep track of and
+    # limit the total number of rows that will be archived in a single database
+    # transaction. In a large scale database with potentially hundreds of
+    # thousands of deleted rows, if we don't limit the size of the transaction
+    # based on max_rows, we can get into a situation where we get stuck not
+    # able to make much progress. The value of max_rows has to be 1) small
+    # enough to not exceed the database's max packet size limit or timeout with
+    # a deadlock but 2) large enough to make progress in an environment with a
+    # constant high volume of create and delete traffic. By archiving each
+    # parent + child rows tree one at a time, we can ensure meaningful progress
+    # can be made while allowing the caller to predictably control the size of
+    # the database transaction with max_rows.
+    for record in records:
         # Walk FK relationships and add insert/delete statements for rows that
         # refer to this table via FK constraints. fk_inserts and fk_deletes
         # will be prepended to by _get_fk_stmts if referring rows are found by
         # FK constraints.
         fk_inserts, fk_deletes = _get_fk_stmts(
-            metadata, conn, table, column, records)
+            metadata, conn, table, column, [record])
+        statements_in_batch.extend(fk_inserts + fk_deletes)
+        # statement to add parent row to shadow table
+        insert = shadow_table.insert().from_select(
+            columns, sql.select(table).where(column.in_([record]))).inline()
+        statements_in_batch.append(insert)
+        # statement to remove parent row from main table
+        delete = table.delete().where(column.in_([record]))
+        statements_in_batch.append(delete)
 
-        # NOTE(tssurya): In order to facilitate the deletion of records from
-        # instance_mappings, request_specs and instance_group_member tables in
-        # the nova_api DB, the rows of deleted instances from the instances
-        # table are stored prior to their deletion. Basically the uuids of the
-        # archived instances are queried and returned.
-        if tablename == "instances":
-            query_select = sql.select([table.c.uuid], table.c.id.in_(records))
+        records_in_batch.append(record)
+
+        # Check whether were have a full batch >= max_rows. Rows are counted as
+        # the number of rows that will be moved in the database transaction.
+        # So each insert+delete pair represents one row that will be moved.
+        # 1 parent + its fks
+        num_rows_in_batch += 1 + len(fk_inserts)
+
+        if max_rows is not None and num_rows_in_batch >= max_rows:
+            break
+
+    # NOTE(tssurya): In order to facilitate the deletion of records from
+    # instance_mappings, request_specs and instance_group_member tables in the
+    # nova_api DB, the rows of deleted instances from the instances table are
+    # stored prior to their deletion. Basically the uuids of the archived
+    # instances are queried and returned.
+    if tablename == "instances":
+        query_select = sql.select(table.c.uuid).where(
+            table.c.id.in_(records_in_batch))
+        with conn.begin():
             rows = conn.execute(query_select).fetchall()
-            deleted_instance_uuids = [r[0] for r in rows]
+        # deleted_instance_uuids = ['uuid1', 'uuid2', ...]
+        deleted_instance_uuids = [r[0] for r in rows]
 
-        try:
-            # Group the insert and delete in a transaction.
-            with conn.begin():
-                for fk_insert in fk_inserts:
-                    conn.execute(fk_insert)
-                for fk_delete in fk_deletes:
-                    result_fk_delete = conn.execute(fk_delete)
-                    extras[fk_delete.table.name] += result_fk_delete.rowcount
-                conn.execute(insert)
-                result_delete = conn.execute(delete)
-            rows_archived += result_delete.rowcount
-        except db_exc.DBReferenceError as ex:
-            # A foreign key constraint keeps us from deleting some of
-            # these rows until we clean up a dependent table.  Just
-            # skip this table for now; we'll come back to it later.
-            LOG.warning("IntegrityError detected when archiving table "
-                        "%(tablename)s: %(error)s",
-                        {'tablename': tablename, 'error': str(ex)})
+    try:
+        # Group the insert and delete in a transaction.
+        with conn.begin():
+            for statement in statements_in_batch:
+                result = conn.execute(statement)
+                result_tablename = statement.table.name
+                # Add to archived row counts if not a shadow table.
+                if not result_tablename.startswith(_SHADOW_TABLE_PREFIX):
+                    if result_tablename == tablename:
+                        # Number of tablename (parent) rows archived.
+                        rows_archived += result.rowcount
+                    else:
+                        # Number(s) of child rows archived.
+                        extras[result_tablename] += result.rowcount
+
+    except db_exc.DBReferenceError as ex:
+        # A foreign key constraint keeps us from deleting some of these rows
+        # until we clean up a dependent table. Just skip this table for now;
+        # we'll come back to it later.
+        LOG.warning("IntegrityError detected when archiving table "
+                    "%(tablename)s: %(error)s",
+                    {'tablename': tablename, 'error': str(ex)})
+
+    conn.close()
 
     return rows_archived, deleted_instance_uuids, extras
 
@@ -4530,8 +4554,9 @@ def archive_deleted_rows(context=None, max_rows=None, before=None,
     table_to_rows_archived = collections.defaultdict(int)
     deleted_instance_uuids = []
     total_rows_archived = 0
-    meta = sa.MetaData(get_engine(use_slave=True, context=context))
-    meta.reflect()
+    meta = sa.MetaData()
+    engine = get_engine(use_slave=True, context=context)
+    meta.reflect(bind=engine)
     # Get the sorted list of tables in order of foreign key dependency.
     # Process the parent tables and find their dependent records in order to
     # archive the related records in a single database transactions. The goal
@@ -4541,19 +4566,20 @@ def archive_deleted_rows(context=None, max_rows=None, before=None,
     for table in meta.sorted_tables:
         tablename = table.name
         rows_archived = 0
-        # skip the special sqlalchemy-migrate migrate_version table and any
-        # shadow tables
-        # TODO(stephenfin): Drop 'migrate_version' once we remove support for
-        # the legacy sqlalchemy-migrate migrations
+        # skip the special alembic_version version table and any shadow tables
         if (
-            tablename in ('migrate_version', 'alembic_version') or
+            tablename == 'alembic_version' or
             tablename.startswith(_SHADOW_TABLE_PREFIX)
         ):
             continue
 
+        # skip the tables that we've since removed the models for
+        if tablename in models.REMOVED_TABLES:
+            continue
+
         rows_archived, _deleted_instance_uuids, extras = (
             _archive_deleted_rows_for_table(
-                meta, tablename,
+                meta, engine, tablename,
                 max_rows=max_rows - total_rows_archived,
                 before=before,
                 task_log=task_log))
@@ -4572,17 +4598,19 @@ def archive_deleted_rows(context=None, max_rows=None, before=None,
 
 
 def _purgeable_tables(metadata):
-    return [t for t in metadata.sorted_tables
-            if (t.name.startswith(_SHADOW_TABLE_PREFIX) and not
-                t.name.endswith('migrate_version'))]
+    return [
+        t for t in metadata.sorted_tables if (
+            t.name.startswith(_SHADOW_TABLE_PREFIX) and not
+            t.name == 'alembic_version'
+        )
+    ]
 
 
 def purge_shadow_tables(context, before_date, status_fn=None):
     engine = get_engine(context=context)
     conn = engine.connect()
     metadata = sa.MetaData()
-    metadata.bind = engine
-    metadata.reflect()
+    metadata.reflect(bind=engine)
     total_deleted = 0
 
     if status_fn is None:
@@ -4619,7 +4647,8 @@ def purge_shadow_tables(context, before_date, status_fn=None):
         else:
             delete = table.delete()
 
-        deleted = conn.execute(delete)
+        with conn.begin():
+            deleted = conn.execute(delete)
         if deleted.rowcount > 0:
             status_fn(_('Deleted %(rows)i rows from %(table)s based on '
                         'timestamp column %(col)s') % {
@@ -4627,6 +4656,8 @@ def purge_shadow_tables(context, before_date, status_fn=None):
                             'table': table.name,
                             'col': col is None and '(n/a)' or col.name})
         total_deleted += deleted.rowcount
+
+    conn.close()
 
     return total_deleted
 
@@ -4760,7 +4791,7 @@ def instance_tag_set(context, instance_uuid, tags):
     if to_add:
         data = [
             {'resource_id': instance_uuid, 'tag': tag} for tag in to_add]
-        context.session.execute(models.Tag.__table__.insert(None), data)
+        context.session.execute(models.Tag.__table__.insert(), data)
 
     return context.session.query(models.Tag).filter_by(
         resource_id=instance_uuid).all()

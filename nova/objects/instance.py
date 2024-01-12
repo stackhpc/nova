@@ -13,6 +13,7 @@
 #    under the License.
 
 import contextlib
+import typing as ty
 
 from oslo_config import cfg
 from oslo_db import exception as db_exc
@@ -27,6 +28,7 @@ from sqlalchemy.sql import func
 from nova import availability_zones as avail_zone
 from nova.compute import task_states
 from nova.compute import vm_states
+from nova import context as nova_context
 from nova.db.main import api as db
 from nova.db.main import models
 from nova import exception
@@ -114,7 +116,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
     # Version 2.5: Added hard_delete kwarg in destroy
     # Version 2.6: Added hidden
     # Version 2.7: Added resources
-    VERSION = '2.7'
+    # Version 2.8: Added compute_id
+    VERSION = '2.8'
 
     fields = {
         'id': fields.IntegerField(),
@@ -145,6 +148,7 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
 
         'host': fields.StringField(nullable=True),
         'node': fields.StringField(nullable=True),
+        'compute_id': fields.IntegerField(nullable=True),
 
         # TODO(stephenfin): Remove this in version 3.0 of the object as it has
         # been replaced by 'flavor'
@@ -186,7 +190,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
         'shutdown_terminate': fields.BooleanField(default=False),
         'disable_terminate': fields.BooleanField(default=False),
 
-        # TODO(stephenfin): Remove this in version 3.0 of the object
+        # TODO(stephenfin): Remove this in version 3.0 of the object as it's
+        # related to cells v1
         'cell_name': fields.StringField(nullable=True),
 
         'metadata': fields.DictOfStringsField(),
@@ -229,6 +234,8 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
     def obj_make_compatible(self, primitive, target_version):
         super(Instance, self).obj_make_compatible(primitive, target_version)
         target_version = versionutils.convert_version_to_tuple(target_version)
+        if target_version < (2, 8) and 'compute_id' in primitive:
+            del primitive['compute_id']
         if target_version < (2, 7) and 'resources' in primitive:
             del primitive['resources']
         if target_version < (2, 6) and 'hidden' in primitive:
@@ -422,7 +429,7 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
         if 'security_groups' in expected_attrs:
             sec_groups = base.obj_make_list(
                     context, objects.SecurityGroupList(context),
-                    objects.SecurityGroup, db_inst.get('security_groups', []))
+                    objects.SecurityGroup, [])
             instance['security_groups'] = sec_groups
 
         if 'tags' in expected_attrs:
@@ -518,7 +525,7 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
     @base.remotable_classmethod
     def get_by_uuid(cls, context, uuid, expected_attrs=None, use_slave=False):
         if expected_attrs is None:
-            expected_attrs = ['info_cache', 'security_groups']
+            expected_attrs = ['info_cache']
         columns_to_join = _expected_cols(expected_attrs)
         db_inst = cls._db_instance_get_by_uuid(context, uuid, columns_to_join,
                                                use_slave=use_slave)
@@ -528,7 +535,7 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
     @base.remotable_classmethod
     def get_by_id(cls, context, inst_id, expected_attrs=None):
         if expected_attrs is None:
-            expected_attrs = ['info_cache', 'security_groups']
+            expected_attrs = ['info_cache']
         columns_to_join = _expected_cols(expected_attrs)
         db_inst = db.instance_get(context, inst_id,
                                   columns_to_join=columns_to_join)
@@ -544,6 +551,21 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
             raise exception.ObjectActionError(action='create',
                                               reason='already deleted')
         updates = self.obj_get_changes()
+        version = versionutils.convert_version_to_tuple(self.VERSION)
+
+        if 'node' in updates and 'compute_id' not in updates:
+            # NOTE(danms): This is not really the best idea, as we should try
+            # not to have different behavior based on the version of the
+            # object. However, this exception helps us find cases in testing
+            # where these may not be updated together. We can remove this
+            # later.
+            if version >= (2, 8):
+                raise exception.ObjectActionError(
+                    ('Instance is being created with node (%r) '
+                     'but not compute_id') % updates['node'])
+            else:
+                LOG.warning('Instance is being created with node %r but '
+                            'no compute_id', updates['node'])
 
         # NOTE(danms): We know because of the check above that deleted
         # is either unset or false. Since we need to avoid passing False
@@ -554,10 +576,6 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
         expected_attrs = [attr for attr in INSTANCE_DEFAULT_FIELDS
                           if attr in updates]
 
-        # TODO(stephenfin): Remove this as it's related to nova-network
-        if 'security_groups' in updates:
-            updates['security_groups'] = [x.name for x in
-                                          updates['security_groups']]
         if 'info_cache' in updates:
             updates['info_cache'] = {
                 'network_info': updates['info_cache'].network_info.json()
@@ -576,6 +594,7 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
                 pci_requests.to_json())
         else:
             updates['extra']['pci_requests'] = None
+            updates['extra']['pci_devices'] = None
         device_metadata = updates.pop('device_metadata', None)
         expected_attrs.append('device_metadata')
         if device_metadata:
@@ -625,15 +644,25 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
                 resources.obj_to_primitive())
         else:
             updates['extra']['resources'] = None
+
+        # Initially all instances have no migration context, so avoid us
+        # trying to lazy-load it to check.
+        updates['extra']['migration_context'] = None
+
         db_inst = db.instance_create(self._context, updates)
         self._from_db_object(self._context, self, db_inst, expected_attrs)
+
+        if ('pci_devices' in updates['extra'] and
+                updates['extra']['pci_devices'] is None):
+            self.pci_devices = None
+        self.migration_context = None
 
         # NOTE(danms): The EC2 ids are created on their first load. In order
         # to avoid them being missing and having to be loaded later, we
         # load them once here on create now that the instance record is
         # created.
         self._load_ec2_ids()
-        self.obj_reset_changes(['ec2_ids'])
+        self.obj_reset_changes(['ec2_ids', 'pci_devices', 'migration_context'])
 
     @base.remotable
     def destroy(self, hard_delete=False):
@@ -666,11 +695,9 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
 
     # TODO(stephenfin): Remove this as it's related to nova-network
     def _save_security_groups(self, context):
-        security_groups = self.security_groups or []
-        for secgroup in security_groups:
-            with secgroup.obj_alternate_context(context):
-                secgroup.save()
-        self.security_groups.obj_reset_changes()
+        # NOTE(stephenfin): We no longer bother saving these since they
+        # shouldn't be created in the first place
+        pass
 
     def _save_fault(self, context):
         # NOTE(danms): I don't think we need to worry about this, do we?
@@ -777,6 +804,21 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
         self._extra_values_to_save = {}
         updates = {}
         changes = self.obj_what_changed()
+
+        version = versionutils.convert_version_to_tuple(self.VERSION)
+        if 'node' in changes and 'compute_id' not in changes:
+            # NOTE(danms): This is not really the best idea, as we should try
+            # not to have different behavior based on the version of the
+            # object. However, this exception helps us find cases in testing
+            # where these may not be updated together. We can remove this
+            # later.
+            if version >= (2, 8):
+                raise exception.ObjectActionError(
+                    ('Instance.node is being updated (%r) '
+                     'but compute_id is not') % self.node)
+            else:
+                LOG.warning('Instance %s node is being updated to %r but '
+                            'compute_id is not', self.uuid, self.node)
 
         for field in self.fields:
             # NOTE(danms): For object fields, we construct and call a
@@ -959,11 +1001,6 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
     def _load_ec2_ids(self):
         self.ec2_ids = objects.EC2Ids.get_by_instance(self._context, self)
 
-    # TODO(stephenfin): Remove this as it's related to nova-network
-    def _load_security_groups(self):
-        self.security_groups = objects.SecurityGroupList.get_by_instance(
-            self._context, self)
-
     def _load_pci_devices(self):
         self.pci_devices = objects.PciDeviceList.get_by_instance_uuid(
             self._context, self.uuid)
@@ -1085,9 +1122,15 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
         if numa_topology is not None:
             self.numa_topology = numa_topology.clear_host_pinning()
 
+    @base.lazy_load_counter
     def obj_load_attr(self, attrname):
         # NOTE(danms): We can't lazy-load anything without a context and a uuid
         if not self._context:
+            if 'uuid' in self:
+                LOG.debug(
+                    "Lazy-load of '%s' attempted by orphaned instance",
+                    attrname, instance=self
+                )
             raise exception.OrphanedObjectError(method='obj_load_attr',
                                                 objtype=self.obj_name())
         if 'uuid' not in self:
@@ -1144,7 +1187,7 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
         elif attrname == 'resources':
             return self._load_resources()
         elif attrname == 'security_groups':
-            self._load_security_groups()
+            self.security_groups = objects.SecurityGroupList()
         elif attrname == 'pci_devices':
             self._load_pci_devices()
         elif 'flavor' in attrname:
@@ -1225,6 +1268,46 @@ class Instance(base.NovaPersistentObject, base.NovaObject,
             pci_req for pci_req in self.pci_requests.requests
             if pci_req.request_id != pci_device.request_id]
 
+    def get_pci_devices(
+        self,
+        source: ty.Optional[int] = None,
+        request_id: ty.Optional[str] = None,
+    ) -> ty.List["objects.PciDevice"]:
+        """Return the PCI devices allocated to the instance
+
+        :param source: Filter by source. It can be
+            InstancePCIRequest.FLAVOR_ALIAS or InstancePCIRequest.NEUTRON_PORT
+            or None. None means returns devices from both type of requests.
+        :param request_id: Filter by PciDevice.request_id. None means do not
+            filter by request_id.
+        :return: a list of matching PciDevice objects
+        """
+        if not self.pci_devices:
+            # return early to avoid an extra lazy load on self.pci_requests
+            # if there are no devices allocated to be filtered
+            return []
+
+        devs = self.pci_devices.objects
+
+        if request_id is not None:
+            devs = [dev for dev in devs if dev.request_id == request_id]
+
+        if source is not None:
+            # NOTE(gibi): this happens to work for the old requests when the
+            # request has request_id None and therefore the device allocated
+            # due to that request has request_id None too, so they will be
+            # mapped via the None key.
+            req_id_to_req = {
+                req.request_id: req for req in self.pci_requests.requests
+            }
+            devs = [
+                dev
+                for dev in devs
+                if (req_id_to_req[dev.request_id].source == source)
+            ]
+
+        return devs
+
 
 def _make_instance_list(context, inst_list, db_inst_list, expected_attrs):
     get_fault = expected_attrs and 'fault' in expected_attrs
@@ -1254,17 +1337,41 @@ def _make_instance_list(context, inst_list, db_inst_list, expected_attrs):
 
 
 @db.pick_context_manager_writer
-def populate_missing_availability_zones(context, count):
+def populate_missing_availability_zones(context, max_count):
     # instances without host have no reasonable AZ to set
     not_empty_host = models.Instance.host != None  # noqa E711
     instances = (context.session.query(models.Instance).
         filter(not_empty_host).
-        filter_by(availability_zone=None).limit(count).all())
+        filter_by(availability_zone=None).limit(max_count).all())
     count_all = len(instances)
     count_hit = 0
     for instance in instances:
         az = avail_zone.get_instance_availability_zone(context, instance)
         instance.availability_zone = az
+        instance.save(context.session)
+        count_hit += 1
+    return count_all, count_hit
+
+
+@db.pick_context_manager_writer
+def populate_instance_compute_id(context, max_count):
+    instances = (context.session.query(models.Instance).
+        filter(models.Instance.compute_id == None).  # noqa E711
+        limit(max_count).all())
+    count_all = count_hit = 0
+    rd_context = nova_context.get_admin_context(read_deleted='yes')
+    for instance in instances:
+        count_all += 1
+        try:
+            node = objects.ComputeNode.get_by_host_and_nodename(rd_context,
+                                                                instance.host,
+                                                                instance.node)
+        except exception.ComputeHostNotFound:
+            LOG.error('Unable to migrate instance because host %s with '
+                      'node %s not found', instance.host, instance.node,
+                      instance=instance)
+            continue
+        instance.compute_id = node.id
         instance.save(context.session)
         count_hit += 1
     return count_all, count_hit
@@ -1442,17 +1549,12 @@ class InstanceList(base.ObjectListBase, base.NovaObject):
     # TODO(stephenfin): Remove this as it's related to nova-network
     @base.remotable_classmethod
     def get_by_security_group_id(cls, context, security_group_id):
-        db_secgroup = db.security_group_get(
-            context, security_group_id,
-            columns_to_join=['instances.info_cache',
-                             'instances.system_metadata'])
-        return _make_instance_list(context, cls(), db_secgroup['instances'],
-                                   ['info_cache', 'system_metadata'])
+        raise NotImplementedError()
 
     # TODO(stephenfin): Remove this as it's related to nova-network
     @classmethod
     def get_by_security_group(cls, context, security_group):
-        return cls.get_by_security_group_id(context, security_group.id)
+        raise NotImplementedError()
 
     # TODO(stephenfin): Remove this as it's related to nova-network
     @base.remotable_classmethod

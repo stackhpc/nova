@@ -12,8 +12,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
 from lxml import etree
-import mock
 from oslo_utils import uuidutils
 
 from nova.objects import fields as obj_fields
@@ -205,7 +206,7 @@ class FakeLibvirtTests(test.NoDBTestCase):
         self.assertFalse(dom.isActive(), 'Defined domain was running.')
         dom.createWithFlags(0)
         self.assertTrue(dom.isActive(),
-                        'Domain wasn\'t running after createWithFlags')
+                        "Domain wasn't running after createWithFlags")
 
     def test_managedSave(self):
         uuid = uuidutils.generate_uuid()

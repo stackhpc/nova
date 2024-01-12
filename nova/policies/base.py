@@ -37,40 +37,25 @@ DEPRECATED_ADMIN_OR_OWNER_POLICY = policy.DeprecatedRule(
     deprecated_since='21.0.0'
 )
 
-# TODO(gmann): # Special string ``system_scope:all`` is added for system
-# scoped policies for backwards compatibility where ``nova.conf [oslo_policy]
-# enforce_scope = False``.
-# Otherwise, this might open up APIs to be more permissive unintentionally if a
-# deployment isn't enforcing scope. For example, the 'list all servers'
-# policy will be System Scoped Reader with ``role:reader`` and
-# scope_type=['system'] Until enforce_scope=True by default, it would
-# be possible for users with the ``reader`` role on a project to access the
-# 'list all servers' API. Once nova defaults ``nova.conf [oslo_policy]
-# enforce_scope=True``, the ``system_scope:all`` bits of these check strings
-# can be removed since that will be handled automatically by scope_types in
-# oslo.policy's RuleDefault objects.
-SYSTEM_ADMIN = 'rule:system_admin_api'
-SYSTEM_READER = 'rule:system_reader_api'
-PROJECT_ADMIN = 'rule:project_admin_api'
+ADMIN = 'rule:context_is_admin'
 PROJECT_MEMBER = 'rule:project_member_api'
 PROJECT_READER = 'rule:project_reader_api'
-PROJECT_MEMBER_OR_SYSTEM_ADMIN = 'rule:system_admin_or_owner'
-PROJECT_READER_OR_SYSTEM_READER = 'rule:system_or_project_reader'
+PROJECT_MEMBER_OR_ADMIN = 'rule:project_member_or_admin'
+PROJECT_READER_OR_ADMIN = 'rule:project_reader_or_admin'
 
-# NOTE(gmann): Below is the mapping of new roles and scope_types
-# with legacy roles::
+# NOTE(gmann): Below is the mapping of new roles with legacy roles::
 
-# Legacy Rule        |    New Rules                     |Operation |scope_type|
-# -------------------+----------------------------------+----------+-----------
-#                    |-> SYSTEM_ADMIN                   |Global    | [system]
-# RULE_ADMIN_API     |                                   Write
-#                    |-> SYSTEM_READER                  |Global    | [system]
-#                    |                                  |Read      |
-#
-#                    |-> PROJECT_MEMBER_OR_SYSTEM_ADMIN |Project   | [system,
-# RULE_ADMIN_OR_OWNER|                                  |Write     |  project]
-#                    |-> PROJECT_READER_OR_SYSTEM_READER|Project   | [system,
-#                                                       |Read      |  project]
+# Legacy Rule        |    New Rules              |Operation       |scope_type|
+# -------------------+---------------------------+----------------+-----------
+# RULE_ADMIN_API     |-> ADMIN                   |Global resource | [project]
+#                    |                           |Write & Read    |
+# -------------------+---------------------------+----------------+-----------
+#                    |-> ADMIN                   |Project admin   | [project]
+#                    |                           |level operation |
+# RULE_ADMIN_OR_OWNER|-> PROJECT_MEMBER_OR_ADMIN |Project resource| [project]
+#                    |                           |Write           |
+#                    |-> PROJECT_READER_OR_ADMIN |Project resource| [project]
+#                    |                           |Read            |
 
 # NOTE(johngarbutt) The base rules here affect so many APIs the list
 # of related API operations has not been populated. It would be
@@ -88,7 +73,8 @@ rules = [
     policy.RuleDefault(
         "context_is_admin",
         "role:admin",
-        "Decides what is required for the 'is_admin:True' check to succeed."),
+        "Decides what is required for the 'is_admin:True' check to succeed.",
+        deprecated_rule=DEPRECATED_ADMIN_POLICY),
     policy.RuleDefault(
         "admin_or_owner",
         "is_admin:True or project_id:%(project_id)s",
@@ -104,21 +90,6 @@ rules = [
         deprecated_reason=DEPRECATED_REASON,
         deprecated_since='21.0.0'),
     policy.RuleDefault(
-        name="system_admin_api",
-        check_str='role:admin and system_scope:all',
-        description="Default rule for System Admin APIs.",
-        deprecated_rule=DEPRECATED_ADMIN_POLICY),
-    policy.RuleDefault(
-        name="system_reader_api",
-        check_str="role:reader and system_scope:all",
-        description="Default rule for System level read only APIs.",
-        deprecated_rule=DEPRECATED_ADMIN_POLICY),
-    policy.RuleDefault(
-        "project_admin_api",
-        "role:admin and project_id:%(project_id)s",
-        "Default rule for Project level admin APIs.",
-        deprecated_rule=DEPRECATED_ADMIN_POLICY),
-    policy.RuleDefault(
         "project_member_api",
         "role:member and project_id:%(project_id)s",
         "Default rule for Project level non admin APIs.",
@@ -126,16 +97,17 @@ rules = [
     policy.RuleDefault(
         "project_reader_api",
         "role:reader and project_id:%(project_id)s",
-        "Default rule for Project level read only APIs."),
-    policy.RuleDefault(
-        name="system_admin_or_owner",
-        check_str="rule:system_admin_api or rule:project_member_api",
-        description="Default rule for System admin+owner APIs.",
+        "Default rule for Project level read only APIs.",
         deprecated_rule=DEPRECATED_ADMIN_OR_OWNER_POLICY),
     policy.RuleDefault(
-        "system_or_project_reader",
-        "rule:system_reader_api or rule:project_reader_api",
-        "Default rule for System+Project read only APIs.",
+        "project_member_or_admin",
+        "rule:project_member_api or rule:context_is_admin",
+        "Default rule for Project Member or admin APIs.",
+        deprecated_rule=DEPRECATED_ADMIN_OR_OWNER_POLICY),
+    policy.RuleDefault(
+        "project_reader_or_admin",
+        "rule:project_reader_api or rule:context_is_admin",
+        "Default rule for Project reader or admin APIs.",
         deprecated_rule=DEPRECATED_ADMIN_OR_OWNER_POLICY)
 ]
 

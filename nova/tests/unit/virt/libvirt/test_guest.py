@@ -14,7 +14,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from oslo_service import fixture as service_fixture
 from oslo_utils import encodeutils
 
@@ -259,6 +260,84 @@ class GuestTestCase(test.NoDBTestCase):
         self.assertEqual('kvm', result.virt_type)
         self.assertEqual('fake', result.name)
 
+    def test_get_device_by_alias(self):
+        xml = """
+<domain type='qemu'>
+  <name>QEMUGuest1</name>
+  <uuid>c7a5fdbd-edaf-9455-926a-d65c16db1809</uuid>
+  <memory unit='KiB'>219136</memory>
+  <currentMemory unit='KiB'>219136</currentMemory>
+  <vcpu placement='static'>1</vcpu>
+  <os>
+    <type arch='i686' machine='pc'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>/usr/bin/qemu</emulator>
+    <disk type='block' device='disk'>
+      <alias name="qemu-disk1"/>
+      <driver name='qemu' type='raw'/>
+      <source dev='/dev/HostVG/QEMUGuest2'/>
+      <target dev='hda' bus='ide'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='0'/>
+    </disk>
+    <disk type='network' device='disk'>
+      <alias name="ua-netdisk"/>
+      <driver name='qemu' type='raw'/>
+      <auth username='myname'>
+        <secret type='iscsi' usage='mycluster_myname'/>
+      </auth>
+      <source protocol='iscsi' name='iqn.1992-01.com.example'>
+        <host name='example.org' port='6000'/>
+      </source>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='network' device='disk'>
+      <driver name='qemu' type='raw'/>
+      <source protocol='iscsi' name='iqn.1992-01.com.example/1'>
+        <host name='example.org' port='6000'/>
+      </source>
+      <target dev='vdb' bus='virtio'/>
+    </disk>
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source>
+        <address domain='0x0000' bus='0x06' slot='0x12' function='0x5'/>
+      </source>
+    </hostdev>
+    <hostdev mode='subsystem' type='pci' managed='yes'>
+      <source>
+        <address domain='0x0000' bus='0x06' slot='0x12' function='0x6'/>
+      </source>
+    </hostdev>
+    <interface type="bridge">
+      <mac address="fa:16:3e:f9:af:ae"/>
+      <model type="virtio"/>
+      <driver name="qemu"/>
+      <source bridge="qbr84008d03-11"/>
+      <target dev="tap84008d03-11"/>
+    </interface>
+    <controller type='usb' index='0'/>
+    <controller type='pci' index='0' model='pci-root'/>
+    <memballoon model='none'/>
+  </devices>
+</domain>
+"""
+        self.domain.XMLDesc.return_value = xml
+
+        dev = self.guest.get_device_by_alias('qemu-disk1')
+        self.assertIsInstance(dev, vconfig.LibvirtConfigGuestDisk)
+        self.assertEqual('hda', dev.target_dev)
+
+        dev = self.guest.get_device_by_alias('ua-netdisk')
+        self.assertIsInstance(dev, vconfig.LibvirtConfigGuestDisk)
+        self.assertEqual('vda', dev.target_dev)
+
+        self.assertIsNone(self.guest.get_device_by_alias('nope'))
+
     def test_get_devices(self):
         xml = """
 <domain type='qemu'>
@@ -403,9 +482,21 @@ class GuestTestCase(test.NoDBTestCase):
         self.assertIsNotNone(
             self.guest.get_interface_by_cfg(
                 cfg, from_persistent_config=True))
+        cfg = vconfig.LibvirtConfigGuestInterface()
+        # NOTE(sean-k-mooney): a default constructed object is not valid
+        # to pass to get_interface_by_cfg as so we just modify the xml to
+        # make it not match
+        cfg.parse_str("""
+            <interface type="wont_match">
+              <mac address="fa:16:3e:f9:af:ae"/>
+              <model type="virtio"/>
+              <driver name="qemu"/>
+              <source bridge="qbr84008d03-11"/>
+              <target dev="tap84008d03-11"/>
+              </interface>""")
         self.assertIsNone(
             self.guest.get_interface_by_cfg(
-                vconfig.LibvirtConfigGuestInterface(),
+                cfg,
                 from_persistent_config=True))
         self.domain.XMLDesc.assert_has_calls(
             [
@@ -1040,3 +1131,25 @@ class JobInfoTestCase(test.NoDBTestCase):
 
         mock_stats.assert_called_once_with()
         mock_info.assert_called_once_with()
+
+    @mock.patch.object(fakelibvirt.virDomain, "jobInfo")
+    @mock.patch.object(fakelibvirt.virDomain, "jobStats")
+    def test_job_stats_no_ram(self, mock_stats, mock_info):
+        mock_stats.side_effect = fakelibvirt.make_libvirtError(
+            fakelibvirt.libvirtError,
+            "internal error: migration was active, but no RAM info was set",
+            error_code=fakelibvirt.VIR_ERR_INTERNAL_ERROR,
+            error_message="migration was active, but no RAM info was set")
+
+        info = self.guest.get_job_info()
+
+        self.assertIsInstance(info, libvirt_guest.JobInfo)
+        self.assertEqual(fakelibvirt.VIR_DOMAIN_JOB_NONE, info.type)
+        self.assertEqual(0, info.time_elapsed)
+        self.assertEqual(0, info.time_remaining)
+        self.assertEqual(0, info.memory_total)
+        self.assertEqual(0, info.memory_processed)
+        self.assertEqual(0, info.memory_remaining)
+
+        mock_stats.assert_called_once_with()
+        self.assertFalse(mock_info.called)

@@ -32,6 +32,73 @@ from nova.db import types
 
 CONF = cfg.CONF
 
+# NOTE(stephenfin): This is a list of fields that have been removed from
+# various SQLAlchemy models but which still exist in the underlying tables. Our
+# upgrade policy dictates that we remove fields from models at least one cycle
+# before we remove the column from the underlying table. Not doing so would
+# prevent us from applying the new database schema before rolling out any of
+# the new code since the old code could attempt to access data in the removed
+# columns. Alembic identifies this temporary mismatch between the models and
+# underlying tables and attempts to resolve it. Tell it instead to ignore these
+# until we're ready to remove them ourselves.
+REMOVED_COLUMNS = {
+    ('instances', 'internal_id'),
+    ('instance_extra', 'vpmems'),
+}
+
+# NOTE(stephenfin): A list of foreign key constraints that were removed when
+# the column they were covering was removed.
+REMOVED_FKEYS = []
+
+# NOTE(stephenfin): A list of entire models that have been removed.
+REMOVED_TABLES = {
+    # Tables that were moved to the API database in Newton. The models
+    # were removed in Y and the tables can be dropped in Z or later
+    'aggregate_hosts',
+    'aggregate_metadata',
+    'aggregates',
+    'allocations',
+    'instance_group_member',
+    'instance_group_policy',
+    'instance_groups',
+    'instance_type_extra_specs',
+    'instance_type_projects',
+    'instance_types',
+    'inventories',
+    'key_pairs',
+    'resource_provider_aggregates',
+    'resource_providers',
+
+    # Tables for the removed XenAPI virt driver. The models were
+    # removed in Y and the tables can be dropped in Z or later
+    'agent_builds',
+    'bw_usage_cache',
+    'console_pools',
+    'consoles',
+
+    # Tables for the removed cells v1 feature. The model was removed in
+    # Y and the table can be dropped in Z or later
+    'cells',
+
+    # Tables for the removed volume snapshot feature. The model was
+    # removed in Y and the table can be dropped in Z or later
+    'snapshots',
+
+    # Tables for the removed in-tree EC2 API. The models were removed
+    # in Y and the table can be dropped in Z or later
+    'snapshot_id_mappings',
+    'volume_id_mappings',
+
+    # Tables for the removed nova-network feature. The models were
+    # removed in Y and the tables can be dropped in Z or later
+    'dns_domains',
+    'fixed_ips',
+    'floating_ips',
+    'networks',
+    'provider_fw_rules',
+    'security_group_default_rules',
+}
+
 # we don't configure 'cls' since we have models that don't use the
 # TimestampMixin
 BASE = declarative.declarative_base()
@@ -94,8 +161,8 @@ class Service(BASE, NovaBase, models.SoftDeleteMixin):
     version = sa.Column(sa.Integer, default=0)
 
     instance = orm.relationship(
-        "Instance",
-        backref='services',
+        'Instance',
+        back_populates='services',
         primaryjoin='and_(Service.host == Instance.host,'
                     'Service.binary == "nova-compute",'
                     'Instance.deleted == 0)',
@@ -199,7 +266,6 @@ class Instance(BASE, NovaBase, models.SoftDeleteMixin):
     """Represents a guest VM."""
     __tablename__ = 'instances'
     __table_args__ = (
-        sa.Index('uuid', 'uuid', unique=True),
         sa.Index('instances_project_id_idx', 'project_id'),
         sa.Index('instances_project_id_deleted_idx',
               'project_id', 'deleted'),
@@ -219,6 +285,8 @@ class Instance(BASE, NovaBase, models.SoftDeleteMixin):
               'deleted', 'created_at'),
         sa.Index('instances_updated_at_project_id_idx',
               'updated_at', 'project_id'),
+        sa.Index('instances_compute_id_deleted_idx',
+              'compute_id', 'deleted'),
         schema.UniqueConstraint('uuid', name='uniq_instances0uuid'),
     )
     injected_files = []
@@ -279,6 +347,10 @@ class Instance(BASE, NovaBase, models.SoftDeleteMixin):
     # To identify the "ComputeNode" which the instance resides in.
     # This equals to ComputeNode.hypervisor_hostname.
     node = sa.Column(sa.String(255))
+    # This identifies the ComputeNode object that this instance resides
+    # on and should be equivalent to the one referenced by the 'node'
+    # field above.
+    compute_id = sa.Column(sa.BigInteger())
 
     # *not* flavorid, this is the internal primary_key
     instance_type_id = sa.Column(sa.Integer)
@@ -353,6 +425,96 @@ class Instance(BASE, NovaBase, models.SoftDeleteMixin):
 
     hidden = sa.Column(sa.Boolean, default=False)
 
+    block_device_mapping = orm.relationship(
+        'BlockDeviceMapping',
+        back_populates='instance',
+        primaryjoin=(
+            'and_(BlockDeviceMapping.instance_uuid == Instance.uuid, '
+            'BlockDeviceMapping.deleted == 0)'
+        ),
+    )
+    console_auth_tokens = orm.relationship(
+        'ConsoleAuthToken',
+        back_populates='instance',
+        foreign_keys='ConsoleAuthToken.instance_uuid',
+        primaryjoin=(
+            'and_(Instance.uuid == ConsoleAuthToken.instance_uuid,'
+            'Instance.deleted == 0)'
+        ),
+    )
+    extra = orm.relationship(
+        'InstanceExtra',
+        back_populates='instance',
+        uselist=False,
+    )
+    info_cache = orm.relationship(
+        'InstanceInfoCache',
+        back_populates='instance',
+        uselist=False,
+    )
+    pci_devices = orm.relationship(
+        'PciDevice',
+        back_populates='instance',
+        foreign_keys='PciDevice.instance_uuid',
+        primaryjoin=(
+            'and_(Instance.uuid == PciDevice.instance_uuid,'
+            'PciDevice.deleted == 0)'
+        ),
+    )
+    services = orm.relationship(
+        'Service',
+        back_populates='instance',
+        primaryjoin=(
+            'and_(Instance.host == Service.host,'
+            'Service.binary == "nova-compute",'
+            'Instance.deleted == 0)'
+        ),
+        foreign_keys='Service.host',
+    )
+    security_groups = orm.relationship(
+        'SecurityGroup',
+        secondary='security_group_instance_association',
+        back_populates='instances',
+        primaryjoin=(
+            'and_('
+            'SecurityGroupInstanceAssociation.instance_uuid == Instance.uuid,'
+            # (anthony) the condition below shouldn't be necessary now that the
+            # association is being marked as deleted.  However, removing this
+            # may cause existing deployments to choke, so I'm leaving it
+            'Instance.deleted == 0)'
+        ),
+        secondaryjoin=(
+            'and_('
+            'SecurityGroup.id == SecurityGroupInstanceAssociation.security_group_id,'  # noqa: E501
+            'SecurityGroupInstanceAssociation.deleted == 0,'
+            'SecurityGroup.deleted == 0)'
+        ),
+    )
+    system_metadata = orm.relationship(
+        'InstanceSystemMetadata',
+        back_populates='instance',
+    )
+    tags = orm.relationship(
+        'Tag',
+        back_populates='instance',
+        primaryjoin=(
+            'and_(Instance.uuid == Tag.resource_id,Instance.deleted == 0)'
+        ),
+        foreign_keys='Tag.resource_id',
+    )
+
+
+# NOTE(stephenfin): https://github.com/sqlalchemy/sqlalchemy/discussions/8619
+Instance.metadata = orm.relationship(
+    'InstanceMetadata',
+    back_populates='instance',
+    foreign_keys='InstanceMetadata.instance_uuid',
+    primaryjoin=(
+        'and_(Instance.uuid == InstanceMetadata.instance_uuid,'
+        'InstanceMetadata.deleted == 0)'
+    ),
+)
+
 
 class InstanceInfoCache(BASE, NovaBase, models.SoftDeleteMixin):
     """Represents a cache of information about an instance
@@ -370,7 +532,7 @@ class InstanceInfoCache(BASE, NovaBase, models.SoftDeleteMixin):
     instance_uuid = sa.Column(sa.String(36), sa.ForeignKey('instances.uuid'),
                            nullable=False)
     instance = orm.relationship(Instance,
-                            backref=orm.backref('info_cache', uselist=False),
+                            back_populates='info_cache',
                             foreign_keys=instance_uuid,
                             primaryjoin=instance_uuid == Instance.uuid)
 
@@ -394,43 +556,9 @@ class InstanceExtra(BASE, NovaBase, models.SoftDeleteMixin):
     # and can be removed in the future release.
     resources = orm.deferred(sa.Column(sa.Text))
     instance = orm.relationship(Instance,
-                            backref=orm.backref('extra',
-                                                uselist=False),
+                            back_populates='extra',
                             foreign_keys=instance_uuid,
                             primaryjoin=instance_uuid == Instance.uuid)
-
-
-# NOTE(alaski): This table exists in the nova_api database and its usage here
-# is deprecated.
-class InstanceTypes(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents possible flavors for instances.
-
-    Note: instance_type and flavor are synonyms and the term instance_type is
-    deprecated and in the process of being removed.
-    """
-    __tablename__ = "instance_types"
-
-    __table_args__ = (
-        schema.UniqueConstraint("flavorid", "deleted",
-                                name="uniq_instance_types0flavorid0deleted"),
-        schema.UniqueConstraint("name", "deleted",
-                                name="uniq_instance_types0name0deleted")
-    )
-
-    # Internal only primary key/id
-    id = sa.Column(sa.Integer, primary_key=True)
-    name = sa.Column(sa.String(255))
-    memory_mb = sa.Column(sa.Integer, nullable=False)
-    vcpus = sa.Column(sa.Integer, nullable=False)
-    root_gb = sa.Column(sa.Integer)
-    ephemeral_gb = sa.Column(sa.Integer)
-    # Public facing id will be renamed public_id
-    flavorid = sa.Column(sa.String(255))
-    swap = sa.Column(sa.Integer, nullable=False, default=0)
-    rxtx_factor = sa.Column(sa.Float, default=1)
-    vcpu_weight = sa.Column(sa.Integer)
-    disabled = sa.Column(sa.Boolean, default=False)
-    is_public = sa.Column(sa.Boolean, default=True)
 
 
 class Quota(BASE, NovaBase, models.SoftDeleteMixin):
@@ -553,32 +681,6 @@ class Reservation(BASE, NovaBase, models.SoftDeleteMixin):
                          'QuotaUsage.deleted == 0)')
 
 
-# TODO(macsz) This class can be removed. It might need a DB migration to drop
-# this.
-class Snapshot(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents a block storage device that can be attached to a VM."""
-    __tablename__ = 'snapshots'
-    __table_args__ = ()
-    id = sa.Column(sa.String(36), primary_key=True, nullable=False)
-    deleted = sa.Column(sa.String(36), default="")
-
-    @property
-    def volume_name(self):
-        return CONF.volume_name_template % self.volume_id
-
-    user_id = sa.Column(sa.String(255))
-    project_id = sa.Column(sa.String(255))
-
-    volume_id = sa.Column(sa.String(36), nullable=False)
-    status = sa.Column(sa.String(255))
-    progress = sa.Column(sa.String(255))
-    volume_size = sa.Column(sa.Integer)
-    scheduled_at = sa.Column(sa.DateTime)
-
-    display_name = sa.Column(sa.String(255))
-    display_description = sa.Column(sa.String(255))
-
-
 class BlockDeviceMapping(BASE, NovaBase, models.SoftDeleteMixin):
     """Represents block device mapping that is defined by EC2."""
     __tablename__ = "block_device_mapping"
@@ -603,7 +705,7 @@ class BlockDeviceMapping(BASE, NovaBase, models.SoftDeleteMixin):
     # transition period first.
     uuid = sa.Column(sa.String(36))
     instance = orm.relationship(Instance,
-                            backref=orm.backref('block_device_mapping'),
+                            back_populates='block_device_mapping',
                             foreign_keys=instance_uuid,
                             primaryjoin='and_(BlockDeviceMapping.'
                                               'instance_uuid=='
@@ -646,7 +748,14 @@ class BlockDeviceMapping(BASE, NovaBase, models.SoftDeleteMixin):
 
     attachment_id = sa.Column(sa.String(36))
 
+    encrypted = sa.Column(sa.Boolean, default=False)
+    encryption_secret_uuid = sa.Column(sa.String(36))
+    encryption_format = sa.Column(sa.String(128))
+    encryption_options = sa.Column(sa.String(4096))
 
+
+# TODO(stephenfin): Remove once we drop the security_groups field from the
+# Instance table. Until then, this is tied to the SecurityGroup table
 class SecurityGroupInstanceAssociation(BASE, NovaBase, models.SoftDeleteMixin):
     __tablename__ = 'security_group_instance_association'
     __table_args__ = (
@@ -659,6 +768,8 @@ class SecurityGroupInstanceAssociation(BASE, NovaBase, models.SoftDeleteMixin):
     instance_uuid = sa.Column(sa.String(36), sa.ForeignKey('instances.uuid'))
 
 
+# TODO(stephenfin): Remove once we drop the security_groups field from the
+# Instance table
 class SecurityGroup(BASE, NovaBase, models.SoftDeleteMixin):
     """Represents a security group."""
     __tablename__ = 'security_groups'
@@ -667,7 +778,7 @@ class SecurityGroup(BASE, NovaBase, models.SoftDeleteMixin):
                                 name='uniq_security_groups0project_id0'
                                      'name0deleted'),
     )
-    id = sa.Column(sa.Integer, primary_key=True)
+    id = sa.Column(sa.Integer, primary_key = True)
 
     name = sa.Column(sa.String(255))
     description = sa.Column(sa.String(255))
@@ -675,8 +786,9 @@ class SecurityGroup(BASE, NovaBase, models.SoftDeleteMixin):
     project_id = sa.Column(sa.String(255))
 
     instances = orm.relationship(Instance,
-                             secondary="security_group_instance_association",
-                             primaryjoin='and_('
+                             back_populates='security_groups',
+                             secondary = "security_group_instance_association",
+                             primaryjoin = 'and_('
         'SecurityGroup.id == '
         'SecurityGroupInstanceAssociation.security_group_id,'
         'SecurityGroupInstanceAssociation.deleted == 0,'
@@ -686,12 +798,21 @@ class SecurityGroup(BASE, NovaBase, models.SoftDeleteMixin):
         # (anthony) the condition below shouldn't be necessary now that the
         # association is being marked as deleted.  However, removing this
         # may cause existing deployments to choke, so I'm leaving it
-        'Instance.deleted == 0)',
-                             backref='security_groups')
+        'Instance.deleted == 0)')
+
+    rules = orm.relationship(
+        'SecurityGroupIngressRule',
+        primaryjoin=(
+            'and_('
+            'SecurityGroupIngressRule.parent_group_id == SecurityGroup.id,'
+            'SecurityGroupIngressRule.deleted == 0)'
+        ),
+        back_populates='parent_group',
+    )
 
 
-# TODO(stephenfin): Remove this in the V release or later, once we're sure we
-# won't want it back (it's for nova-network, so we won't)
+# TODO(stephenfin): Remove once we drop the security_groups field from the
+# Instance table. Until then, this is tied to the SecurityGroup table
 class SecurityGroupIngressRule(BASE, NovaBase, models.SoftDeleteMixin):
     """Represents a rule in a security group."""
     __tablename__ = 'security_group_rules'
@@ -700,8 +821,9 @@ class SecurityGroupIngressRule(BASE, NovaBase, models.SoftDeleteMixin):
 
     parent_group_id = sa.Column(
         sa.Integer, sa.ForeignKey('security_groups.id'))
-    parent_group = orm.relationship("SecurityGroup", backref="rules",
-                                foreign_keys=parent_group_id,
+    parent_group = orm.relationship("SecurityGroup",
+                                back_populates="rules",
+                                foreign_keys=[parent_group_id],
                                 primaryjoin='and_('
         'SecurityGroupIngressRule.parent_group_id == SecurityGroup.id,'
         'SecurityGroupIngressRule.deleted == 0)')
@@ -715,57 +837,10 @@ class SecurityGroupIngressRule(BASE, NovaBase, models.SoftDeleteMixin):
     # granting access for.
     group_id = sa.Column(sa.Integer, sa.ForeignKey('security_groups.id'))
     grantee_group = orm.relationship("SecurityGroup",
-                                 foreign_keys=group_id,
+                                 foreign_keys=[group_id],
                                  primaryjoin='and_('
         'SecurityGroupIngressRule.group_id == SecurityGroup.id,'
         'SecurityGroupIngressRule.deleted == 0)')
-
-
-# TODO(stephenfin): Remove this in the V release or later, once we're sure we
-# won't want it back (it's for nova-network, so we won't)
-class SecurityGroupIngressDefaultRule(BASE, NovaBase, models.SoftDeleteMixin):
-    __tablename__ = 'security_group_default_rules'
-    __table_args__ = ()
-    id = sa.Column(sa.Integer, primary_key=True, nullable=False)
-    protocol = sa.Column(sa.String(5))  # "tcp", "udp" or "icmp"
-    from_port = sa.Column(sa.Integer)
-    to_port = sa.Column(sa.Integer)
-    cidr = sa.Column(types.CIDR())
-
-
-# TODO(stephenfin): Remove this in the V release or later, once we're sure we
-# won't want it back (it's for nova-network, so we won't)
-class ProviderFirewallRule(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents a rule in a security group."""
-    __tablename__ = 'provider_fw_rules'
-    __table_args__ = ()
-    id = sa.Column(sa.Integer, primary_key=True, nullable=False)
-
-    protocol = sa.Column(sa.String(5))  # "tcp", "udp", or "icmp"
-    from_port = sa.Column(sa.Integer)
-    to_port = sa.Column(sa.Integer)
-    cidr = sa.Column(types.CIDR())
-
-
-# NOTE(alaski): This table exists in the nova_api database and its usage here
-# is deprecated.
-class KeyPair(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents a public key pair for ssh / WinRM."""
-    __tablename__ = 'key_pairs'
-    __table_args__ = (
-        schema.UniqueConstraint("user_id", "name", "deleted",
-                                name="uniq_key_pairs0user_id0name0deleted"),
-    )
-    id = sa.Column(sa.Integer, primary_key=True, nullable=False)
-
-    name = sa.Column(sa.String(255), nullable=False)
-
-    user_id = sa.Column(sa.String(255))
-
-    fingerprint = sa.Column(sa.String(255))
-    public_key = sa.Column(types.MediumText())
-    type = sa.Column(sa.Enum('ssh', 'x509', name='keypair_types'),
-                  nullable=False, server_default='ssh')
 
 
 class Migration(BASE, NovaBase, models.SoftDeleteMixin):
@@ -779,6 +854,8 @@ class Migration(BASE, NovaBase, models.SoftDeleteMixin):
               'status'),
         sa.Index('migrations_uuid', 'uuid', unique=True),
         sa.Index('migrations_updated_at_idx', 'updated_at'),
+        sa.Index('migrations_dest_compute_id_deleted_idx',
+                 'dest_compute_id', 'deleted'),
     )
     id = sa.Column(sa.Integer, primary_key=True, nullable=False)
     # NOTE(tr3buchet): the ____compute variables are instance['host']
@@ -787,6 +864,8 @@ class Migration(BASE, NovaBase, models.SoftDeleteMixin):
     # nodes are equivalent to a compute node's 'hypervisor_hostname'
     source_node = sa.Column(sa.String(255))
     dest_node = sa.Column(sa.String(255))
+    # The ID of the ComputeNode that matches dest_node
+    dest_compute_id = sa.Column(sa.BigInteger())
     # NOTE(tr3buchet): dest_host, btw, is an ip address
     dest_host = sa.Column(sa.String(255))
     old_instance_type_id = sa.Column(sa.Integer())
@@ -816,60 +895,6 @@ class Migration(BASE, NovaBase, models.SoftDeleteMixin):
                                         '0)')
 
 
-# TODO(stephenfin): Remove this in the V release or later, once we're sure we
-# won't want it back (it's for nova-network, so we won't)
-class Network(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents a network."""
-    __tablename__ = 'networks'
-    __table_args__ = (
-        schema.UniqueConstraint("vlan", "deleted",
-                                name="uniq_networks0vlan0deleted"),
-       sa.Index('networks_bridge_deleted_idx', 'bridge', 'deleted'),
-       sa.Index('networks_host_idx', 'host'),
-       sa.Index('networks_project_id_deleted_idx', 'project_id', 'deleted'),
-       sa.Index('networks_uuid_project_id_deleted_idx', 'uuid',
-             'project_id', 'deleted'),
-       sa.Index('networks_vlan_deleted_idx', 'vlan', 'deleted'),
-       sa.Index('networks_cidr_v6_idx', 'cidr_v6')
-    )
-
-    id = sa.Column(sa.Integer, primary_key=True, nullable=False)
-    label = sa.Column(sa.String(255))
-
-    injected = sa.Column(sa.Boolean, default=False)
-    cidr = sa.Column(types.CIDR())
-    cidr_v6 = sa.Column(types.CIDR())
-    multi_host = sa.Column(sa.Boolean, default=False)
-
-    gateway_v6 = sa.Column(types.IPAddress())
-    netmask_v6 = sa.Column(types.IPAddress())
-    netmask = sa.Column(types.IPAddress())
-    bridge = sa.Column(sa.String(255))
-    bridge_interface = sa.Column(sa.String(255))
-    gateway = sa.Column(types.IPAddress())
-    broadcast = sa.Column(types.IPAddress())
-    dns1 = sa.Column(types.IPAddress())
-    dns2 = sa.Column(types.IPAddress())
-
-    vlan = sa.Column(sa.Integer)
-    vpn_public_address = sa.Column(types.IPAddress())
-    vpn_public_port = sa.Column(sa.Integer)
-    vpn_private_address = sa.Column(types.IPAddress())
-    dhcp_start = sa.Column(types.IPAddress())
-
-    rxtx_base = sa.Column(sa.Integer)
-
-    project_id = sa.Column(sa.String(255))
-    priority = sa.Column(sa.Integer)
-    host = sa.Column(sa.String(255))
-    uuid = sa.Column(sa.String(36))
-
-    mtu = sa.Column(sa.Integer)
-    dhcp_server = sa.Column(types.IPAddress())
-    enable_dhcp = sa.Column(sa.Boolean, default=True)
-    share_address = sa.Column(sa.Boolean, default=False)
-
-
 class VirtualInterface(BASE, NovaBase, models.SoftDeleteMixin):
     """Represents a virtual interface on an instance."""
     __tablename__ = 'virtual_interfaces'
@@ -888,149 +913,6 @@ class VirtualInterface(BASE, NovaBase, models.SoftDeleteMixin):
     tag = sa.Column(sa.String(255))
 
 
-# TODO(stephenfin): Remove this in the V release or later, once we're sure we
-# won't want it back (it's for nova-network, so we won't)
-class FixedIp(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents a fixed IP for an instance."""
-    __tablename__ = 'fixed_ips'
-    __table_args__ = (
-        schema.UniqueConstraint(
-            "address", "deleted", name="uniq_fixed_ips0address0deleted"),
-        sa.Index(
-            'fixed_ips_virtual_interface_id_fkey', 'virtual_interface_id'),
-        sa.Index('network_id', 'network_id'),
-        sa.Index('address', 'address'),
-        sa.Index('fixed_ips_instance_uuid_fkey', 'instance_uuid'),
-        sa.Index('fixed_ips_host_idx', 'host'),
-        sa.Index('fixed_ips_network_id_host_deleted_idx', 'network_id', 'host',
-              'deleted'),
-        sa.Index('fixed_ips_address_reserved_network_id_deleted_idx',
-              'address', 'reserved', 'network_id', 'deleted'),
-        sa.Index('fixed_ips_deleted_allocated_idx', 'address', 'deleted',
-              'allocated'),
-        sa.Index('fixed_ips_deleted_allocated_updated_at_idx', 'deleted',
-              'allocated', 'updated_at')
-    )
-    id = sa.Column(sa.Integer, primary_key=True)
-    address = sa.Column(types.IPAddress())
-    network_id = sa.Column(sa.Integer)
-    virtual_interface_id = sa.Column(sa.Integer)
-    instance_uuid = sa.Column(sa.String(36), sa.ForeignKey('instances.uuid'))
-    # associated means that a fixed_ip has its instance_id column set
-    # allocated means that a fixed_ip has its virtual_interface_id column set
-    # TODO(sshturm) add default in db
-    allocated = sa.Column(sa.Boolean, default=False)
-    # leased means dhcp bridge has leased the ip
-    # TODO(sshturm) add default in db
-    leased = sa.Column(sa.Boolean, default=False)
-    # TODO(sshturm) add default in db
-    reserved = sa.Column(sa.Boolean, default=False)
-    host = sa.Column(sa.String(255))
-    network = orm.relationship(Network,
-                           backref=orm.backref('fixed_ips'),
-                           foreign_keys=network_id,
-                           primaryjoin='and_('
-                                'FixedIp.network_id == Network.id,'
-                                'FixedIp.deleted == 0,'
-                                'Network.deleted == 0)')
-    instance = orm.relationship(Instance,
-                            foreign_keys=instance_uuid,
-                            primaryjoin='and_('
-                                'FixedIp.instance_uuid == Instance.uuid,'
-                                'FixedIp.deleted == 0,'
-                                'Instance.deleted == 0)')
-    virtual_interface = orm.relationship(VirtualInterface,
-                           backref=orm.backref('fixed_ips'),
-                           foreign_keys=virtual_interface_id,
-                           primaryjoin='and_('
-                                'FixedIp.virtual_interface_id == '
-                                'VirtualInterface.id,'
-                                'FixedIp.deleted == 0,'
-                                'VirtualInterface.deleted == 0)')
-
-
-# TODO(stephenfin): Remove this in the V release or later, once we're sure we
-# won't want it back (it's for nova-network, so we won't)
-class FloatingIp(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents a floating IP that dynamically forwards to a fixed IP."""
-    __tablename__ = 'floating_ips'
-    __table_args__ = (
-        schema.UniqueConstraint("address", "deleted",
-                                name="uniq_floating_ips0address0deleted"),
-        sa.Index('fixed_ip_id', 'fixed_ip_id'),
-        sa.Index('floating_ips_host_idx', 'host'),
-        sa.Index('floating_ips_project_id_idx', 'project_id'),
-        sa.Index('floating_ips_pool_deleted_fixed_ip_id_project_id_idx',
-              'pool', 'deleted', 'fixed_ip_id', 'project_id')
-    )
-    id = sa.Column(sa.Integer, primary_key=True)
-    address = sa.Column(types.IPAddress())
-    fixed_ip_id = sa.Column(sa.Integer)
-    project_id = sa.Column(sa.String(255))
-    host = sa.Column(sa.String(255))
-    auto_assigned = sa.Column(sa.Boolean, default=False)
-    # TODO(sshturm) add default in db
-    pool = sa.Column(sa.String(255))
-    interface = sa.Column(sa.String(255))
-    fixed_ip = orm.relationship(FixedIp,
-                            backref=orm.backref('floating_ips'),
-                            foreign_keys=fixed_ip_id,
-                            primaryjoin='and_('
-                                'FloatingIp.fixed_ip_id == FixedIp.id,'
-                                'FloatingIp.deleted == 0,'
-                                'FixedIp.deleted == 0)')
-
-
-# TODO(stephenfin): Remove in V or later
-class DNSDomain(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents a DNS domain with availability zone or project info."""
-    __tablename__ = 'dns_domains'
-    __table_args__ = (
-        sa.Index('dns_domains_project_id_idx', 'project_id'),
-        sa.Index('dns_domains_domain_deleted_idx', 'domain', 'deleted'),
-    )
-    deleted = sa.Column(sa.Boolean, default=False)
-    domain = sa.Column(sa.String(255), primary_key=True)
-    scope = sa.Column(sa.String(255))
-    availability_zone = sa.Column(sa.String(255))
-    project_id = sa.Column(sa.String(255))
-
-
-# TODO(stephenfin): Remove in V or later
-class ConsolePool(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents pool of consoles on the same physical node."""
-    __tablename__ = 'console_pools'
-    __table_args__ = (
-        schema.UniqueConstraint(
-            "host", "console_type", "compute_host", "deleted",
-            name="uniq_console_pools0host0console_type0compute_host0deleted"),
-    )
-    id = sa.Column(sa.Integer, primary_key=True)
-    address = sa.Column(types.IPAddress())
-    username = sa.Column(sa.String(255))
-    password = sa.Column(sa.String(255))
-    console_type = sa.Column(sa.String(255))
-    public_hostname = sa.Column(sa.String(255))
-    host = sa.Column(sa.String(255))
-    compute_host = sa.Column(sa.String(255))
-
-
-# TODO(stephenfin): Remove in V or later
-class Console(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents a console session for an instance."""
-    __tablename__ = 'consoles'
-    __table_args__ = (
-        sa.Index('consoles_instance_uuid_idx', 'instance_uuid'),
-    )
-    id = sa.Column(sa.Integer, primary_key=True)
-    instance_name = sa.Column(sa.String(255))
-    instance_uuid = sa.Column(sa.String(36), sa.ForeignKey('instances.uuid'))
-    password = sa.Column(sa.String(255))
-    port = sa.Column(sa.Integer)
-    pool_id = sa.Column(sa.Integer, sa.ForeignKey('console_pools.id'))
-    pool = orm.relationship(ConsolePool, backref=orm.backref('consoles'))
-
-
 class InstanceMetadata(BASE, NovaBase, models.SoftDeleteMixin):
     """Represents a user-provided metadata key/value pair for an instance."""
     __tablename__ = 'instance_metadata'
@@ -1041,12 +923,16 @@ class InstanceMetadata(BASE, NovaBase, models.SoftDeleteMixin):
     key = sa.Column(sa.String(255))
     value = sa.Column(sa.String(255))
     instance_uuid = sa.Column(sa.String(36), sa.ForeignKey('instances.uuid'))
-    instance = orm.relationship(Instance, backref="metadata",
-                            foreign_keys=instance_uuid,
-                            primaryjoin='and_('
-                                'InstanceMetadata.instance_uuid == '
-                                     'Instance.uuid,'
-                                'InstanceMetadata.deleted == 0)')
+
+    instance = orm.relationship(
+        Instance,
+        back_populates="metadata",
+        foreign_keys=instance_uuid,
+        primaryjoin=(
+            'and_(InstanceMetadata.instance_uuid == Instance.uuid,'
+            'InstanceMetadata.deleted == 0)'
+        ),
+    )
 
 
 class InstanceSystemMetadata(BASE, NovaBase, models.SoftDeleteMixin):
@@ -1062,199 +948,11 @@ class InstanceSystemMetadata(BASE, NovaBase, models.SoftDeleteMixin):
                            sa.ForeignKey('instances.uuid'),
                            nullable=False)
 
-    instance = orm.relationship(Instance, backref="system_metadata",
-                            foreign_keys=instance_uuid)
-
-
-# NOTE(alaski): This table exists in the nova_api database and its usage here
-# is deprecated.
-class InstanceTypeProjects(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represent projects associated instance_types."""
-    __tablename__ = "instance_type_projects"
-    __table_args__ = (schema.UniqueConstraint(
-        "instance_type_id", "project_id", "deleted",
-        name="uniq_instance_type_projects0instance_type_id0project_id0deleted"
-        ),
+    instance = orm.relationship(
+        Instance,
+        back_populates='system_metadata',
+        foreign_keys=instance_uuid,
     )
-    id = sa.Column(sa.Integer, primary_key=True)
-    instance_type_id = sa.Column(
-        sa.Integer, sa.ForeignKey('instance_types.id'), nullable=False)
-    project_id = sa.Column(sa.String(255))
-
-    instance_type = orm.relationship(InstanceTypes, backref="projects",
-                 foreign_keys=instance_type_id,
-                 primaryjoin='and_('
-                 'InstanceTypeProjects.instance_type_id == InstanceTypes.id,'
-                 'InstanceTypeProjects.deleted == 0)')
-
-
-# NOTE(alaski): This table exists in the nova_api database and its usage here
-# is deprecated.
-class InstanceTypeExtraSpecs(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents additional specs as key/value pairs for an instance_type."""
-    __tablename__ = 'instance_type_extra_specs'
-    __table_args__ = (
-        sa.Index('instance_type_extra_specs_instance_type_id_key_idx',
-              'instance_type_id', 'key'),
-        schema.UniqueConstraint(
-              "instance_type_id", "key", "deleted",
-              name=("uniq_instance_type_extra_specs0"
-                    "instance_type_id0key0deleted")
-        ),
-        {'mysql_collate': 'utf8_bin'},
-    )
-    id = sa.Column(sa.Integer, primary_key=True)
-    key = sa.Column(sa.String(255))
-    value = sa.Column(sa.String(255))
-    instance_type_id = sa.Column(
-        sa.Integer, sa.ForeignKey('instance_types.id'), nullable=False)
-    instance_type = orm.relationship(
-        InstanceTypes, backref="extra_specs",
-        foreign_keys=instance_type_id,
-        primaryjoin=(
-            'and_('
-            'InstanceTypeExtraSpecs.instance_type_id == InstanceTypes.id,'
-            'InstanceTypeExtraSpecs.deleted == 0)'),
-    )
-
-
-# TODO(stephenfin): Remove this in the U release or later, once we're sure we
-# won't want it back (it's for cells v1, so we won't)
-class Cell(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents parent and child cells of this cell.  Cells can
-    have multiple parents and children, so there could be any number
-    of entries with is_parent=True or False
-    """
-    __tablename__ = 'cells'
-    __table_args__ = (schema.UniqueConstraint(
-        "name", "deleted", name="uniq_cells0name0deleted"
-        ),
-    )
-    id = sa.Column(sa.Integer, primary_key=True)
-    # Name here is the 'short name' of a cell.  For instance: 'child1'
-    name = sa.Column(sa.String(255))
-    api_url = sa.Column(sa.String(255))
-
-    transport_url = sa.Column(sa.String(255), nullable=False)
-
-    weight_offset = sa.Column(sa.Float(), default=0.0)
-    weight_scale = sa.Column(sa.Float(), default=1.0)
-    is_parent = sa.Column(sa.Boolean())
-
-
-# NOTE(alaski): This table exists in the nova_api database and its usage here
-# is deprecated.
-class AggregateHost(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents a host that is member of an aggregate."""
-    __tablename__ = 'aggregate_hosts'
-    __table_args__ = (schema.UniqueConstraint(
-        "host", "aggregate_id", "deleted",
-         name="uniq_aggregate_hosts0host0aggregate_id0deleted"
-        ),
-    )
-    id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
-    host = sa.Column(sa.String(255))
-    aggregate_id = sa.Column(
-        sa.Integer, sa.ForeignKey('aggregates.id'), nullable=False)
-
-
-# NOTE(alaski): This table exists in the nova_api database and its usage here
-# is deprecated.
-class AggregateMetadata(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents a metadata key/value pair for an aggregate."""
-    __tablename__ = 'aggregate_metadata'
-    __table_args__ = (
-        schema.UniqueConstraint("aggregate_id", "key", "deleted",
-            name="uniq_aggregate_metadata0aggregate_id0key0deleted"
-            ),
-        sa.Index('aggregate_metadata_key_idx', 'key'),
-        sa.Index('aggregate_metadata_value_idx', 'value'),
-    )
-    id = sa.Column(sa.Integer, primary_key=True)
-    key = sa.Column(sa.String(255), nullable=False)
-    value = sa.Column(sa.String(255), nullable=False)
-    aggregate_id = sa.Column(
-        sa.Integer, sa.ForeignKey('aggregates.id'), nullable=False)
-
-
-# NOTE(alaski): This table exists in the nova_api database and its usage here
-# is deprecated.
-class Aggregate(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents a cluster of hosts that exists in this zone."""
-    __tablename__ = 'aggregates'
-    __table_args__ = (sa.Index('aggregate_uuid_idx', 'uuid'),)
-    id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
-    uuid = sa.Column(sa.String(36))
-    name = sa.Column(sa.String(255))
-    _hosts = orm.relationship(AggregateHost,
-                          primaryjoin='and_('
-                          'Aggregate.id == AggregateHost.aggregate_id,'
-                          'AggregateHost.deleted == 0,'
-                          'Aggregate.deleted == 0)')
-
-    _metadata = orm.relationship(AggregateMetadata,
-                             primaryjoin='and_('
-                             'Aggregate.id == AggregateMetadata.aggregate_id,'
-                             'AggregateMetadata.deleted == 0,'
-                             'Aggregate.deleted == 0)')
-
-    @property
-    def _extra_keys(self):
-        return ['hosts', 'metadetails', 'availability_zone']
-
-    @property
-    def hosts(self):
-        return [h.host for h in self._hosts]
-
-    @property
-    def metadetails(self):
-        return {m.key: m.value for m in self._metadata}
-
-    @property
-    def availability_zone(self):
-        if 'availability_zone' not in self.metadetails:
-            return None
-        return self.metadetails['availability_zone']
-
-
-# TODO(stephenfin): Remove this in the W release or later, once we're sure we
-# won't want it back (it's for a XenAPI-only feature)
-class AgentBuild(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents an agent build."""
-    __tablename__ = 'agent_builds'
-    __table_args__ = (
-        sa.Index('agent_builds_hypervisor_os_arch_idx', 'hypervisor', 'os',
-              'architecture'),
-        schema.UniqueConstraint("hypervisor", "os", "architecture", "deleted",
-                name="uniq_agent_builds0hypervisor0os0architecture0deleted"),
-    )
-    id = sa.Column(sa.Integer, primary_key=True)
-    hypervisor = sa.Column(sa.String(255))
-    os = sa.Column(sa.String(255))
-    architecture = sa.Column(sa.String(255))
-    version = sa.Column(sa.String(255))
-    url = sa.Column(sa.String(255))
-    md5hash = sa.Column(sa.String(255))
-
-
-# TODO(stephenfin): Remove this in the W release or later, once we're sure we
-# won't want it back (it's for a XenAPI-only feature)
-class BandwidthUsage(BASE, NovaBase, models.SoftDeleteMixin):
-    """Cache for instance bandwidth usage data pulled from the hypervisor."""
-    __tablename__ = 'bw_usage_cache'
-    __table_args__ = (
-        sa.Index('bw_usage_cache_uuid_start_period_idx', 'uuid',
-              'start_period'),
-    )
-    id = sa.Column(sa.Integer, primary_key=True, nullable=False)
-    uuid = sa.Column(sa.String(36))
-    mac = sa.Column(sa.String(255))
-    start_period = sa.Column(sa.DateTime, nullable=False)
-    last_refreshed = sa.Column(sa.DateTime)
-    bw_in = sa.Column(sa.BigInteger)
-    bw_out = sa.Column(sa.BigInteger)
-    last_ctr_in = sa.Column(sa.BigInteger)
-    last_ctr_out = sa.Column(sa.BigInteger)
 
 
 class VolumeUsage(BASE, NovaBase, models.SoftDeleteMixin):
@@ -1282,24 +980,6 @@ class VolumeUsage(BASE, NovaBase, models.SoftDeleteMixin):
 class S3Image(BASE, NovaBase, models.SoftDeleteMixin):
     """Compatibility layer for the S3 image service talking to Glance."""
     __tablename__ = 's3_images'
-    __table_args__ = ()
-    id = sa.Column(
-        sa.Integer, primary_key=True, nullable=False, autoincrement=True)
-    uuid = sa.Column(sa.String(36), nullable=False)
-
-
-class VolumeIdMapping(BASE, NovaBase, models.SoftDeleteMixin):
-    """Compatibility layer for the EC2 volume service."""
-    __tablename__ = 'volume_id_mappings'
-    __table_args__ = ()
-    id = sa.Column(
-        sa.Integer, primary_key=True, nullable=False, autoincrement=True)
-    uuid = sa.Column(sa.String(36), nullable=False)
-
-
-class SnapshotIdMapping(BASE, NovaBase, models.SoftDeleteMixin):
-    """Compatibility layer for the EC2 snapshot service."""
-    __tablename__ = 'snapshot_id_mappings'
     __table_args__ = ()
     id = sa.Column(
         sa.Integer, primary_key=True, nullable=False, autoincrement=True)
@@ -1404,72 +1084,6 @@ class TaskLog(BASE, NovaBase, models.SoftDeleteMixin):
     errors = sa.Column(sa.Integer(), default=0)
 
 
-# NOTE(alaski): This table exists in the nova_api database and its usage here
-# is deprecated.
-class InstanceGroupMember(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents the members for an instance group."""
-    __tablename__ = 'instance_group_member'
-    __table_args__ = (
-        sa.Index('instance_group_member_instance_idx', 'instance_id'),
-    )
-    id = sa.Column(sa.Integer, primary_key=True, nullable=False)
-    instance_id = sa.Column(sa.String(255))
-    group_id = sa.Column(sa.Integer, sa.ForeignKey('instance_groups.id'),
-                      nullable=False)
-
-
-# NOTE(alaski): This table exists in the nova_api database and its usage here
-# is deprecated.
-class InstanceGroupPolicy(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents the policy type for an instance group."""
-    __tablename__ = 'instance_group_policy'
-    __table_args__ = (
-        sa.Index('instance_group_policy_policy_idx', 'policy'),
-    )
-    id = sa.Column(sa.Integer, primary_key=True, nullable=False)
-    policy = sa.Column(sa.String(255))
-    group_id = sa.Column(sa.Integer, sa.ForeignKey('instance_groups.id'),
-                      nullable=False)
-
-
-# NOTE(alaski): This table exists in the nova_api database and its usage here
-# is deprecated.
-class InstanceGroup(BASE, NovaBase, models.SoftDeleteMixin):
-    """Represents an instance group.
-
-    A group will maintain a collection of instances and the relationship
-    between them.
-    """
-
-    __tablename__ = 'instance_groups'
-    __table_args__ = (
-        schema.UniqueConstraint("uuid", "deleted",
-                                 name="uniq_instance_groups0uuid0deleted"),
-    )
-
-    id = sa.Column(sa.Integer, primary_key=True, autoincrement=True)
-    user_id = sa.Column(sa.String(255))
-    project_id = sa.Column(sa.String(255))
-    uuid = sa.Column(sa.String(36), nullable=False)
-    name = sa.Column(sa.String(255))
-    _policies = orm.relationship(InstanceGroupPolicy, primaryjoin='and_('
-        'InstanceGroup.id == InstanceGroupPolicy.group_id,'
-        'InstanceGroupPolicy.deleted == 0,'
-        'InstanceGroup.deleted == 0)')
-    _members = orm.relationship(InstanceGroupMember, primaryjoin='and_('
-        'InstanceGroup.id == InstanceGroupMember.group_id,'
-        'InstanceGroupMember.deleted == 0,'
-        'InstanceGroup.deleted == 0)')
-
-    @property
-    def policies(self):
-        return [p.policy for p in self._policies]
-
-    @property
-    def members(self):
-        return [m.instance_id for m in self._members]
-
-
 class PciDevice(BASE, NovaBase, models.SoftDeleteMixin):
     """Represents a PCI host device that can be passed through to instances.
     """
@@ -1514,7 +1128,8 @@ class PciDevice(BASE, NovaBase, models.SoftDeleteMixin):
     numa_node = sa.Column(sa.Integer, nullable=True)
 
     parent_addr = sa.Column(sa.String(12), nullable=True)
-    instance = orm.relationship(Instance, backref="pci_devices",
+    instance = orm.relationship(Instance,
+                                back_populates="pci_devices",
                                 foreign_keys=instance_uuid,
                                 primaryjoin='and_('
                                 'PciDevice.instance_uuid == Instance.uuid,'
@@ -1532,105 +1147,12 @@ class Tag(BASE, models.ModelBase):
     tag = sa.Column(sa.Unicode(80), primary_key=True, nullable=False)
 
     instance = orm.relationship(
-        "Instance",
-        backref='tags',
+        'Instance',
+        back_populates='tags',
+        foreign_keys=resource_id,
         primaryjoin='and_(Tag.resource_id == Instance.uuid,'
                     'Instance.deleted == 0)',
-        foreign_keys=resource_id
     )
-
-
-# NOTE(alaski): This table exists in the nova_api database and its usage here
-# is deprecated.
-class ResourceProvider(BASE, models.ModelBase):
-    """Represents a mapping to a providers of resources."""
-
-    __tablename__ = "resource_providers"
-    __table_args__ = (
-        sa.Index('resource_providers_uuid_idx', 'uuid'),
-        schema.UniqueConstraint('uuid',
-            name='uniq_resource_providers0uuid'),
-        sa.Index('resource_providers_name_idx', 'name'),
-        schema.UniqueConstraint('name',
-            name='uniq_resource_providers0name')
-    )
-
-    id = sa.Column(sa.Integer, primary_key=True, nullable=False)
-    uuid = sa.Column(sa.String(36), nullable=False)
-    name = sa.Column(sa.Unicode(200), nullable=True)
-    generation = sa.Column(sa.Integer, default=0)
-    can_host = sa.Column(sa.Integer, default=0)
-
-
-# NOTE(alaski): This table exists in the nova_api database and its usage here
-# is deprecated.
-class Inventory(BASE, models.ModelBase):
-    """Represents a quantity of available resource."""
-
-    __tablename__ = "inventories"
-    __table_args__ = (
-        sa.Index('inventories_resource_provider_id_idx',
-              'resource_provider_id'),
-        sa.Index('inventories_resource_class_id_idx',
-              'resource_class_id'),
-        sa.Index('inventories_resource_provider_resource_class_idx',
-              'resource_provider_id', 'resource_class_id'),
-        schema.UniqueConstraint('resource_provider_id', 'resource_class_id',
-            name='uniq_inventories0resource_provider_resource_class')
-    )
-
-    id = sa.Column(sa.Integer, primary_key=True, nullable=False)
-    resource_provider_id = sa.Column(sa.Integer, nullable=False)
-    resource_class_id = sa.Column(sa.Integer, nullable=False)
-    total = sa.Column(sa.Integer, nullable=False)
-    reserved = sa.Column(sa.Integer, nullable=False)
-    min_unit = sa.Column(sa.Integer, nullable=False)
-    max_unit = sa.Column(sa.Integer, nullable=False)
-    step_size = sa.Column(sa.Integer, nullable=False)
-    allocation_ratio = sa.Column(sa.Float, nullable=False)
-    resource_provider = orm.relationship(
-        "ResourceProvider",
-        primaryjoin=('and_(Inventory.resource_provider_id == '
-                     'ResourceProvider.id)'),
-        foreign_keys=resource_provider_id)
-
-
-# NOTE(alaski): This table exists in the nova_api database and its usage here
-# is deprecated.
-class Allocation(BASE, models.ModelBase):
-    """A use of inventory."""
-
-    __tablename__ = "allocations"
-    __table_args__ = (
-        sa.Index('allocations_resource_provider_class_used_idx',
-              'resource_provider_id', 'resource_class_id',
-              'used'),
-        sa.Index('allocations_resource_class_id_idx',
-              'resource_class_id'),
-        sa.Index('allocations_consumer_id_idx', 'consumer_id')
-    )
-
-    id = sa.Column(sa.Integer, primary_key=True, nullable=False)
-    resource_provider_id = sa.Column(sa.Integer, nullable=False)
-    consumer_id = sa.Column(sa.String(36), nullable=False)
-    resource_class_id = sa.Column(sa.Integer, nullable=False)
-    used = sa.Column(sa.Integer, nullable=False)
-
-
-# NOTE(alaski): This table exists in the nova_api database and its usage here
-# is deprecated.
-class ResourceProviderAggregate(BASE, models.ModelBase):
-    """Associate a resource provider with an aggregate."""
-
-    __tablename__ = 'resource_provider_aggregates'
-    __table_args__ = (
-        sa.Index('resource_provider_aggregates_aggregate_id_idx',
-              'aggregate_id'),
-    )
-
-    resource_provider_id = sa.Column(
-        sa.Integer, primary_key=True, nullable=False)
-    aggregate_id = sa.Column(sa.Integer, primary_key=True, nullable=False)
 
 
 class ConsoleAuthToken(BASE, NovaBase):
@@ -1640,7 +1162,6 @@ class ConsoleAuthToken(BASE, NovaBase):
     __table_args__ = (
         sa.Index('console_auth_tokens_instance_uuid_idx', 'instance_uuid'),
         sa.Index('console_auth_tokens_host_expires_idx', 'host', 'expires'),
-        sa.Index('console_auth_tokens_token_hash_idx', 'token_hash'),
         sa.Index(
             'console_auth_tokens_token_hash_instance_uuid_idx', 'token_hash',
             'instance_uuid',
@@ -1660,7 +1181,7 @@ class ConsoleAuthToken(BASE, NovaBase):
 
     instance = orm.relationship(
         "Instance",
-        backref='console_auth_tokens',
+        back_populates='console_auth_tokens',
         primaryjoin='and_(ConsoleAuthToken.instance_uuid == Instance.uuid,'
                     'Instance.deleted == 0)',
         foreign_keys=instance_uuid

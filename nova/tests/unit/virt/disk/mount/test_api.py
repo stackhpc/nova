@@ -12,7 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from oslo_service import fixture as service_fixture
 
 from nova import test
@@ -202,7 +203,7 @@ class MountTestCase(test.NoDBTestCase):
                                                device)
         self.assertIsInstance(inst, block.BlockMount)
 
-    def test_instance_for_device_block_partiton(self,):
+    def test_instance_for_device_block_partiton(self):
         image = mock.MagicMock()
         mount_dir = '/mount/dir'
         partition = 1

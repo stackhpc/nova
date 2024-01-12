@@ -10,7 +10,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import mock
+from unittest import mock
 
 from nova import context as nova_context
 from nova import exception
@@ -40,6 +40,7 @@ class TestDeleteWhileBooting(test.TestCase,
     delete request. We aim to mock only the bare minimum necessary to recreate
     the bug scenarios.
     """
+
     def setUp(self):
         super(TestDeleteWhileBooting, self).setUp()
         self.useFixture(nova_fixtures.RealPolicyFixture())

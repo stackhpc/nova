@@ -13,9 +13,10 @@
 #    under the License.
 
 import copy
+from unittest import mock
 
-import mock
 import netaddr
+from oslo_db import exception as db_exc
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel
 from oslo_utils import timeutils
@@ -341,6 +342,14 @@ class _TestComputeNodeObject(object):
                       'uuid': uuidsentinel.fake_compute_node}
         mock_create.assert_called_once_with(self.context, param_dict)
 
+    @mock.patch('nova.db.main.api.compute_node_create')
+    def test_create_duplicate(self, mock_create):
+        mock_create.side_effect = db_exc.DBDuplicateEntry
+        compute = compute_node.ComputeNode(context=self.context)
+        compute.service_id = 456
+        compute.hypervisor_hostname = 'node1'
+        self.assertRaises(exception.DuplicateRecord, compute.create)
+
     @mock.patch.object(db, 'compute_node_update')
     @mock.patch(
         'nova.db.main.api.compute_node_get', return_value=fake_compute_node)
@@ -553,17 +562,15 @@ class _TestComputeNodeObject(object):
 
     def test_update_from_virt_driver_uuid_already_set(self):
         """Tests update_from_virt_driver where the compute node object already
-        has a uuid value so the uuid from the virt driver is ignored.
+        has a uuid value so an error is raised.
         """
         # copy in case the update has a side effect
         resources = copy.deepcopy(fake_resources)
         # Emulate the ironic driver which adds a uuid field.
         resources['uuid'] = uuidsentinel.node_uuid
         compute = compute_node.ComputeNode(uuid=uuidsentinel.something_else)
-        compute.update_from_virt_driver(resources)
-        expected = fake_compute_with_resources.obj_clone()
-        expected.uuid = uuidsentinel.something_else
-        self.assertTrue(base.obj_equal_prims(expected, compute))
+        self.assertRaises(exception.InvalidNodeConfiguration,
+            compute.update_from_virt_driver, resources)
 
     def test_update_from_virt_driver_missing_field(self):
         # NOTE(pmurray): update_from_virt_driver does not require
@@ -666,8 +673,8 @@ class _TestComputeNodeObject(object):
             CONF.initial_disk_allocation_ratio, compute.disk_allocation_ratio)
 
         mock_update.assert_called_once_with(
-            self.context, 123, {'cpu_allocation_ratio': 16.0,
-                                'ram_allocation_ratio': 1.5,
+            self.context, 123, {'cpu_allocation_ratio': 4.0,
+                                'ram_allocation_ratio': 1.0,
                                 'disk_allocation_ratio': 1.0})
 
     @mock.patch('nova.db.main.api.compute_node_update')
@@ -694,8 +701,8 @@ class _TestComputeNodeObject(object):
             CONF.initial_disk_allocation_ratio, compute.disk_allocation_ratio)
 
         mock_update.assert_called_once_with(
-            self.context, 123, {'cpu_allocation_ratio': 16.0,
-                                'ram_allocation_ratio': 1.5,
+            self.context, 123, {'cpu_allocation_ratio': 4.0,
+                                'ram_allocation_ratio': 1.0,
                                 'disk_allocation_ratio': 1.0})
 
     @mock.patch('nova.db.main.api.compute_node_update')
@@ -722,8 +729,8 @@ class _TestComputeNodeObject(object):
             CONF.initial_disk_allocation_ratio, compute.disk_allocation_ratio)
 
         mock_update.assert_called_once_with(
-            self.context, 123, {'cpu_allocation_ratio': 16.0,
-                                'ram_allocation_ratio': 1.5,
+            self.context, 123, {'cpu_allocation_ratio': 4.0,
+                                'ram_allocation_ratio': 1.0,
                                 'disk_allocation_ratio': 1.0})
 
     def test_get_all_by_not_mapped(self):

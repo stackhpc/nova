@@ -14,8 +14,8 @@
 #    under the License.
 
 import time
+from unittest import mock
 
-import mock
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import units
@@ -37,9 +37,9 @@ from nova.tests.unit.virt.vmwareapi import stubs
 from nova import version
 from nova.virt import hardware
 from nova.virt.vmwareapi import constants
-from nova.virt.vmwareapi import driver
 from nova.virt.vmwareapi import ds_util
 from nova.virt.vmwareapi import images
+from nova.virt.vmwareapi import session
 from nova.virt.vmwareapi import vif
 from nova.virt.vmwareapi import vim_util
 from nova.virt.vmwareapi import vm_util
@@ -65,18 +65,20 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
         self.flags(my_ip='',
                    flat_injected=True)
         self._context = context.RequestContext('fake_user', 'fake_project')
-        self._session = driver.VMwareAPISession()
+        self._session = session.VMwareAPISession()
 
         self._virtapi = mock.Mock()
         self._image_id = uuids.image
-        fake_ds_ref = vmwareapi_fake.ManagedObjectReference(value='fake-ds')
+        fake_ds_ref = vmwareapi_fake.ManagedObjectReference(
+            name='Datastore', value='fake-ds')
         self._ds = ds_obj.Datastore(
                 ref=fake_ds_ref, name='fake_ds',
                 capacity=10 * units.Gi,
                 freespace=10 * units.Gi)
         self._dc_info = ds_util.DcInfo(
                 ref='fake_dc_ref', name='fake_dc',
-                vmFolder='fake_vm_folder')
+                vmFolder=vmwareapi_fake.ManagedObjectReference(
+                    name='Folder', value='fake_vm_folder'))
         cluster = vmwareapi_fake.create_cluster('fake_cluster', fake_ds_ref)
         self._uuid = uuids.foo
         fake_info_cache = {
@@ -166,7 +168,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
             "projectid:fake_project\n"
             "projectname:None\n"
             "flavor:name:m1.micro\n"
-            "flavor:memory_mb:6\n"
+            "flavor:memory_mb:8\n"
             "flavor:vcpus:28\n"
             "flavor:ephemeral_gb:8128\n"
             "flavor:root_gb:496\n"
@@ -297,7 +299,8 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
             mock_save.assert_called_once_with()
         self.assertEqual(50, self._instance.progress)
 
-    @mock.patch.object(vm_util, 'get_vm_ref', return_value='fake_ref')
+    @mock.patch.object(vm_util, 'get_vm_ref',
+        return_value=vmwareapi_fake.ManagedObjectReference())
     def test_get_info(self, mock_get_vm_ref):
         result = {
             'summary.config.numCpu': 4,
@@ -577,7 +580,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
                                   vmware_tools_status="toolsOk",
                                   succeeds=False)
 
-    def test_clean_shutdown_no_vwaretools(self):
+    def test_clean_shutdown_no_vmwaretools(self):
         self._test_clean_shutdown(timeout=10,
                                   retry_interval=3,
                                   returns_on=1,
@@ -1137,6 +1140,14 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
                 "Fake-CookieJar")
         mock_attach_cdrom_to_vm.assert_called_once_with(
                 vm_ref, self._instance, self._ds.ref, str(upload_iso_path))
+
+    def test_prepare_for_spawn_invalid_ram(self):
+        instance = self._instance.obj_clone()
+        flavor = objects.Flavor(vcpus=1, memory_mb=6, ephemeral_gb=1,
+                                swap=1024, extra_specs={})
+        instance.flavor = flavor
+        self.assertRaises(exception.InstanceUnacceptable,
+                          self._vmops.prepare_for_spawn, instance)
 
     @mock.patch('nova.image.glance.API.get')
     @mock.patch.object(vmops.LOG, 'debug')
@@ -2051,7 +2062,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
                                                    extra_specs,
                                                    self._metadata)
 
-        vm = vmwareapi_fake._get_object(vm_ref)
+        vm = vmwareapi_fake.get_object(vm_ref)
 
         # Test basic VM parameters
         self.assertEqual(self._instance.uuid, vm.name)
@@ -2074,7 +2085,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
         datastores = vm.datastore.ManagedObjectReference
         self.assertEqual(1, len(datastores))
 
-        datastore = vmwareapi_fake._get_object(datastores[0])
+        datastore = vmwareapi_fake.get_object(datastores[0])
         self.assertEqual(self._ds.name, datastore.get('summary.name'))
 
         # Test that the VM's network is configured as specified
@@ -2176,7 +2187,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
     def _validate_flavor_extra_specs(self, flavor_extra_specs, expected):
         # Validate that the extra specs are parsed correctly
         flavor = objects.Flavor(name='my-flavor',
-                                memory_mb=6,
+                                memory_mb=8,
                                 vcpus=28,
                                 root_gb=496,
                                 ephemeral_gb=8128,
@@ -2190,6 +2201,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
     coming from the image is bigger than the maximum allowed video ram from
     the flavor.
     """
+
     def test_video_ram(self):
         meta_dict = {'id': self._image_id, 'properties': {'hw_video_ram': 120}}
         image_meta, flavor = self._get_image_and_flavor_for_test_video(
@@ -2205,6 +2217,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
     coming from the image is not specified. This is a success scenario,
     in the case where `hw_video_ram` property is not set.
     """
+
     def test_video_ram_if_none(self):
         meta_dict = {'id': self._image_id, 'properties': {}}
         image_meta, flavor = self._get_image_and_flavor_for_test_video(
@@ -2218,13 +2231,14 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
     coming from the flavor is not specified. This is a success scenario,
     in the case where `hw_video_ram` property is not set.
     """
+
     def test_max_video_ram_none(self):
         meta_dict = {'id': self._image_id, 'properties': {'hw_video_ram': 120}}
         image_meta = objects.ImageMeta.from_dict(meta_dict)
         flavor_extra_specs = {'quota:cpu_limit': 7,
                               'quota:cpu_reservation': 6}
         flavor = objects.Flavor(name='my-flavor',
-                                memory_mb=6,
+                                memory_mb=8,
                                 vcpus=28,
                                 root_gb=496,
                                 ephemeral_gb=8128,
@@ -2242,6 +2256,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
     the flavor. This is a success scenario, in the case where `hw_video_ram`
     property is set in the extra spec.
     """
+
     def test_success_video_ram(self):
         expected_video_ram = 90
         meta_dict = {'id': self._image_id, 'properties': {
@@ -2258,6 +2273,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
     coming from the image is equal to 0. This is a success scenario, in the
     case where `hw_video_ram` property is not set in the extra spec.
     """
+
     def test_zero_video_ram(self):
         meta_dict = {'id': self._image_id, 'properties': {'hw_video_ram': 0}}
         image_meta, flavor = self._get_image_and_flavor_for_test_video(
@@ -2275,7 +2291,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
                               'quota:cpu_reservation': 6,
                               'hw_video:ram_max_mb': 100}
         flavor = objects.Flavor(name='my-flavor',
-                                memory_mb=6,
+                                memory_mb=8,
                                 vcpus=28,
                                 root_gb=496,
                                 ephemeral_gb=8128,
@@ -2687,7 +2703,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
 
     def test_get_storage_policy_none(self):
         flavor = objects.Flavor(name='m1.small',
-                                memory_mb=6,
+                                memory_mb=8,
                                 vcpus=28,
                                 root_gb=496,
                                 ephemeral_gb=8128,
@@ -2701,7 +2717,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
     def test_get_storage_policy_extra_specs(self):
         extra_specs = {'vmware:storage_policy': 'flavor-policy'}
         flavor = objects.Flavor(name='m1.small',
-                                memory_mb=6,
+                                memory_mb=8,
                                 vcpus=28,
                                 root_gb=496,
                                 ephemeral_gb=8128,
@@ -2776,7 +2792,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
     def test_get_instance_metadata(self):
         flavor = objects.Flavor(id=7,
                                 name='m1.small',
-                                memory_mb=6,
+                                memory_mb=8,
                                 vcpus=28,
                                 root_gb=496,
                                 ephemeral_gb=8128,
@@ -2791,7 +2807,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
                     "projectid:fake_project\n"
                     "projectname:None\n"
                     "flavor:name:m1.small\n"
-                    "flavor:memory_mb:6\n"
+                    "flavor:memory_mb:8\n"
                     "flavor:vcpus:28\n"
                     "flavor:ephemeral_gb:8128\n"
                     "flavor:root_gb:496\n"
@@ -2908,7 +2924,7 @@ class VMwareVMOpsTestCase(test.NoDBTestCase):
     def test_get_cores_per_socket(self):
         extra_specs = {'hw:cpu_sockets': 7}
         flavor = objects.Flavor(name='m1.small',
-                                memory_mb=6,
+                                memory_mb=8,
                                 vcpus=28,
                                 root_gb=496,
                                 ephemeral_gb=8128,

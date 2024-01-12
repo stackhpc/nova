@@ -9,13 +9,15 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+
 import copy
+import ddt
 import time
+from unittest import mock
 from urllib import parse
 
 import fixtures
 from keystoneauth1 import exceptions as ks_exc
-import mock
 import os_resource_classes as orc
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel as uuids
@@ -41,8 +43,14 @@ class SafeConnectedTestCase(test.NoDBTestCase):
         super(SafeConnectedTestCase, self).setUp()
         self.context = context.get_admin_context()
 
-        with mock.patch('keystoneauth1.loading.load_auth_from_conf_options'):
-            self.client = report.SchedulerReportClient()
+        # need to mock this globally as SchedulerReportClient._create_client
+        # is called again when EndpointNotFound is raised
+        self.useFixture(
+            fixtures.MonkeyPatch(
+                'keystoneauth1.loading.load_auth_from_conf_options',
+                mock.MagicMock()))
+
+        self.client = report.SchedulerReportClient()
 
     @mock.patch('keystoneauth1.session.Session.request')
     def test_missing_endpoint(self, req):
@@ -148,6 +156,60 @@ class SafeConnectedTestCase(test.NoDBTestCase):
         req.reset_mock()
         self.client._get_resource_provider(self.context, "fake")
         self.assertTrue(req.called)
+
+
+@ddt.ddt
+class TestSingleton(test.NoDBTestCase):
+    def test_singleton(self):
+        # Make sure we start with a clean slate
+        self.assertIsNone(report.PLACEMENTCLIENT)
+
+        # Make sure the first call creates the singleton, sets it
+        # globally, and returns it
+        client = report.report_client_singleton()
+        self.assertEqual(client, report.PLACEMENTCLIENT)
+
+        # Make sure that a subsequent call returns the same thing
+        # again and that the global is unchanged
+        self.assertEqual(client, report.report_client_singleton())
+        self.assertEqual(client, report.PLACEMENTCLIENT)
+
+    @ddt.data(ks_exc.EndpointNotFound,
+              ks_exc.MissingAuthPlugin,
+              ks_exc.Unauthorized,
+              ks_exc.DiscoveryFailure,
+              ks_exc.ConnectFailure,
+              ks_exc.RequestTimeout,
+              ks_exc.GatewayTimeout,
+              test.TestingException)
+    def test_errors(self, exc):
+        self._test_error(exc)
+
+    @mock.patch.object(report, 'LOG')
+    def _test_error(self, exc, mock_log):
+        with mock.patch.object(report.SchedulerReportClient, '_create_client',
+                               side_effect=exc):
+            self.assertRaises(exc, report.report_client_singleton)
+        mock_log.error.assert_called_once()
+
+    def test_error_then_success(self):
+        # Simulate an error
+        self._test_error(ks_exc.ConnectFailure)
+
+        # Ensure we did not set the global client
+        self.assertIsNone(report.PLACEMENTCLIENT)
+
+        # Call again, with no error
+        client = report.report_client_singleton()
+
+        # Make sure we got a client and that it was set as the global
+        # one
+        self.assertIsNotNone(client)
+        self.assertEqual(client, report.PLACEMENTCLIENT)
+
+        # Make sure we keep getting the same one
+        client2 = report.report_client_singleton()
+        self.assertEqual(client, client2)
 
 
 class TestConstructor(test.NoDBTestCase):
@@ -3184,15 +3246,41 @@ class TestAssociations(SchedulerReportClientTestCase):
 
 class TestAllocations(SchedulerReportClientTestCase):
 
+    @mock.patch("nova.scheduler.client.report.SchedulerReportClient."
+                "remove_provider_tree_from_instance_allocation")
+    @mock.patch('nova.objects.MigrationList.get_by_filters')
+    def test_remove_allocations_for_evacuated_instances(self,
+            mock_get_migrations, mock_rm_pr_tree):
+        cn = objects.ComputeNode(uuid=uuids.cn, host="fake_host",
+                hypervisor_hostname="fake_hostname", )
+        migrations = [mock.Mock(instance_uuid=uuids.inst1, status='done'),
+                      mock.Mock(instance_uuid=uuids.inst2, status='done')]
+        mock_get_migrations.return_value = migrations
+        mock_rm_pr_tree.return_value = True
+        self.client._remove_allocations_for_evacuated_instances(self.context,
+                                                                cn)
+        mock_get_migrations.assert_called_once_with(
+            self.context,
+            {'source_compute': cn.host, 'status': ['done'],
+             'migration_type': 'evacuation'})
+        mock_rm_pr_tree.assert_has_calls(
+            [mock.call(self.context, uuids.inst1, cn.uuid),
+             mock.call(self.context, uuids.inst2, cn.uuid)])
+        # status of migrations should be kept
+        for migration in migrations:
+            self.assertEqual('done', migration.status)
+
     @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
                 'get_providers_in_tree')
     @mock.patch("nova.scheduler.client.report.SchedulerReportClient."
                 "delete")
     @mock.patch("nova.scheduler.client.report.SchedulerReportClient."
+                "_remove_allocations_for_evacuated_instances")
+    @mock.patch("nova.scheduler.client.report.SchedulerReportClient."
                 "delete_allocation_for_instance")
     @mock.patch("nova.objects.InstanceList.get_uuids_by_host_and_node")
     def test_delete_resource_provider_cascade(self, mock_by_host,
-            mock_del_alloc, mock_delete, mock_get_rpt):
+            mock_del_alloc, mock_evacuate, mock_delete, mock_get_rpt):
         cn = objects.ComputeNode(uuid=uuids.cn, host="fake_host",
                 hypervisor_hostname="fake_hostname", )
         mock_by_host.return_value = [uuids.inst1, uuids.inst2]
@@ -3208,6 +3296,7 @@ class TestAllocations(SchedulerReportClientTestCase):
         mock_by_host.assert_called_once_with(
             self.context, cn.host, cn.hypervisor_hostname)
         self.assertEqual(2, mock_del_alloc.call_count)
+        mock_evacuate.assert_called_once_with(self.context, cn)
         exp_url = "/resource_providers/%s" % uuids.cn
         mock_delete.assert_called_once_with(
             exp_url, global_request_id=self.context.global_id)
@@ -3218,10 +3307,12 @@ class TestAllocations(SchedulerReportClientTestCase):
     @mock.patch("nova.scheduler.client.report.SchedulerReportClient."
                 "delete")
     @mock.patch("nova.scheduler.client.report.SchedulerReportClient."
+                "_remove_allocations_for_evacuated_instances")
+    @mock.patch("nova.scheduler.client.report.SchedulerReportClient."
                 "delete_allocation_for_instance")
     @mock.patch("nova.objects.InstanceList.get_uuids_by_host_and_node")
     def test_delete_resource_provider_no_cascade(self, mock_by_host,
-            mock_del_alloc, mock_delete, mock_get_rpt):
+            mock_del_alloc, mock_evacuate, mock_delete, mock_get_rpt):
         self.client._association_refresh_time[uuids.cn] = mock.Mock()
         cn = objects.ComputeNode(uuid=uuids.cn, host="fake_host",
                 hypervisor_hostname="fake_hostname", )
@@ -3236,6 +3327,7 @@ class TestAllocations(SchedulerReportClientTestCase):
         mock_delete.return_value = resp_mock
         self.client.delete_resource_provider(self.context, cn)
         mock_del_alloc.assert_not_called()
+        mock_evacuate.assert_not_called()
         exp_url = "/resource_providers/%s" % uuids.cn
         mock_delete.assert_called_once_with(
             exp_url, global_request_id=self.context.global_id)
@@ -4183,6 +4275,7 @@ class TestAggregateAddRemoveHost(SchedulerReportClientTestCase):
     access the SchedulerReportClient provider_tree attribute and are called
     from the nova API, not the nova compute manager/resource tracker.
     """
+
     def setUp(self):
         super(TestAggregateAddRemoveHost, self).setUp()
         self.mock_get = self.useFixture(
@@ -4606,3 +4699,31 @@ class TestUsages(SchedulerReportClientTestCase):
         expected = {'project': {'cores': 4, 'ram': 0},
                     'user': {'cores': 4, 'ram': 0}}
         self.assertDictEqual(expected, counts)
+
+    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.get')
+    def test_get_usages_counts_for_limits(self, mock_get):
+        fake_responses = fake_requests.FakeResponse(
+            200,
+            content=jsonutils.dumps({'usages': {orc.VCPU: 2, orc.PCPU: 2}}))
+        mock_get.return_value = fake_responses
+
+        counts = self.client.get_usages_counts_for_limits(
+            self.context, 'fake-project')
+
+        expected = {orc.VCPU: 2, orc.PCPU: 2}
+        self.assertDictEqual(expected, counts)
+        self.assertEqual(1, mock_get.call_count)
+
+    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.get')
+    def test_get_usages_counts_for_limits_fails(self, mock_get):
+        fake_failure_response = fake_requests.FakeResponse(500)
+        mock_get.side_effect = [ks_exc.ConnectFailure, fake_failure_response]
+
+        e = self.assertRaises(exception.UsagesRetrievalFailed,
+                              self.client.get_usages_counts_for_limits,
+                              self.context, 'fake-project')
+
+        expected = "Failed to retrieve usages for project 'fake-project' " \
+                   "and user 'N/A'."
+        self.assertEqual(expected, str(e))
+        self.assertEqual(2, mock_get.call_count)

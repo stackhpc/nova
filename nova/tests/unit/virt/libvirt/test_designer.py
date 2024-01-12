@@ -12,7 +12,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import mock
+from unittest import mock
 
 from nova.pci import utils as pci_utils
 from nova import test
@@ -40,7 +40,7 @@ class DesignerTestCase(test.NoDBTestCase):
         conf = config.LibvirtConfigGuestInterface()
         designer.set_vif_guest_frontend_config(conf, 'fake-mac',
                                                'fake-model', 'fake-driver',
-                                               'fake-queues', None)
+                                               'fake-queues', None, None)
         self.assertEqual('fake-mac', conf.mac_addr)
         self.assertEqual('fake-model', conf.model)
         self.assertEqual('fake-driver', conf.driver_name)
@@ -51,7 +51,7 @@ class DesignerTestCase(test.NoDBTestCase):
         conf = config.LibvirtConfigGuestInterface()
         designer.set_vif_guest_frontend_config(conf, 'fake-mac',
                                                'fake-model', 'fake-driver',
-                                               'fake-queues', 1024)
+                                               'fake-queues', 1024, None)
         self.assertEqual('fake-mac', conf.mac_addr)
         self.assertEqual('fake-model', conf.model)
         self.assertEqual('fake-driver', conf.driver_name)

@@ -50,16 +50,16 @@ class LibvirtFibreChannelVolumeDriver(libvirt_volume.LibvirtBaseVolumeDriver):
     def connect_volume(self, connection_info, instance):
         """Attach the volume to instance_name."""
 
-        LOG.debug("Calling os-brick to attach FC Volume")
+        LOG.debug("Calling os-brick to attach FC Volume", instance=instance)
         device_info = self.connector.connect_volume(connection_info['data'])
-        LOG.debug("Attached FC volume %s", device_info)
+        LOG.debug("Attached FC volume %s", device_info, instance=instance)
 
         connection_info['data']['device_path'] = device_info['path']
         if 'multipath_id' in device_info:
             connection_info['data']['multipath_id'] = \
                 device_info['multipath_id']
 
-    def disconnect_volume(self, connection_info, instance):
+    def disconnect_volume(self, connection_info, instance, force=False):
         """Detach the volume from instance_name."""
 
         LOG.debug("calling os-brick to detach FC Volume", instance=instance)
@@ -69,17 +69,17 @@ class LibvirtFibreChannelVolumeDriver(libvirt_volume.LibvirtBaseVolumeDriver):
         # the 2nd param of disconnect_volume and be consistent
         # with the rest of the connectors.
         self.connector.disconnect_volume(connection_info['data'],
-                                         connection_info['data'])
+                                         connection_info['data'],
+                                         force=force)
         LOG.debug("Disconnected FC Volume", instance=instance)
 
         super(LibvirtFibreChannelVolumeDriver,
-              self).disconnect_volume(connection_info, instance)
+              self).disconnect_volume(connection_info, instance, force=force)
 
     def extend_volume(self, connection_info, instance, requested_size):
         """Extend the volume."""
         LOG.debug("calling os-brick to extend FC Volume", instance=instance)
         new_size = self.connector.extend_volume(connection_info['data'])
-        LOG.debug("Extend FC Volume %s; new_size=%s",
-                  connection_info['data']['device_path'],
+        LOG.debug("Extend FC Volume: new_size=%s",
                   new_size, instance=instance)
         return new_size

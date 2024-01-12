@@ -103,12 +103,15 @@ class Manager(PeriodicTasks, metaclass=ManagerMeta):
         """Tasks to be run at a periodic interval."""
         return self.run_periodic_tasks(context, raise_on_error=raise_on_error)
 
-    def init_host(self):
+    def init_host(self, service_ref):
         """Hook to do additional manager initialization when one requests
         the service be started.  This is called before any service record
-        is created.
+        is created, but if one already exists for this service, it is
+        provided.
 
         Child classes should override this method.
+
+        :param service_ref: An objects.Service if one exists, else None.
         """
         pass
 
@@ -119,13 +122,15 @@ class Manager(PeriodicTasks, metaclass=ManagerMeta):
         """
         pass
 
-    def pre_start_hook(self):
+    def pre_start_hook(self, service_ref):
         """Hook to provide the manager the ability to do additional
         start-up work before any RPC queues/consumers are created. This is
         called after other initialization has succeeded and a service
         record is created.
 
         Child classes should override this method.
+
+        :param service_ref: The nova.objects.Service for this
         """
         pass
 

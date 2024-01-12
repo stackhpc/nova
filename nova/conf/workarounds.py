@@ -300,6 +300,167 @@ patched however in some cases this is not possible. This workaround allows the
 emulation of an apic to be disabled per host however it is not recommended to
 use outside of a CI or developer cloud.
 """),
+    cfg.ListOpt('wait_for_vif_plugged_event_during_hard_reboot',
+                item_type=cfg.types.String(
+                    choices=[
+                        "normal",
+                        "direct",
+                        "macvtap",
+                        "baremetal",
+                        "direct-physical",
+                        "virtio-forwarder",
+                        "smart-nic",
+                        "vdpa",
+                        "accelerator-direct",
+                        "accelerator-direct-physical",
+                        "remote-managed",
+                    ]),
+                default=[],
+                help="""
+The libvirt virt driver implements power on and hard reboot by tearing down
+every vif of the instance being rebooted then plug them again. By default nova
+does not wait for network-vif-plugged event from neutron before it lets the
+instance run. This can cause the instance to requests the IP via DHCP before
+the neutron backend has a chance to set up the networking backend after the vif
+plug.
+
+This flag defines which vifs nova expects network-vif-plugged events from
+during hard reboot. The possible values are neutron port vnic types:
+
+* normal
+* direct
+* macvtap
+* baremetal
+* direct-physical
+* virtio-forwarder
+* smart-nic
+* vdpa
+* accelerator-direct
+* accelerator-direct-physical
+* remote-managed
+
+Adding a ``vnic_type`` to this configuration makes Nova wait for a
+network-vif-plugged event for each of the instance's vifs having the specific
+``vnic_type`` before unpausing the instance, similarly to how new instance
+creation works.
+
+Please note that not all neutron networking backends send plug time events, for
+certain ``vnic_type`` therefore this config is empty by default.
+
+The ml2/ovs and the networking-odl backends are known to send plug time events
+for ports with ``normal`` ``vnic_type`` so it is safe to add ``normal`` to this
+config if you are using only those backends in the compute host.
+
+The neutron in-tree SRIOV backend does not reliably send network-vif-plugged
+event during plug time for ports with  ``direct`` vnic_type and never sends
+that event for port with ``direct-physical`` vnic_type during plug time. For
+other ``vnic_type`` and backend pairs, please consult the developers of the
+backend.
+
+Related options:
+
+* :oslo.config:option:`DEFAULT.vif_plugging_timeout`
+"""),
+    cfg.BoolOpt('enable_qemu_monitor_announce_self',
+                default=False,
+                help="""
+If it is set to True the libvirt driver will  try as a best effort to send
+the announce-self command to the QEMU monitor so that it generates RARP frames
+to update network switches in the post live migration phase on the destination.
+
+Please note that this causes the domain to be considered tainted by libvirt.
+
+Related options:
+
+* :oslo.config:option:`DEFAULT.compute_driver` (libvirt)
+"""),
+    cfg.IntOpt('qemu_monitor_announce_self_count',
+                default=3,
+                min=1,
+                help="""
+The total number of times to send the announce_self command to the QEMU
+monitor when enable_qemu_monitor_announce_self is enabled.
+
+Related options:
+
+* :oslo.config:option:`WORKAROUNDS.enable_qemu_monitor_announce_self` (libvirt)
+"""),
+    cfg.IntOpt('qemu_monitor_announce_self_interval',
+                default=1,
+                min=1,
+                help="""
+The number of seconds to wait before re-sending the announce_self
+command to the QEMU monitor.
+
+Related options:
+
+* :oslo.config:option:`WORKAROUNDS.enable_qemu_monitor_announce_self` (libvirt)
+"""),
+    cfg.BoolOpt('disable_compute_service_check_for_ffu',
+                default=False,
+                help="""
+If this is set, the normal safety check for old compute services will be
+treated as a warning instead of an error. This is only to be enabled to
+facilitate a Fast-Forward upgrade where new control services are being started
+before compute nodes have been able to update their service record. In an FFU,
+the service records in the database will be more than one version old until
+the compute nodes start up, but control services need to be online first.
+"""),
+    cfg.BoolOpt('unified_limits_count_pcpu_as_vcpu',
+                default=False,
+                help="""
+When using unified limits, use VCPU + PCPU for VCPU quota usage.
+
+If the deployment is configured to use unified limits via
+``[quota]driver=nova.quota.UnifiedLimitsDriver``, by default VCPU resources are
+counted independently from PCPU resources, consistent with how they are
+represented in the placement service.
+
+Legacy quota behavior counts PCPU as VCPU and returns the sum of VCPU + PCPU
+usage as the usage count for VCPU. Operators relying on the aggregation of
+VCPU and PCPU resource usage counts should set this option to True.
+
+Related options:
+
+* :oslo.config:option:`quota.driver`
+"""),
+    cfg.BoolOpt('skip_cpu_compare_on_dest',
+               default=False,
+               help="""
+With the libvirt driver, during live migration, skip comparing guest CPU
+with the destination host. When using QEMU >= 2.9 and libvirt >=
+4.4.0, libvirt will do the correct thing with respect to checking CPU
+compatibility on the destination host during live migration.
+"""),
+    cfg.BoolOpt('skip_cpu_compare_at_startup',
+               default=False,
+               help="""
+This will skip the CPU comparison call at the startup of Compute
+service and lets libvirt handle it.
+"""),
+
+    cfg.BoolOpt(
+        'skip_hypervisor_version_check_on_lm',
+        default=False,
+        help="""
+When this is enabled, it will skip version-checking of hypervisors
+during live migration.
+"""),
+    cfg.BoolOpt(
+        'skip_reserve_in_use_ironic_nodes',
+        default=False,
+        help="""
+This may be useful if you use the Ironic driver, but don't have
+automatic cleaning enabled in Ironic. Nova, by default, will mark
+Ironic nodes as reserved as soon as they are in use. When you free
+the Ironic node (by deleting the nova instance) it takes a while
+for Nova to un-reserve that Ironic node in placement. Usually this
+is a good idea, because it avoids placement providing an Ironic
+as a valid candidate when it is still being cleaned.
+However, if you don't use automatic cleaning, it can cause an
+extra delay before and Ironic node is available for building a
+new Nova instance.
+"""),
 ]
 
 

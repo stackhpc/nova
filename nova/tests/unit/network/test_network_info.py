@@ -19,7 +19,6 @@ from oslo_utils.fixture import uuidsentinel as uuids
 
 from nova import exception
 from nova.network import model
-from nova import objects
 from nova import test
 from nova.tests.unit import fake_network_cache_model
 from nova.virt import netutils
@@ -739,6 +738,52 @@ iface eth0 inet6 static
         template = self._setup_injected_network_scenario(use_ipv4=False)
         self.assertEqual(expected, template)
 
+    def test_injection_ipv6_only(self):
+        expected = '''\
+# Injected by Nova on instance boot
+#
+# This file describes the network interfaces available on your system
+# and how to activate them. For more information, see interfaces(5).
+
+# The loopback network interface
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet6 static
+    hwaddress ether aa:aa:aa:aa:aa:aa
+    address 1234:567::2
+    netmask 48
+    gateway 1234:567::1
+    dns-nameservers 2001:4860:4860::8888 2001:4860:4860::8844
+'''
+        template = self._setup_injected_network_scenario(use_ipv4=False,
+                                                         use_ipv6=True)
+        self.assertEqual(expected, template)
+
+    def test_injection_ipv6_only_no_gateway(self):
+        expected = '''\
+# Injected by Nova on instance boot
+#
+# This file describes the network interfaces available on your system
+# and how to activate them. For more information, see interfaces(5).
+
+# The loopback network interface
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet6 static
+    hwaddress ether aa:aa:aa:aa:aa:aa
+    address 1234:567::2
+    netmask 48
+    dns-nameservers 2001:4860:4860::8888 2001:4860:4860::8844
+'''
+        template = self._setup_injected_network_scenario(use_ipv4=False,
+                                                         use_ipv6=True,
+                                                         gateway=False)
+        self.assertEqual(expected, template)
+
     def test_injection_ipv6_two_interfaces(self):
         expected = """\
 # Injected by Nova on instance boot
@@ -854,34 +899,6 @@ iface eth1 inet static
                 use_ipv6=True, gateway=False, two_interfaces=True,
                 libvirt_virt_type='lxc')
         self.assertEqual(expected, template)
-
-    def test_get_events(self):
-        network_info = model.NetworkInfo([
-            model.VIF(
-                id=uuids.hybrid_vif,
-                details={'ovs_hybrid_plug': True}),
-            model.VIF(
-                id=uuids.normal_vif,
-                details={'ovs_hybrid_plug': False})])
-        same_host = objects.Migration(source_compute='fake-host',
-                                      dest_compute='fake-host')
-        diff_host = objects.Migration(source_compute='fake-host1',
-                                      dest_compute='fake-host2')
-        # Same-host migrations will have all events be plug-time.
-        self.assertCountEqual(
-            [('network-vif-plugged', uuids.normal_vif),
-             ('network-vif-plugged', uuids.hybrid_vif)],
-            network_info.get_plug_time_events(same_host))
-        # Same host migration will have no plug-time events.
-        self.assertEqual([], network_info.get_bind_time_events(same_host))
-        # Diff-host migration + OVS hybrid plug = bind-time events
-        self.assertEqual(
-            [('network-vif-plugged', uuids.hybrid_vif)],
-            network_info.get_bind_time_events(diff_host))
-        # Diff-host migration + normal OVS = plug-time events
-        self.assertEqual(
-            [('network-vif-plugged', uuids.normal_vif)],
-            network_info.get_plug_time_events(diff_host))
 
     def test_has_port_with_allocation(self):
         network_info = model.NetworkInfo([])

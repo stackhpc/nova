@@ -12,8 +12,9 @@
 #   License for the specific language governing permissions and limitations
 #   under the License.
 
+from unittest import mock
+
 import fixtures
-import mock
 from oslo_utils.fixture import uuidsentinel as uuids
 import testtools
 import webob
@@ -415,3 +416,32 @@ class EvacuateTestV268(EvacuateTestV229):
     def test_forced_evacuate_with_no_host_provided(self):
         # not applicable for v2.68, which removed the 'force' parameter
         pass
+
+
+class EvacuateTestV295(EvacuateTestV268):
+    def setUp(self):
+        super(EvacuateTestV268, self).setUp()
+        self.admin_req = fakes.HTTPRequest.blank('', use_admin_context=True,
+                                                 version='2.95')
+        self.req = fakes.HTTPRequest.blank('', version='2.95')
+        self.mock_get_min_ver = self.useFixture(fixtures.MockPatch(
+            'nova.objects.service.get_minimum_version_all_cells',
+            return_value=62)).mock
+
+    def test_evacuate_version_error(self):
+        self.mock_get_min_ver.return_value = 61
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self._get_evacuate_response,
+                          {'host': 'my-host', 'adminPass': 'foo'})
+
+    def test_evacuate_unsupported_rpc(self):
+        def fake_evacuate(*args, **kwargs):
+            raise exception.UnsupportedRPCVersion(
+                api="fakeapi",
+                required="x.xx")
+
+        self.stub_out('nova.compute.api.API.evacuate', fake_evacuate)
+        self._check_evacuate_failure(webob.exc.HTTPConflict,
+                                     {'host': 'my-host',
+                                      'onSharedStorage': 'False',
+                                      'adminPass': 'MyNewPass'})

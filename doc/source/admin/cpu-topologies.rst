@@ -95,14 +95,64 @@ In all cases where NUMA awareness is used, the ``NUMATopologyFilter``
 filter must be enabled. Details on this filter are provided in
 :doc:`/admin/scheduling`.
 
+The host's NUMA node(s) used are chosen based on some logic and controlled by
+``packing_host_numa_cells_allocation_strategy`` configuration variable in
+nova.conf. By default ``packing_host_numa_cells_allocation_strategy``
+variable is set to ``True``. It leads to attempt to chose NUMA node(s) with
+less amount of free resources (or in other words **more used** NUMA nodes)
+first. It is so-called "pack" strategy - we try to place as much as possible
+load at **more used** host's NUMA node until it will be completely exhausted.
+And only after we will choose **most used** host's NUMA node from the rest
+available nodes on host. "Spread" strategy is reverse to "pack" strategy.
+The NUMA node(s) with **more free** resources will be used first. So "spread"
+strategy will try to balance load between all NUMA nodes and keep number of
+free resources on all NUMA nodes as more equal as possible.
+
 .. caution::
 
-   The NUMA node(s) used are normally chosen at random. However, if a PCI
-   passthrough or SR-IOV device is attached to the instance, then the NUMA
-   node that the device is associated with will be used. This can provide
-   important performance improvements. However, booting a large number of
-   similar instances can result in unbalanced NUMA node usage. Care should
-   be taken to mitigate this issue. See this `discussion`_ for more details.
+    Host's NUMA nodes are placed in list and list is sorted based on strategy
+    chosen and resource available in each NUMA node. Sorts are performed on
+    same list one after another, so the last sort implemented is the sort
+    with most priority.
+
+The python performed so-called stable sort. It means that each sort executed
+on same list will change order of list items only if item's property we sort on
+differs. If this properties in all list's items are equal than elements order
+will not changed.
+
+Sorts are performed on host's NUMA nodes list in the following order:
+
+*  sort based on available memory on node(first sort-less priority)
+*  sort based on cpu usage (in case of shared CPUs requested by guest
+   VM topology) or free pinned cpus otherwise.
+*  sort based on number of free PCI device on node(last sort-top priority)
+
+Top sorting priority is for host's NUMA nodes with PCI devices attached. If VM
+requested PCI device(s) logic **always** puts host's NUMA nodes with more PCI
+devices at the beginning of the host's NUMA nodes list. If PCI devices isn't
+requested by VM than NUMA nodes with no (or less) PCI device available will be
+placed at the beginning of the list.
+
+.. caution::
+
+   The described logic for PCI devices is used **both** for "pack" and "spread"
+   strategies. It is done to keep backward compatibility with previous nova
+   versions.
+
+
+During "pack" logic implementation rest (two) sorts are performed with sort
+order to move NUMA nodes with more available resources (CPUs and memory) at the
+END of host's NUMA nodes list. Sort based on memory is the first sort
+implemented and has least priority.
+
+During "spread" logic implementation rest (two) sorts are performed with sort
+order to move NUMA nodes with more available resources (CPUs and memory) at the
+BEGINNING of host's NUMA nodes list. Sort based on memory is the first sort
+implemented and has least priority.
+
+Finally resulting list (after all sorts) is passed next and attempts to place
+VM's NUMA node to host's NUMA node are performed starting from the first
+host's NUMA node in list.
 
 .. caution::
 
@@ -680,6 +730,102 @@ CPU policy, meanwhile, will consume ``VCPU`` inventory.
 
 .. _configure-hyperv-numa:
 
+Configuring CPU power management for dedicated cores
+----------------------------------------------------
+
+.. versionchanged:: 27.0.0
+
+   This feature was only introduced by the 2023.1 Antelope release
+
+.. important::
+
+   The functionality described below is currently only supported by the
+   libvirt/KVM driver.
+
+For power saving reasons, operators can decide to turn down the power usage of
+CPU cores whether they are in use or not. For obvious reasons, Nova only allows
+to change the power consumption of a dedicated CPU core and not a shared one.
+Accordingly, usage of this feature relies on the reading of
+:oslo.config:option:`compute.cpu_dedicated_set` config option to know which CPU
+cores to handle.
+The main action to enable the power management of dedicated cores is to set
+:oslo.config:option:`libvirt.cpu_power_management` config option to ``True``.
+
+By default, if this option is enabled, Nova will lookup the dedicated cores and
+power them down at the compute service startup. Then, once an instance starts
+by being attached to a dedicated core, this below core will be powered up right
+before the libvirt guest starts. On the other way, once an instance is stopped,
+migrated or deleted, then the corresponding dedicated core will be powered down.
+
+There are two distinct strategies for powering up or down :
+
+- the default is to offline the CPU core and online it when needed.
+- an alternative strategy is to use two distinct CPU governors for the up state
+  and the down state.
+
+The strategy can be chosen using
+:oslo.config:option:`libvirt.cpu_power_management_strategy` config option.
+``cpu_state`` supports the first online/offline strategy, while ``governor``
+sets the alternative strategy.
+We default to turning off the cores as it provides you the best power savings
+while there could be other tools outside Nova to manage the governor, like
+tuned. That being said, we also provide a way to automatically change the
+governors on the fly, as explained below.
+
+.. important::
+   Some OS platforms don't support `cpufreq` resources in sysfs, so the
+   ``governor`` strategy could be not available. Please verify if your OS
+   supports scaling govenors before modifying the configuration option.
+
+If the strategy is set to ``governor``, a couple of config options are provided
+to define which exact CPU governor to use for each of the up and down states :
+
+- :oslo.config:option:`libvirt.cpu_power_governor_low` will define the governor
+  to use for the powerdown state (defaults to ``powersave``)
+- :oslo.config:option:`libvirt.cpu_power_governor_high` will define the
+  governor to use for the powerup state (defaults to ``performance``)
+
+.. important::
+   This is the responsibility of the operator to ensure that the govenors
+   defined by the configuration options are currently supported by the OS
+   underlying kernel that runs the compute service.
+
+   As a side note, we recommend the ``schedutil`` governor as an alternative for
+   the high-power state (if the kernel supports it) as the CPU frequency is
+   dynamically set based on CPU task states. Other governors may be worth to
+   be tested, including ``conservative`` and ``ondemand`` which are quite a bit
+   more power consuming than ``schedutil`` but more efficient than
+   ``performance``. See `Linux kernel docs`_ for further explanations.
+
+.. _`Linux kernel docs`: https://www.kernel.org/doc/Documentation/cpu-freq/governors.txt
+
+As an example, a ``nova.conf`` part of configuration would look like::
+
+    [compute]
+    cpu_dedicated_set=2-17
+
+    [libvirt]
+    cpu_power_management=True
+    cpu_power_management_strategy=cpu_state
+
+.. warning::
+
+   The CPU core #0 has a special meaning in most of the recent Linux kernels.
+   This is always highly discouraged to use it for CPU pinning but please
+   refrain to have it power managed or you could have surprises if Nova turns
+   it off!
+
+One last important note : you can decide to change the CPU management strategy
+during the compute lifecycle, or you can currently already manage the CPU
+states. For ensuring that Nova can correctly manage the CPU performances, we
+added a couple of checks at startup that refuse to start nova-compute service
+if those arbitrary rules aren't enforced :
+
+- if the operator opts for ``cpu_state`` strategy, then all dedicated CPU
+  governors *MUST* be identical.
+- if they decide using ``governor``, then all dedicated CPU cores *MUST* be
+  online.
+
 Configuring Hyper-V compute nodes for instance NUMA policies
 ------------------------------------------------------------
 
@@ -724,5 +870,4 @@ instances with a NUMA topology.
 
 .. Links
 .. _`Image metadata`: https://docs.openstack.org/image-guide/introduction.html#image-metadata
-.. _`discussion`: http://lists.openstack.org/pipermail/openstack-dev/2016-March/090367.html
 .. _`MTTCG project`: http://wiki.qemu.org/Features/tcg-multithread

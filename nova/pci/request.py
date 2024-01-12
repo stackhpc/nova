@@ -43,6 +43,7 @@ import typing as ty
 import jsonschema
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
+from oslo_utils import uuidutils
 
 import nova.conf
 from nova import context as ctx
@@ -58,6 +59,7 @@ Alias = ty.Dict[str, ty.Tuple[str, ty.List[ty.Dict[str, str]]]]
 PCI_NET_TAG = 'physical_network'
 PCI_TRUSTED_TAG = 'trusted'
 PCI_DEVICE_TYPE_TAG = 'dev_type'
+PCI_REMOTE_MANAGED_TAG = 'remote_managed'
 
 DEVICE_TYPE_FOR_VNIC_TYPE = {
     network_model.VNIC_TYPE_DIRECT_PHYSICAL: obj_fields.PciDeviceType.SRIOV_PF,
@@ -104,6 +106,12 @@ _ALIAS_SCHEMA = {
             "type": "string",
             "enum": list(obj_fields.PCINUMAAffinityPolicy.ALL),
         },
+        "resource_class": {
+            "type": "string",
+        },
+        "traits": {
+            "type": "string",
+        },
     },
     "required": ["name"],
 }
@@ -112,7 +120,7 @@ _ALIAS_SCHEMA = {
 def _get_alias_from_config() -> Alias:
     """Parse and validate PCI aliases from the nova config.
 
-    :returns: A dictionary where the keys are device names and the values are
+    :returns: A dictionary where the keys are alias names and the values are
         tuples of form ``(numa_policy, specs)``. ``numa_policy`` describes the
         required NUMA affinity of the device(s), while ``specs`` is a list of
         PCI device specs.
@@ -160,7 +168,7 @@ def _get_alias_from_config() -> Alias:
 
 
 def _translate_alias_to_requests(
-    alias_spec: str, affinity_policy: str = None,
+    alias_spec: str, affinity_policy: ty.Optional[str] = None,
 ) -> ty.List['objects.InstancePCIRequest']:
     """Generate complete pci requests from pci aliases in extra_spec."""
     pci_aliases = _get_alias_from_config()
@@ -182,7 +190,9 @@ def _translate_alias_to_requests(
             count=int(count),
             spec=spec,
             alias_name=name,
-            numa_policy=policy))
+            numa_policy=policy,
+            request_id=uuidutils.generate_uuid(),
+        ))
     return pci_requests
 
 
@@ -245,7 +255,7 @@ def get_instance_pci_request_from_vif(
 
 
 def get_pci_requests_from_flavor(
-    flavor: 'objects.Flavor', affinity_policy: str = None,
+    flavor: 'objects.Flavor', affinity_policy: ty.Optional[str] = None,
 ) -> 'objects.InstancePCIRequests':
     """Validate and return PCI requests.
 

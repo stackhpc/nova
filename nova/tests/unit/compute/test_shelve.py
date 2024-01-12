@@ -10,8 +10,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
 import eventlet
-import mock
 from oslo_utils import fixture as utils_fixture
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
@@ -24,6 +25,7 @@ from nova.compute import task_states
 from nova.compute import utils as compute_utils
 from nova.compute import vm_states
 import nova.conf
+from nova import context
 from nova.db.main import api as db
 from nova import exception
 from nova.network import neutron as neutron_api
@@ -207,6 +209,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
         instance = self._shelve_offload(clean_shutdown=False)
         mock_power_off.assert_called_once_with(instance, 0, 0)
 
+    @mock.patch.object(neutron_api.API, 'unbind_ports')
     @mock.patch.object(compute_utils, 'EventReporter')
     @mock.patch.object(objects.BlockDeviceMappingList, 'get_by_instance_uuid')
     @mock.patch.object(nova.compute.manager.ComputeManager,
@@ -223,7 +226,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
     def _shelve_offload(self, mock_notify, mock_notify_instance_usage,
                         mock_get_power_state, mock_update_resource_tracker,
                         mock_delete_alloc, mock_terminate, mock_get_bdms,
-                        mock_event, clean_shutdown=True):
+                        mock_event, mock_unbind_ports, clean_shutdown=True):
         host = 'fake-mini'
         instance = self._create_fake_instance_obj(params={'host': host})
         instance.task_state = task_states.SHELVING
@@ -276,10 +279,13 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
                                            instance.uuid,
                                            graceful_exit=False)
 
+        mock_unbind_ports.assert_called_once_with(
+            self.context, mock.ANY, detach=False)
+
         return instance
 
     @mock.patch('nova.compute.utils.'
-                'update_pci_request_spec_with_allocated_interface_name',
+                'update_pci_request_with_placement_allocations',
                 new=mock.NonCallableMock())
     @mock.patch('nova.objects.BlockDeviceMappingList.get_by_instance_uuid')
     @mock.patch('nova.compute.utils.notify_about_instance_action')
@@ -629,7 +635,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
 
     @mock.patch('nova.network.neutron.API.setup_instance_network_on_host')
     @mock.patch('nova.compute.utils.'
-                'update_pci_request_spec_with_allocated_interface_name')
+                'update_pci_request_with_placement_allocations')
     def test_unshelve_with_resource_request(
             self, mock_update_pci, mock_setup_network):
         requested_res = [objects.RequestGroup(
@@ -640,7 +646,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
 
         self.compute.unshelve_instance(
             self.context, instance, image=None,
-            filter_properties={}, node='fake-node', request_spec=request_spec,
+            filter_properties={}, node='fakenode1', request_spec=request_spec,
             accel_uuids=[])
 
         mock_update_pci.assert_called_once_with(
@@ -653,7 +659,7 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
     @mock.patch('nova.network.neutron.API.setup_instance_network_on_host',
                 new=mock.NonCallableMock())
     @mock.patch('nova.compute.utils.'
-                'update_pci_request_spec_with_allocated_interface_name')
+                'update_pci_request_with_placement_allocations')
     def test_unshelve_with_resource_request_update_raises(
             self, mock_update_pci):
         requested_res = [objects.RequestGroup(
@@ -676,6 +682,26 @@ class ShelveComputeManagerTestCase(test_compute.BaseTestCase):
         mock_update_pci.assert_called_once_with(
             self.context, self.compute.reportclient, [],
             {uuids.port_1: [uuids.rp1]})
+
+    def test_unshelve_spawn_fails_cleanup_instance_image_ref(self):
+        """Tests error handling when a instance fails to unshelve and makes
+        sure to revert instance.image_ref to the initial value instead of
+        keeping the one of shelved image
+        https://bugs.launchpad.net/nova/+bug/1934094
+        """
+        instance = self._create_fake_instance_obj()
+        initial_image_ref = instance.image_ref
+
+        fake_spec = objects.RequestSpec()
+        shelved_image = {'id': uuids.image_id}
+
+        with mock.patch.object(self.compute.driver, 'spawn',
+                side_effect=test.TestingException('Spawn Failed')):
+            self.assertRaises(test.TestingException,
+                    self.compute.unshelve_instance, self.context, instance,
+                    image=shelved_image, filter_properties={},
+                    node='fakenode1', request_spec=fake_spec, accel_uuids=[])
+        self.assertEqual(instance.image_ref, initial_image_ref)
 
     @mock.patch.object(objects.InstanceList, 'get_by_filters')
     def test_shelved_poll_none_offloaded(self, mock_get_by_filters):
@@ -829,9 +855,67 @@ class ShelveComputeAPITestCase(test_compute.BaseTestCase):
             exclude_states = set()
         return vm_state - exclude_states
 
+    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.'
+                'aggregate_add_host')
+    @mock.patch('nova.availability_zones.get_availability_zones')
+    def _create_host_inside_az(
+            self,
+            ctxt,
+            host,
+            az,
+            mock_az,
+            mock_aggregate,
+            ):
+
+        self.api = compute_api.AggregateAPI()
+        mock_az.return_value = [az]
+
+        cells = objects.CellMappingList.get_all(ctxt)
+        cell = cells[0]
+        with context.target_cell(ctxt, cell) as cctxt:
+            s = objects.Service(context=cctxt,
+                                host=host,
+                                binary='nova-compute',
+                                topic='compute',
+                                report_count=0)
+            s.create()
+
+        hm = objects.HostMapping(context=ctxt,
+                                 cell_mapping=cell,
+                                 host=host)
+        hm.create()
+
+        self._init_aggregate_with_host(None, 'fake_aggregate1',
+                                       az, host)
+
+    def _create_request_spec_for_initial_az(self, az):
+        fake_spec = objects.RequestSpec()
+        fake_spec.availability_zone = az
+        return fake_spec
+
+    def _assert_unshelving_and_request_spec_az_and_host(
+            self,
+            context,
+            instance,
+            fake_spec,
+            fake_zone,
+            fake_host,
+            mock_get_by_instance_uuid,
+            mock_unshelve
+    ):
+        mock_get_by_instance_uuid.assert_called_once_with(context,
+                                                     instance.uuid)
+
+        mock_unshelve.assert_called_once_with(context, instance, fake_spec)
+
+        self.assertEqual(instance.task_state, task_states.UNSHELVING)
+        self.assertEqual(fake_spec.availability_zone, fake_zone)
+        if fake_host:
+            self.assertEqual(fake_spec.requested_destination.host, fake_host)
+
     def _test_shelve(self, vm_state=vm_states.ACTIVE, boot_from_volume=False,
                      clean_shutdown=True):
-        # Ensure instance can be shelved.
+
         params = dict(task_state=None, vm_state=vm_state, display_name='vm01')
         fake_instance = self._create_fake_instance_obj(params=params)
         instance = fake_instance
@@ -968,12 +1052,14 @@ class ShelveComputeAPITestCase(test_compute.BaseTestCase):
 
         return instance
 
+    @mock.patch.object(objects.RequestSpec, 'save')
     @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
-    def test_unshelve(self, get_by_instance_uuid):
+    def test_unshelve(self, get_by_instance_uuid, fake_save):
         # Ensure instance can be unshelved.
         instance = self._get_specify_state_instance(vm_states.SHELVED)
 
         fake_spec = objects.RequestSpec()
+        fake_spec.availability_zone = None
         get_by_instance_uuid.return_value = fake_spec
         with mock.patch.object(self.compute_api.compute_task_api,
                                'unshelve_instance') as unshelve:
@@ -1096,24 +1182,558 @@ class ShelveComputeAPITestCase(test_compute.BaseTestCase):
         mock_get_bdms.assert_called_once_with(self.context, instance.uuid)
         mock_get.assert_called_once_with(self.context, uuids.volume_id)
 
-    @mock.patch.object(compute_api.API, '_validate_unshelve_az')
+# Next tests attempt to check the following behavior
+# +----------+---------------------------+-------+----------------------------+
+# | Boot     | Unshelve after offload AZ | Host  | Result                     |
+# +==========+===========================+=======+============================+
+# |  No AZ   | No AZ or AZ=null          | No    | Free scheduling,           |
+# |          |                           |       | reqspec.AZ=None            |
+# +----------+---------------------------+-------+----------------------------+
+# |  No AZ   | No AZ or AZ=null          | Host1 | Schedule to host1,         |
+# |          |                           |       | reqspec.AZ=None            |
+# +----------+---------------------------+-------+----------------------------+
+# |  No AZ   | AZ="AZ1"                  | No    | Schedule to AZ1,           |
+# |          |                           |       | reqspec.AZ="AZ1"           |
+# +----------+---------------------------+-------+----------------------------+
+# |  No AZ   | AZ="AZ1"                  | Host1 | Verify that host1 in AZ1,  |
+# |          |                           |       | or (1). Schedule to        |
+# |          |                           |       | host1, reqspec.AZ="AZ1"    |
+# +----------+---------------------------+-------+----------------------------+
+# |  AZ1     | No AZ                     | No    | Schedule to AZ1,           |
+# |          |                           |       | reqspec.AZ="AZ1"           |
+# +----------+---------------------------+-------+----------------------------+
+# |  AZ1     | AZ=null                   | No    | Free scheduling,           |
+# |          |                           |       | reqspec.AZ=None            |
+# +----------+---------------------------+-------+----------------------------+
+# |  AZ1     | No AZ                     | Host1 | If host1 is in AZ1,        |
+# |          |                           |       | then schedule to host1,    |
+# |          |                           |       | reqspec.AZ="AZ1", otherwise|
+# |          |                           |       | reject the request (1)     |
+# +----------+---------------------------+-------+----------------------------+
+# |  AZ1     | AZ=null                   | Host1 | Schedule to host1,         |
+# |          |                           |       | reqspec.AZ=None            |
+# +----------+---------------------------+-------+----------------------------+
+# |  AZ1     | AZ="AZ2"                  | No    | Schedule to AZ2,           |
+# |          |                           |       | reqspec.AZ="AZ2"           |
+# +----------+---------------------------+-------+----------------------------+
+# |  AZ1     | AZ="AZ2"                  | Host1 | If host1 in AZ2 then       |
+# |          |                           |       | schedule to host1,         |
+# |          |                           |       | reqspec.AZ="AZ2",          |
+# |          |                           |       | otherwise reject (1)       |
+# +----------+---------------------------+-------+----------------------------+
+#
+# (1) Check at the api and return an error.
+#
+#
+# +----------+---------------------------+-------+----------------------------+
+# |  No AZ   | No AZ or AZ=null          | No    | Free scheduling,           |
+# |          |                           |       | reqspec.AZ=None            |
+# +----------+---------------------------+-------+----------------------------+
+    @mock.patch.object(nova.conductor.ComputeTaskAPI, 'unshelve_instance')
     @mock.patch.object(objects.RequestSpec, 'save')
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
     @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
-    def test_specified_az_unshelve(self, get_by_instance_uuid,
-                                   mock_save, mock_validate_unshelve_az):
-        # Ensure instance can be unshelved.
+    def test_unshelve_without_az(
+            self,
+            mock_get_by_instance_uuid,
+            mock_get_all_by_host,
+            mock_save,
+            mock_unshelve
+        ):
+
+        context = self.context.elevated()
+        fake_host = 'fake_host1'
+        fake_zone = 'avail_zone1'
+        self._create_host_inside_az(self.context, fake_host, fake_zone)
+
         instance = self._get_specify_state_instance(
             vm_states.SHELVED_OFFLOADED)
 
-        new_az = "west_az"
-        fake_spec = objects.RequestSpec()
-        fake_spec.availability_zone = "fake-old-az"
-        get_by_instance_uuid.return_value = fake_spec
+        fake_spec = self._create_request_spec_for_initial_az(None)
+        mock_get_by_instance_uuid.return_value = fake_spec
 
-        self.compute_api.unshelve(self.context, instance, new_az=new_az)
+        self.compute_api.unshelve(context, instance)
 
-        mock_save.assert_called_once_with()
-        self.assertEqual(new_az, fake_spec.availability_zone)
+        self._assert_unshelving_and_request_spec_az_and_host(
+            context,
+            instance,
+            fake_spec,
+            None,
+            None,
+            mock_get_by_instance_uuid,
+            mock_unshelve
+        )
 
-        mock_validate_unshelve_az.assert_called_once_with(
-            self.context, instance, new_az)
+# +----------+---------------------------+-------+----------------------------+
+# |  No AZ   | No AZ or AZ=null          | Host1 | Schedule to host1,         |
+# |          |                           |       | reqspec.AZ=None            |
+# +----------+---------------------------+-------+----------------------------+
+    @mock.patch.object(nova.conductor.ComputeTaskAPI, 'unshelve_instance')
+    @mock.patch.object(objects.RequestSpec, 'save')
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    def test_unshelve_without_az_to_host(
+            self,
+            mock_get_by_instance_uuid,
+            mock_get_all_by_host,
+            mock_save,
+            mock_unshelve
+        ):
+
+        context = self.context.elevated()
+        fake_host = 'fake_host1'
+        fake_zone = 'avail_zone1'
+        self._create_host_inside_az(self.context, fake_host, fake_zone)
+
+        instance = self._get_specify_state_instance(
+            vm_states.SHELVED_OFFLOADED)
+
+        fake_spec = self._create_request_spec_for_initial_az(None)
+        mock_get_by_instance_uuid.return_value = fake_spec
+
+        self.compute_api.unshelve(context, instance, host=fake_host)
+
+        self._assert_unshelving_and_request_spec_az_and_host(
+            context,
+            instance,
+            fake_spec,
+            None,
+            fake_host,
+            mock_get_by_instance_uuid,
+            mock_unshelve
+        )
+
+# +----------+---------------------------+-------+----------------------------+
+# |  No AZ   | AZ="AZ1"                  | No    | Schedule to AZ1,           |
+# |          |                           |       | reqspec.AZ="AZ1"           |
+# +----------+---------------------------+-------+----------------------------+
+    @mock.patch.object(nova.conductor.ComputeTaskAPI, 'unshelve_instance')
+    @mock.patch.object(objects.RequestSpec, 'save')
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    def test_unshelve_without_az_to_newaz(
+            self,
+            mock_get_by_instance_uuid,
+            mock_get_all_by_host,
+            mock_save,
+            mock_unshelve
+        ):
+
+        context = self.context.elevated()
+        fake_host = 'fake_host1'
+        fake_zone = 'avail_zone1'
+        self._create_host_inside_az(self.context, fake_host, fake_zone)
+
+        instance = self._get_specify_state_instance(
+            vm_states.SHELVED_OFFLOADED)
+
+        fake_spec = self._create_request_spec_for_initial_az(None)
+        mock_get_by_instance_uuid.return_value = fake_spec
+
+        self.compute_api.unshelve(context, instance, new_az=fake_zone)
+
+        self._assert_unshelving_and_request_spec_az_and_host(
+            context,
+            instance,
+            fake_spec,
+            fake_zone,
+            None,
+            mock_get_by_instance_uuid,
+            mock_unshelve
+        )
+
+# +----------+---------------------------+-------+----------------------------+
+# |  No AZ   | AZ="AZ1"                  | Host1 | Verify that host1 in AZ1,  |
+# |          |                           |       | or (1). Schedule to        |
+# |          |                           |       | host1, reqspec.AZ="AZ1"    |
+# +----------+---------------------------+-------+----------------------------+
+    @mock.patch.object(nova.conductor.ComputeTaskAPI, 'unshelve_instance')
+    @mock.patch.object(objects.RequestSpec, 'save')
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    def test_unshelve_without_az_to_newaz_and_host(
+            self,
+            mock_get_by_instance_uuid,
+            mock_get_all_by_host,
+            mock_save,
+            mock_unshelve
+        ):
+
+        context = self.context.elevated()
+        fake_host = 'fake_host1'
+        fake_zone = 'avail_zone1'
+        self._create_host_inside_az(self.context, fake_host, fake_zone)
+
+        instance = self._get_specify_state_instance(
+            vm_states.SHELVED_OFFLOADED)
+
+        fake_spec = self._create_request_spec_for_initial_az(None)
+        mock_get_by_instance_uuid.return_value = fake_spec
+
+        self.compute_api.unshelve(
+            context, instance, new_az=fake_zone, host=fake_host
+        )
+
+        self._assert_unshelving_and_request_spec_az_and_host(
+            context,
+            instance,
+            fake_spec,
+            fake_zone,
+            fake_host,
+            mock_get_by_instance_uuid,
+            mock_unshelve
+        )
+
+    @mock.patch.object(nova.conductor.ComputeTaskAPI, 'unshelve_instance')
+    @mock.patch.object(objects.RequestSpec, 'save')
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    def test_unshelve_without_az_to_newaz_and_host_invalid(
+            self,
+            mock_get_by_instance_uuid,
+            mock_get_all_by_host,
+            mock_save,
+            mock_unshelve
+        ):
+
+        context = self.context.elevated()
+        fake_host = 'fake_host1'
+        fake_zone = 'avail_zone1'
+        self._create_host_inside_az(self.context, fake_host, fake_zone)
+
+        instance = self._get_specify_state_instance(
+            vm_states.SHELVED_OFFLOADED)
+
+        fake_spec = self._create_request_spec_for_initial_az(None)
+        mock_get_by_instance_uuid.return_value = fake_spec
+
+        exc = self.assertRaises(
+            nova.exception.UnshelveHostNotInAZ,
+            self.compute_api.unshelve,
+            context,
+            instance,
+            new_az='avail_zone1',
+            host='fake_mini'
+        )
+
+        self.assertIn(
+            exc.message,
+            'Host "fake_mini" is not in the availability zone "avail_zone1".'
+        )
+
+# +----------+---------------------------+-------+----------------------------+
+# |  AZ1     | No AZ                     | No    | Schedule to AZ1,           |
+# |          |                           |       | reqspec.AZ="AZ1"           |
+# +----------+---------------------------+-------+----------------------------+
+    @mock.patch.object(nova.conductor.ComputeTaskAPI, 'unshelve_instance')
+    @mock.patch.object(objects.RequestSpec, 'save')
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    def test_unshelve_with_az(
+            self,
+            mock_get_by_instance_uuid,
+            mock_get_all_by_host,
+            mock_save,
+            mock_unshelve
+        ):
+
+        context = self.context.elevated()
+        fake_host = 'fake_host1'
+        fake_zone = 'avail_zone1'
+        self._create_host_inside_az(self.context, fake_host, fake_zone)
+
+        instance = self._get_specify_state_instance(
+            vm_states.SHELVED_OFFLOADED)
+
+        fake_spec = self._create_request_spec_for_initial_az(fake_zone)
+        mock_get_by_instance_uuid.return_value = fake_spec
+
+        self.compute_api.unshelve(context, instance)
+
+        self._assert_unshelving_and_request_spec_az_and_host(
+            context,
+            instance,
+            fake_spec,
+            fake_zone,
+            None,
+            mock_get_by_instance_uuid,
+            mock_unshelve
+        )
+
+# +----------+---------------------------+-------+----------------------------+
+# |  AZ1     | AZ=null                   | No    | Free scheduling,           |
+# |          |                           |       | reqspec.AZ=None            |
+# +----------+---------------------------+-------+----------------------------+
+    @mock.patch.object(nova.conductor.ComputeTaskAPI, 'unshelve_instance')
+    @mock.patch.object(objects.RequestSpec, 'save')
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    def test_unshelve_with_az_to_unpin_az(
+            self,
+            mock_get_by_instance_uuid,
+            mock_get_all_by_host,
+            mock_save,
+            mock_unshelve
+        ):
+
+        context = self.context.elevated()
+        fake_host = 'fake_host1'
+        fake_zone = 'avail_zone1'
+        self._create_host_inside_az(self.context, fake_host, fake_zone)
+
+        instance = self._get_specify_state_instance(
+            vm_states.SHELVED_OFFLOADED)
+
+        fake_spec = self._create_request_spec_for_initial_az(fake_zone)
+        mock_get_by_instance_uuid.return_value = fake_spec
+
+        self.compute_api.unshelve(context, instance, new_az=None)
+
+        self._assert_unshelving_and_request_spec_az_and_host(
+            context,
+            instance,
+            fake_spec,
+            None,
+            None,
+            mock_get_by_instance_uuid,
+            mock_unshelve
+        )
+
+# +----------+---------------------------+-------+----------------------------+
+# |  AZ1     | No AZ                     | Host1 | If host1 is in AZ1,        |
+# |          |                           |       | then schedule to host1,    |
+# |          |                           |       | reqspec.AZ="AZ1", otherwise|
+# |          |                           |       | reject the request (1)     |
+# +----------+---------------------------+-------+----------------------------+
+    @mock.patch.object(nova.conductor.ComputeTaskAPI, 'unshelve_instance')
+    @mock.patch.object(objects.RequestSpec, 'save')
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    def test_unshelve_with_az_to_host_in_az(
+            self,
+            mock_get_by_instance_uuid,
+            mock_get_all_by_host,
+            mock_save,
+            mock_unshelve
+        ):
+
+        context = self.context.elevated()
+        fake_host = 'fake_host1'
+        fake_zone = 'avail_zone1'
+        self._create_host_inside_az(self.context, fake_host, fake_zone)
+
+        instance = self._get_specify_state_instance(
+            vm_states.SHELVED_OFFLOADED)
+
+        fake_spec = self._create_request_spec_for_initial_az(fake_zone)
+        mock_get_by_instance_uuid.return_value = fake_spec
+
+        self.compute_api.unshelve(context, instance, host=fake_host)
+
+        self._assert_unshelving_and_request_spec_az_and_host(
+            context,
+            instance,
+            fake_spec,
+            fake_zone,
+            fake_host,
+            mock_get_by_instance_uuid,
+            mock_unshelve
+        )
+
+    @mock.patch.object(nova.conductor.ComputeTaskAPI, 'unshelve_instance')
+    @mock.patch.object(objects.RequestSpec, 'save')
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    def test_unshelve_with_az_to_invalid_host(
+            self,
+            mock_get_by_instance_uuid,
+            mock_get_all_by_host,
+            mock_save,
+            mock_unshelve
+        ):
+
+        context = self.context.elevated()
+        fake_host = 'fake_host1'
+        fake_zone = 'avail_zone1'
+        self._create_host_inside_az(self.context, fake_host, fake_zone)
+
+        instance = self._get_specify_state_instance(
+            vm_states.SHELVED_OFFLOADED)
+
+        fake_spec = self._create_request_spec_for_initial_az(fake_zone)
+        mock_get_by_instance_uuid.return_value = fake_spec
+
+        exc = self.assertRaises(
+            nova.exception.UnshelveHostNotInAZ,
+            self.compute_api.unshelve,
+            context,
+            instance,
+            host='fake_mini'
+        )
+
+        self.assertIn(
+            exc.message,
+            'Host "fake_mini" is not in the availability zone "avail_zone1".'
+        )
+
+# +----------+---------------------------+-------+----------------------------+
+# |  AZ1     | AZ=null                   | Host1 | Schedule to host1,         |
+# |          |                           |       | reqspec.AZ=None            |
+# +----------+---------------------------+-------+----------------------------+
+    @mock.patch.object(nova.conductor.ComputeTaskAPI, 'unshelve_instance')
+    @mock.patch.object(objects.RequestSpec, 'save')
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    def test_unshelve_with_az_to_host_unpin_az(
+            self,
+            mock_get_by_instance_uuid,
+            mock_get_all_by_host,
+            mock_save,
+            mock_unshelve
+        ):
+
+        context = self.context.elevated()
+        fake_host = 'fake_host1'
+        fake_zone = 'avail_zone1'
+        self._create_host_inside_az(self.context, fake_host, fake_zone)
+
+        instance = self._get_specify_state_instance(
+            vm_states.SHELVED_OFFLOADED)
+
+        fake_spec = self._create_request_spec_for_initial_az(fake_zone)
+        mock_get_by_instance_uuid.return_value = fake_spec
+
+        self.compute_api.unshelve(
+            context, instance, new_az=None, host=fake_host
+        )
+
+        self._assert_unshelving_and_request_spec_az_and_host(
+            context,
+            instance,
+            fake_spec,
+            None,
+            fake_host,
+            mock_get_by_instance_uuid,
+            mock_unshelve
+        )
+
+# +----------+---------------------------+-------+----------------------------+
+# |  AZ1     | AZ="AZ2"                  | No    | Schedule to AZ2,           |
+# |          |                           |       | reqspec.AZ="AZ2"           |
+# +----------+---------------------------+-------+----------------------------+
+    @mock.patch.object(nova.conductor.ComputeTaskAPI, 'unshelve_instance')
+    @mock.patch.object(objects.RequestSpec, 'save')
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    def test_unshelve_with_az_to_newaz(
+            self,
+            mock_get_by_instance_uuid,
+            mock_get_all_by_host,
+            mock_save,
+            mock_unshelve
+        ):
+
+        context = self.context.elevated()
+        fake_host = 'fake_host1'
+        fake_zone = 'avail_zone1'
+        self._create_host_inside_az(self.context, fake_host, fake_zone)
+
+        instance = self._get_specify_state_instance(
+            vm_states.SHELVED_OFFLOADED)
+
+        fake_spec = self._create_request_spec_for_initial_az('az1')
+        mock_get_by_instance_uuid.return_value = fake_spec
+
+        self.compute_api.unshelve(
+            context, instance, new_az=fake_zone
+        )
+
+        self._assert_unshelving_and_request_spec_az_and_host(
+            context,
+            instance,
+            fake_spec,
+            fake_zone,
+            None,
+            mock_get_by_instance_uuid,
+            mock_unshelve
+        )
+
+# +----------+---------------------------+-------+----------------------------+
+# |  AZ1     | AZ="AZ2"                  | Host1 | If host1 in AZ2 then       |
+# |          |                           |       | schedule to host1,         |
+# |          |                           |       | reqspec.AZ="AZ2",          |
+# |          |                           |       | otherwise reject (1)       |
+# +----------+---------------------------+-------+----------------------------+
+    @mock.patch.object(nova.conductor.ComputeTaskAPI, 'unshelve_instance')
+    @mock.patch.object(objects.RequestSpec, 'save')
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    def test_unshelve_with_az_to_newaz_and_host(
+            self,
+            mock_get_by_instance_uuid,
+            mock_get_all_by_host,
+            mock_save,
+            mock_unshelve
+        ):
+
+        context = self.context.elevated()
+        fake_host = 'fake_host1'
+        fake_zone = 'avail_zone1'
+        self._create_host_inside_az(self.context, fake_host, fake_zone)
+
+        instance = self._get_specify_state_instance(
+            vm_states.SHELVED_OFFLOADED)
+
+        fake_spec = self._create_request_spec_for_initial_az('az1')
+        mock_get_by_instance_uuid.return_value = fake_spec
+
+        self.compute_api.unshelve(
+            context, instance, new_az=fake_zone, host=fake_host
+        )
+
+        self._assert_unshelving_and_request_spec_az_and_host(
+            context,
+            instance,
+            fake_spec,
+            fake_zone,
+            fake_host,
+            mock_get_by_instance_uuid,
+            mock_unshelve
+        )
+
+    @mock.patch.object(nova.conductor.ComputeTaskAPI, 'unshelve_instance')
+    @mock.patch.object(objects.RequestSpec, 'save')
+    @mock.patch.object(objects.ComputeNodeList, 'get_all_by_host')
+    @mock.patch.object(objects.RequestSpec, 'get_by_instance_uuid')
+    def test_unshelve_with_az_to_newaz_and_invalid_host(
+            self,
+            mock_get_by_instance_uuid,
+            mock_get_all_by_host,
+            mock_save,
+            mock_unshelve
+        ):
+
+        context = self.context.elevated()
+        fake_host = 'fake_host1'
+        fake_zone = 'avail_zone1'
+        self._create_host_inside_az(self.context, fake_host, fake_zone)
+
+        instance = self._get_specify_state_instance(
+            vm_states.SHELVED_OFFLOADED)
+
+        fake_spec = self._create_request_spec_for_initial_az('az1')
+        mock_get_by_instance_uuid.return_value = fake_spec
+
+        exc = self.assertRaises(
+            nova.exception.UnshelveHostNotInAZ,
+            self.compute_api.unshelve,
+            context,
+            instance,
+            new_az=fake_zone,
+            host='fake_mini'
+        )
+
+        self.assertIn(
+            exc.message,
+            'Host "fake_mini" is not in the availability zone "avail_zone1".'
+        )

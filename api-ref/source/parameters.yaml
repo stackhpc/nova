@@ -1858,8 +1858,11 @@ availability_zone_state:
 availability_zone_unshelve:
   description: |
     The availability zone name. Specifying an availability zone is only
-    allowed when the server status is ``SHELVED_OFFLOADED`` otherwise a
-    409 HTTPConflict response is returned.
+    allowed when the server status is ``SHELVED_OFFLOADED`` otherwise
+    HTTP 409 conflict response is returned.
+
+    Since microversion 2.91 ``"availability_zone":null`` allows unpinning the
+    instance from any availability_zone it is pinned to.
   in: body
   required: false
   type: string
@@ -3126,8 +3129,9 @@ flavor_id_body_2_46:
   max_version: 2.46
 flavor_id_body_create:
   description: |
-    The ID of the flavor. While people often make this look like an int, this
-    is really a string. If not provided, this defaults to a uuid.
+    Only alphanumeric characters with hyphen '-', underscore '_', spaces
+    and dots '.' are permitted. If an ID is not provided, then a default UUID
+    will be assigned.
   in: body
   required: false
   type: string
@@ -3375,7 +3379,7 @@ force_evacuate:
       Furthermore, this should not be specified when evacuating instances
       managed by a clustered hypervisor driver like ironic since you
       cannot specify a node, so the compute service will pick a node randomly
-      which may not be able to accomodate the instance.
+      which may not be able to accommodate the instance.
   in: body
   required: false
   type: boolean
@@ -3690,6 +3694,15 @@ host_status_update_rebuild:
   required: false
   type: string
   min_version: 2.75
+host_unshelve:
+  description: |
+    The destination host name. Specifying a destination host is by default only
+    allowed to project_admin, if it not the case HTTP 403 forbidden response
+    is returned.
+  in: body
+  required: false
+  type: string
+  min_version: 2.91
 host_zone:
   description: |
     The available zone of the host.
@@ -4007,14 +4020,15 @@ imageRef:
   type: string
 imageRef_rebuild:
   description: |
-    The UUID of the image to rebuild for your server instance.
-    It must be a valid UUID otherwise API will return 400.
-    If rebuilding a volume-backed server with a new image
-    (an image different from the image used when creating the volume),
-    the API will return 400.
-    For non-volume-backed servers, specifying a new image will result
-    in validating that the image is acceptable for the current compute host
-    on which the server exists. If the new image is not valid,
+    The UUID of the image to rebuild for your server instance.  It
+    must be a valid UUID otherwise API will return 400.  To rebuild a
+    volume-backed server with a new image, at least microversion 2.93
+    needs to be provided in the request else the request will fall
+    back to old behaviour i.e. the API will return 400 (for an image
+    different from the image used when creating the volume).  For
+    non-volume-backed servers, specifying a new image will result in
+    validating that the image is acceptable for the current compute
+    host on which the server exists. If the new image is not valid,
     the server will go into ``ERROR`` status.
   in: body
   required: true
@@ -4402,7 +4416,19 @@ keypair_name:
   required: true
   type: string
   description: |
+    The name for the keypair.
+keypair_name_in:
+  in: body
+  required: true
+  type: string
+  description: |
     A name for the keypair which will be used to reference it later.
+
+    .. note::
+
+      Since microversion 2.92, allowed characters are ASCII letters
+      ``[a-zA-Z]``, digits ``[0-9]`` and the following special
+      characters: ``[@._- ]``.
 keypair_private_key:
   description: |
     If you do not provide a public key on create, a new keypair will
@@ -4412,6 +4438,7 @@ keypair_private_key:
   in: body
   required: false
   type: string
+  max_version: 2.91
 keypair_public_key:
   description: |
     The keypair public key.
@@ -4420,10 +4447,11 @@ keypair_public_key:
   type: string
 keypair_public_key_in:
   description: |
-    The public ssh key to import. If you omit this value, a keypair is
-    generated for you.
+    The public ssh key to import.
+    Was optional before microversion 2.92 : if you were omitting this value, a
+    keypair was generated for you.
   in: body
-  required: false
+  required: true
   type: string
 keypair_type:
   in: body
@@ -5531,7 +5559,7 @@ os:scheduler_hints_cidr:
     Schedule the server on a host in the network specified with an IP address
     (``os:scheduler_hints:build_near_host_ip``) and this parameter.
     If ``os:scheduler_hints:build_near_host_ip`` is specified and
-    this paramete is omitted, ``/24`` is used.
+    this parameter is omitted, ``/24`` is used.
     It is available when ``SimpleCIDRAffinityFilter`` is available
     on cloud side.
   in: body
@@ -6344,7 +6372,7 @@ server_hostname: &server_hostname
     .. note::
 
         This information is published via the metadata service and requires
-        application such as ``cloud-init`` to propogate it through to the
+        application such as ``cloud-init`` to propagate it through to the
         instance.
   min_version: 2.3
 server_hostname_req:
@@ -6354,10 +6382,13 @@ server_hostname_req:
   description: |
     The hostname to configure for the instance in the metadata service.
 
+    Starting with microversion 2.94, this can be a Fully Qualified Domain Name
+    (FQDN) of up to 255 characters in length.
+
     .. note::
 
         This information is published via the metadata service and requires
-        application such as ``cloud-init`` to propogate it through to the
+        application such as ``cloud-init`` to propagate it through to the
         instance.
   min_version: 2.90
 server_hostname_update_rebuild:

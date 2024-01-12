@@ -16,13 +16,12 @@ import datetime
 import os
 import os.path
 import tempfile
+from unittest import mock
 
-import eventlet
 import fixtures
 from keystoneauth1 import adapter as ks_adapter
 from keystoneauth1.identity import base as ks_identity
 from keystoneauth1 import session as ks_session
-import mock
 import netaddr
 from openstack import exceptions as sdk_exc
 from oslo_config import cfg
@@ -772,8 +771,8 @@ class SpawnNTestCase(test.NoDBTestCase):
 
         def fake(arg):
             pass
-
-        with mock.patch.object(eventlet, self.spawn_name, _fake_spawn):
+        pool = utils._get_default_green_pool()
+        with mock.patch.object(pool, self.spawn_name, _fake_spawn):
             getattr(utils, self.spawn_name)(fake, 'test')
         self.assertIsNone(common_context.get_current())
 
@@ -790,7 +789,8 @@ class SpawnNTestCase(test.NoDBTestCase):
         def fake(context, kwarg1=None):
             pass
 
-        with mock.patch.object(eventlet, self.spawn_name, _fake_spawn):
+        pool = utils._get_default_green_pool()
+        with mock.patch.object(pool, self.spawn_name, _fake_spawn):
             getattr(utils, self.spawn_name)(fake, ctxt, kwarg1='test')
         self.assertEqual(ctxt, common_context.get_current())
 
@@ -810,7 +810,8 @@ class SpawnNTestCase(test.NoDBTestCase):
         def fake(context, kwarg1=None):
             pass
 
-        with mock.patch.object(eventlet, self.spawn_name, _fake_spawn):
+        pool = utils._get_default_green_pool()
+        with mock.patch.object(pool, self.spawn_name, _fake_spawn):
             getattr(utils, self.spawn_name)(fake, ctxt_passed, kwarg1='test')
         self.assertEqual(ctxt, common_context.get_current())
 
@@ -907,6 +908,7 @@ class TestObjectCallHelpers(test.NoDBTestCase):
 
 class GetKSAAdapterTestCase(test.NoDBTestCase):
     """Tests for nova.utils.get_endpoint_data()."""
+
     def setUp(self):
         super(GetKSAAdapterTestCase, self).setUp()
         self.sess = mock.create_autospec(ks_session.Session, instance=True)
@@ -1072,6 +1074,7 @@ class TestGetConfGroup(test.NoDBTestCase):
 
 class TestGetAuthAndSession(test.NoDBTestCase):
     """Tests for nova.utils._get_auth_and_session"""
+
     def setUp(self):
         super(TestGetAuthAndSession, self).setUp()
 

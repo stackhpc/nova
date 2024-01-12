@@ -13,8 +13,8 @@
 #    under the License.
 
 import datetime
+from unittest import mock
 
-import mock
 from oslo_db import exception as db_exc
 from oslo_utils import uuidutils
 
@@ -540,6 +540,7 @@ class TestFlavorExtraSpecs(test.TestCase):
 
 class TestFlavorFiltering(test.TestCase):
     """Test cases for the filter option available for FlavorList.get_all."""
+
     def setUp(self):
         super().setUp()
         self.context = nova_context.get_admin_context()

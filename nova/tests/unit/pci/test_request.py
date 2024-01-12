@@ -15,7 +15,8 @@
 
 """Tests for PCI request."""
 
-import mock
+from unittest import mock
+
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel
 
@@ -186,6 +187,21 @@ class PciRequestTestCase(test.NoDBTestCase):
             self.assertIn("xxx", aliases)
             self.assertEqual(policy, aliases["xxx"][0])
 
+    def test_get_alias_from_config_valid_rc_and_traits(self):
+        fake_alias = jsonutils.dumps({
+            "name": "xxx",
+            "resource_class": "foo",
+            "traits": "bar,baz",
+        })
+        self.flags(alias=[fake_alias], group='pci')
+        aliases = request._get_alias_from_config()
+        self.assertIsNotNone(aliases)
+        self.assertIn("xxx", aliases)
+        self.assertEqual(
+            ("legacy", [{"resource_class": "foo", "traits": "bar,baz"}]),
+            aliases["xxx"],
+        )
+
     def test_get_alias_from_config_conflicting_device_type(self):
         """Check behavior when device_type conflicts occur."""
         fake_alias_a = jsonutils.dumps({
@@ -255,7 +271,7 @@ class PciRequestTestCase(test.NoDBTestCase):
 
         requests = request._translate_alias_to_requests(
             "QuickAssist : 3, IntelNIC: 1")
-        self.assertEqual(set([p['count'] for p in requests]), set([1, 3]))
+        self.assertEqual(set([p.count for p in requests]), set([1, 3]))
         self._verify_result(expect_request, requests)
 
     def test_translate_alias_to_requests_invalid(self):
@@ -292,7 +308,7 @@ class PciRequestTestCase(test.NoDBTestCase):
 
         requests = request._translate_alias_to_requests(
             "QuickAssist : 3, IntelNIC: 1", affinity_policy=policy)
-        self.assertEqual(set([p['count'] for p in requests]), set([1, 3]))
+        self.assertEqual(set([p.count for p in requests]), set([1, 3]))
         self._verify_result(expect_request, requests)
 
     @mock.patch.object(objects.compute_node.ComputeNode,

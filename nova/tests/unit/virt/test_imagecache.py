@@ -12,7 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from oslo_utils.fixture import uuidsentinel as uuids
 
 from nova import block_device
@@ -64,7 +65,7 @@ ephemeral_bdm = [block_device.BlockDeviceDict(
 
 class ImageCacheManagerTests(test.NoDBTestCase):
 
-    def test_configurationi_defaults(self):
+    def test_configuration_defaults(self):
         self.assertEqual(2400, CONF.image_cache.manager_interval)
         self.assertEqual('_base', CONF.image_cache.subdirectory_name)
         self.assertTrue(CONF.image_cache.remove_unused_base_images)

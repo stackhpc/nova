@@ -11,14 +11,15 @@
 #    under the License.
 
 import time
+from unittest import mock
 
-import mock
 
 from nova import exception
 from nova.tests import fixtures
 from nova.tests.functional.api import client
 from nova.tests.functional.notification_sample_tests \
     import notification_sample_base
+from nova.volume import cinder
 
 
 class TestInstanceNotificationSampleWithMultipleCompute(
@@ -46,18 +47,18 @@ class TestInstanceNotificationSampleWithMultipleCompute(
         self.compute2 = self.start_service('compute', host='host2')
 
         actions = [
-            self._test_live_migration_rollback,
-            self._test_live_migration_abort,
-            self._test_live_migration_success,
-            self._test_evacuate_server,
-            self._test_live_migration_force_complete
+            (self._test_live_migration_rollback, 'ACTIVE'),
+            (self._test_live_migration_abort, 'ACTIVE'),
+            (self._test_live_migration_success, 'ACTIVE'),
+            (self._test_evacuate_server, 'SHUTOFF'),
+            (self._test_live_migration_force_complete, 'ACTIVE'),
         ]
 
-        for action in actions:
+        for action, expected_state in actions:
             self.notifier.reset()
             action(server)
             # Ensure that instance is in active state after an action
-            self._wait_for_state_change(server, 'ACTIVE')
+            self._wait_for_state_change(server, expected_state)
 
     @mock.patch('nova.compute.manager.ComputeManager.'
                 '_live_migration_cleanup_flags', return_value=[True, False])
@@ -193,7 +194,7 @@ class TestInstanceNotificationSampleWithMultipleCompute(
         self.admin_api.delete_migration(server['id'], migrations[0]['id'])
         self._wait_for_notification('instance.live_migration_abort.start')
         self._wait_for_state_change(server, 'ACTIVE')
-        # NOTE(gibi): the intance.live_migration_rollback notification emitted
+        # NOTE(gibi): the instance.live_migration_rollback notification emitted
         # after the instance.live_migration_abort notification so we have to
         # wait for the rollback to ensure we can assert both notifications
         # below
@@ -275,6 +276,12 @@ class TestInstanceNotificationSampleWithMultipleCompute(
         self.admin_api.put_service(service_id, {'forced_down': False})
 
     def _test_live_migration_force_complete(self, server):
+        # In the scenario evacuate happened before which stopped the
+        # server.
+        self._start_server(server)
+        self._wait_for_state_change(server, 'ACTIVE')
+        self.notifier.reset()
+
         post = {
             'os-migrateLive': {
                 'host': 'host2',
@@ -679,7 +686,6 @@ class TestInstanceNotificationSample(
              'state_update.old_state': 'active',
              'state': 'active',
              'task_state': 'deleting',
-             'bandwidth': [],
              'tags': ["tag1"],
              'block_devices': [{
                 "nova_object.data": {
@@ -705,7 +711,6 @@ class TestInstanceNotificationSample(
              'terminated_at': '2012-10-29T13:42:11Z',
              'ip_addresses': [],
              'power_state': 'pending',
-             'bandwidth': [],
              'tags': ["tag1"],
              'block_devices': [{
                 "nova_object.data": {
@@ -1233,7 +1238,7 @@ class TestInstanceNotificationSample(
                     'nova_object.data': {},
                     'nova_object.name': 'ImageMetaPropsPayload',
                     'nova_object.namespace': 'nova',
-                    'nova_object.version': '1.8',
+                    'nova_object.version': '1.13',
                 },
                 'image.size': 58145823,
                 'image.tags': [],
@@ -1329,7 +1334,7 @@ class TestInstanceNotificationSample(
                     'nova_object.data': {},
                     'nova_object.name': 'ImageMetaPropsPayload',
                     'nova_object.namespace': 'nova',
-                    'nova_object.version': '1.8',
+                    'nova_object.version': '1.13',
                 },
                 'image.size': 58145823,
                 'image.tags': [],
@@ -1502,8 +1507,8 @@ class TestInstanceNotificationSample(
         self.api.delete_server_volume(server['id'], volume_id)
         self._wait_for_notification('instance.volume_detach.end')
 
-    def _volume_swap_server(self, server, attachement_id, volume_id):
-        self.api.put_server_volume(server['id'], attachement_id, volume_id)
+    def _volume_swap_server(self, server, attachment_id, volume_id):
+        self.api.put_server_volume(server['id'], attachment_id, volume_id)
 
     def test_volume_swap_server(self):
         server = self._boot_a_server(
@@ -1770,11 +1775,14 @@ class TestInstanceNotificationSample(
         # Leave instance in normal, active state
         self.api.post_server_action(server['id'], {'restore': {}})
 
-    def _do_test_attach_volume_error(self, server, mock_attach):
+    def _test_attach_volume_error(self, server):
         def attach_volume(*args, **kwargs):
             raise exception.CinderConnectionFailed(
                 reason="Connection timed out")
-        mock_attach.side_effect = attach_volume
+
+        # Override the fixture's default implementation of this with our
+        # error-generating version.
+        cinder.API.attachment_update.side_effect = attach_volume
 
         post = {"volumeAttachment": {"volumeId": self.cinder.SWAP_NEW_VOL}}
         self.api.post_server_volume(server['id'], post)
@@ -1829,10 +1837,6 @@ class TestInstanceNotificationSample(
                 'uuid': server['id'],
                 'fault.traceback': self.ANY},
             actual=self.notifier.versioned_notifications[1])
-
-    @mock.patch('nova.volume.cinder.API.attachment_update')
-    def _test_attach_volume_error(self, server, mock_attach):
-        self._do_test_attach_volume_error(server, mock_attach)
 
     def _test_interface_attach_and_detach(self, server):
         post = {

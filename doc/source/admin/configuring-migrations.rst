@@ -63,7 +63,8 @@ The migration types are:
 .. note::
 
    In a multi-cell cloud, instances can be live migrated to a
-   different host in the same cell, but not across cells.
+   different host in the same cell, but not across cells. Refer to the
+   :ref:`cells v2 documentation <cells-v2-caveats>`. for more information.
 
 The following sections describe how to configure your hosts for live migrations
 using the libvirt virt driver and KVM hypervisor.
@@ -262,8 +263,10 @@ memory-intensive instances succeed.
       live_migration_downtime_steps = 10
       live_migration_downtime_delay = 75
 
-   ``live_migration_downtime`` sets the maximum permitted downtime for a live
-   migration, in *milliseconds*.  The default is 500.
+   ``live_migration_downtime`` sets the target maximum period of time Nova will
+   try to keep the instance paused during the last part of the memory copy, in
+   *milliseconds*. This value may be exceeded if there is any reduction on the
+   transfer rate after the VM is paused. The default is 500.
 
    ``live_migration_downtime_steps`` sets the total number of adjustment steps
    until ``live_migration_downtime`` is reached.  The default is 10 steps.

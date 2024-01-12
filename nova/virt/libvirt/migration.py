@@ -62,6 +62,7 @@ def get_updated_guest_xml(instance, guest, migrate_data, get_volume_config,
         xml_doc, migrate_data, instance, get_volume_config)
     xml_doc = _update_perf_events_xml(xml_doc, migrate_data)
     xml_doc = _update_memory_backing_xml(xml_doc, migrate_data)
+    xml_doc = _update_quota_xml(instance, xml_doc)
     if get_vif_config is not None:
         xml_doc = _update_vif_xml(xml_doc, migrate_data, get_vif_config)
     if 'dst_numa_info' in migrate_data:
@@ -69,6 +70,18 @@ def get_updated_guest_xml(instance, guest, migrate_data, get_volume_config,
     if new_resources:
         xml_doc = _update_device_resources_xml(xml_doc, new_resources)
     return etree.tostring(xml_doc, encoding='unicode')
+
+
+def _update_quota_xml(instance, xml_doc):
+    flavor_shares = instance.flavor.extra_specs.get('quota:cpu_shares')
+    cputune = xml_doc.find('./cputune')
+    shares = xml_doc.find('./cputune/shares')
+    if shares is not None and not flavor_shares:
+        cputune.remove(shares)
+    # Remove the cputune element entirely if it has no children left.
+    if cputune is not None and not list(cputune):
+        xml_doc.remove(cputune)
+    return xml_doc
 
 
 def _update_device_resources_xml(xml_doc, new_resources):
@@ -240,7 +253,7 @@ def _update_volume_xml(xml_doc, migrate_data, instance, get_volume_config):
                         item_dst.tail = None
                         disk_dev.insert(cnt, item_dst)
 
-            # If destination has additional items, thses items should be
+            # If destination has additional items, these items should be
             # added here.
             for item_dst in list(xml_doc2):
                 if item_dst.tag != 'address':
@@ -339,14 +352,21 @@ def _update_vif_xml(xml_doc, migrate_data, get_vif_config):
     instance_uuid = xml_doc.findtext('uuid')
     parser = etree.XMLParser(remove_blank_text=True)
     interface_nodes = xml_doc.findall('./devices/interface')
-    migrate_vif_by_mac = {vif.source_vif['address']: vif
+    # MAC address stored for port in neutron DB and in domain XML
+    # might be in different cases, so to harmonize that
+    # we convert MAC to lower case for dict key.
+    migrate_vif_by_mac = {vif.source_vif['address'].lower(): vif
                           for vif in migrate_data.vifs}
     for interface_dev in interface_nodes:
         mac = interface_dev.find('mac')
         mac = mac if mac is not None else {}
         mac_addr = mac.get('address')
         if mac_addr:
-            migrate_vif = migrate_vif_by_mac[mac_addr]
+            # MAC address stored in libvirt should always be normalized
+            # and stored in lower case. But just to be extra safe here
+            # we still normalize MAC retrieved from XML to be absolutely
+            # sure it will be the same with the Neutron provided one.
+            migrate_vif = migrate_vif_by_mac[mac_addr.lower()]
             vif = migrate_vif.get_dest_vif()
             # get_vif_config is a partial function of
             # nova.virt.libvirt.vif.LibvirtGenericVIFDriver.get_config

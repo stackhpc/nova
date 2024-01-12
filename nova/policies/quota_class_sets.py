@@ -24,18 +24,18 @@ POLICY_ROOT = 'os_compute_api:os-quota-class-sets:%s'
 quota_class_sets_policies = [
     policy.DocumentedRuleDefault(
         name=POLICY_ROOT % 'show',
-        check_str=base.SYSTEM_READER,
-        description="List quotas for specific quota classs",
+        check_str=base.ADMIN,
+        description="List quotas for specific quota classes",
         operations=[
             {
                 'method': 'GET',
                 'path': '/os-quota-class-sets/{quota_class}'
             }
         ],
-        scope_types=['system']),
+        scope_types=['project']),
     policy.DocumentedRuleDefault(
         name=POLICY_ROOT % 'update',
-        check_str=base.SYSTEM_ADMIN,
+        check_str=base.ADMIN,
         description='Update quotas for specific quota class',
         operations=[
             {
@@ -43,7 +43,7 @@ quota_class_sets_policies = [
                 'path': '/os-quota-class-sets/{quota_class}'
             }
         ],
-        scope_types=['system']),
+        scope_types=['project']),
 ]
 
 

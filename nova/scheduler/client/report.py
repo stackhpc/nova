@@ -36,6 +36,7 @@ from nova import context as nova_context
 from nova import exception
 from nova.i18n import _
 from nova import objects
+from nova.objects import fields
 from nova import utils
 
 
@@ -51,6 +52,7 @@ AGGREGATE_GENERATION_VERSION = '1.19'
 NESTED_PROVIDER_API_VERSION = '1.14'
 POST_ALLOCATIONS_API_VERSION = '1.13'
 GET_USAGES_VERSION = '1.9'
+PLACEMENTCLIENT = None
 
 AggInfo = collections.namedtuple('AggInfo', ['aggregates', 'generation'])
 TraitInfo = collections.namedtuple('TraitInfo', ['traits', 'generation'])
@@ -64,6 +66,51 @@ def warn_limit(self, msg):
     else:
         self._warn_count = WARN_EVERY
         LOG.warning(msg)
+
+
+def report_client_singleton():
+    """Return a reference to the global placement client singleton.
+
+    This initializes the placement client once and returns a reference
+    to that singleton on subsequent calls. Errors are raised
+    (particularly ks_exc.*) but context-specific error messages are
+    logged for consistency.
+    """
+    # NOTE(danms): The report client maintains internal state in the
+    # form of the provider tree, which will be shared across all users
+    # of this global client. That is not a problem now, but in the
+    # future it may be beneficial to fix that. One idea would be to
+    # change the behavior of the client such that the static-config
+    # pieces of the actual keystone client are separate from the
+    # internal state, so that we can return a new object here with a
+    # context-specific local state object, but with the client bits
+    # shared.
+    global PLACEMENTCLIENT
+    if PLACEMENTCLIENT is None:
+        try:
+            PLACEMENTCLIENT = SchedulerReportClient()
+        except ks_exc.EndpointNotFound:
+            LOG.error('The placement API endpoint was not found.')
+            raise
+        except ks_exc.MissingAuthPlugin:
+            LOG.error('No authentication information found for placement API.')
+            raise
+        except ks_exc.Unauthorized:
+            LOG.error('Placement service credentials do not work.')
+            raise
+        except ks_exc.DiscoveryFailure:
+            LOG.error('Discovering suitable URL for placement API failed.')
+            raise
+        except (ks_exc.ConnectFailure,
+                ks_exc.RequestTimeout,
+                ks_exc.GatewayTimeout):
+            LOG.error('Placement API service is not responding.')
+            raise
+        except Exception:
+            LOG.error('Failed to initialize placement client '
+                      '(is keystone available?)')
+            raise
+    return PLACEMENTCLIENT
 
 
 def safe_connect(f):
@@ -1000,7 +1047,7 @@ class SchedulerReportClient(object):
         context: nova_context.RequestContext,
         rp_uuid: str,
         traits: ty.Iterable[str],
-        generation: int = None
+        generation: ty.Optional[int] = None
     ):
         """Replace a provider's traits with those specified.
 
@@ -1230,6 +1277,11 @@ class SchedulerReportClient(object):
         resp = self.post('/reshaper', payload, version=RESHAPER_VERSION,
                          global_request_id=context.global_id)
         if not resp:
+            if resp.status_code == 409:
+                err = resp.json()['errors'][0]
+                if err['code'] == 'placement.concurrent_update':
+                    raise exception.PlacementReshapeConflict(error=resp.text)
+
             raise exception.ReshapeFailed(error=resp.text)
 
         return resp
@@ -1263,7 +1315,7 @@ class SchedulerReportClient(object):
         # failure here to be fatal to the caller.
         try:
             self._reshape(context, inventories, allocations)
-        except exception.ReshapeFailed:
+        except (exception.ReshapeFailed, exception.PlacementReshapeConflict):
             raise
         except Exception as e:
             # Make sure the original stack trace gets logged.
@@ -1321,7 +1373,6 @@ class SchedulerReportClient(object):
             # can inherit.
             helper_exceptions = (
                 exception.InvalidResourceClass,
-                exception.InventoryInUse,
                 exception.ResourceProviderAggregateRetrievalFailed,
                 exception.ResourceProviderDeletionFailed,
                 exception.ResourceProviderInUse,
@@ -1340,8 +1391,8 @@ class SchedulerReportClient(object):
                 # the conflict exception. This signals the resource tracker to
                 # redrive the update right away rather than waiting until the
                 # next periodic.
-                with excutils.save_and_reraise_exception():
-                    self._clear_provider_cache_for_tree(rp_uuid)
+                self._clear_provider_cache_for_tree(rp_uuid)
+                raise
             except helper_exceptions:
                 # Invalidate the relevant part of the cache. It gets rebuilt on
                 # the next pass.
@@ -1382,8 +1433,16 @@ class SchedulerReportClient(object):
         if allocations is not None:
             # NOTE(efried): We do not catch_all here, because ReshapeFailed
             # needs to bubble up right away and be handled specially.
-            self._set_up_and_do_reshape(context, old_tree, new_tree,
-                                        allocations)
+            try:
+                self._set_up_and_do_reshape(
+                    context, old_tree, new_tree, allocations)
+            except exception.PlacementReshapeConflict:
+                # The conflict means we need to invalidate the local caches and
+                # let the retry mechanism in _update_to_placement to re-drive
+                # the reshape top of the fresh data
+                with excutils.save_and_reraise_exception():
+                    self.clear_provider_cache()
+
             # The reshape updated provider generations, so the ones we have in
             # the cache are now stale. The inventory update below will short
             # out, but we would still bounce with a provider generation
@@ -2248,6 +2307,22 @@ class SchedulerReportClient(object):
         return {consumer: self.get_allocs_for_consumer(context, consumer)
                 for consumer in consumers}
 
+    def _remove_allocations_for_evacuated_instances(self, context,
+            compute_node):
+        filters = {
+            'source_compute': compute_node.host,
+            'status': ['done'],
+            'migration_type': fields.MigrationType.EVACUATION,
+        }
+        evacuations = objects.MigrationList.get_by_filters(context, filters)
+
+        for evacuation in evacuations:
+            if not self.remove_provider_tree_from_instance_allocation(
+                    context, evacuation.instance_uuid, compute_node.uuid):
+                LOG.error("Failed to clean allocation of evacuated "
+                          "instance on the source node %s",
+                          compute_node.uuid, instance=evacuation.instance)
+
     def delete_resource_provider(self, context, compute_node, cascade=False):
         """Deletes the ResourceProvider record for the compute_node.
 
@@ -2266,17 +2341,20 @@ class SchedulerReportClient(object):
             # Delete any allocations for this resource provider.
             # Since allocations are by consumer, we get the consumers on this
             # host, which are its instances.
-            # NOTE(mriedem): This assumes the only allocations on this node
-            # are instances, but there could be migration consumers if the
-            # node is deleted during a migration or allocations from an
-            # evacuated host (bug 1829479). Obviously an admin shouldn't
-            # do that but...you know. I guess the provider deletion should fail
-            # in that case which is what we'd want to happen.
             instance_uuids = objects.InstanceList.get_uuids_by_host_and_node(
                 context, host, nodename)
             for instance_uuid in instance_uuids:
                 self.delete_allocation_for_instance(
                     context, instance_uuid, force=True)
+
+            # When an instance is evacuated, its allocation remains in
+            # the source compute node until the node recovers again.
+            # If the broken compute never recovered but instead it is
+            # decommissioned, then we should delete the allocations of
+            # successfully evacuated instances during service delete.
+            self._remove_allocations_for_evacuated_instances(context,
+                                                             compute_node)
+
         # Ensure to delete resource provider in tree by top-down
         # traversable order.
         rps_to_refresh = self.get_providers_in_tree(context, rp_uuid)
@@ -2465,6 +2543,30 @@ class SchedulerReportClient(object):
             url = ''.join([url, '&user_id=%s' % user_id])
         return self.get(url, version=GET_USAGES_VERSION,
                         global_request_id=context.global_id)
+
+    def get_usages_counts_for_limits(self, context, project_id):
+        """Get the usages counts for the purpose of enforcing unified limits
+
+        The response from placement will not contain a resource class if
+        there is no usage. i.e. if there is no usage, you get an empty dict.
+
+        Note resources are counted as placement sees them, as such note
+        that VCPUs and PCPUs will be counted independently.
+
+        :param context: The request context
+        :param project_id: The project_id to count across
+        :return: A dict containing the project-scoped counts, for example:
+                {'VCPU': 2, 'MEMORY_MB': 1024}
+        :raises: `exception.UsagesRetrievalFailed` if a placement API call
+                 fails
+        """
+        LOG.debug('Getting usages for project_id %s from placement',
+                  project_id)
+        resp = self._get_usages(context, project_id)
+        if resp:
+            data = resp.json()
+            return data['usages']
+        self._handle_usages_error_from_placement(resp, project_id)
 
     def get_usages_counts_for_quota(self, context, project_id, user_id=None):
         """Get the usages counts for the purpose of counting quota usage.

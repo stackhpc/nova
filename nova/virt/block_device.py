@@ -227,9 +227,70 @@ class DriverSwapBlockDevice(DriverBlockDevice):
         })
 
 
+class DriverImageBlockDevice(DriverBlockDevice):
+    _valid_source = 'image'
+    _proxy_as_attr_inherited = set(['image_id'])
+    _new_only_fields = set([
+        'disk_bus',
+        'device_type',
+        'guest_format',
+        'boot_index',
+        'encrypted',
+        'encryption_secret_uuid',
+        'encryption_format',
+        'encryption_options'
+    ])
+    _fields = set([
+        'device_name',
+        'size']) | _new_only_fields
+    _legacy_fields = (
+        _fields - _new_only_fields | set(['num', 'virtual_name']))
+    _update_on_save = {
+        'disk_bus': None,
+        'device_name': None,
+        'device_type': None,
+        'encryption_secret_uuid': None,
+        'encryption_format': None,
+        'encryption_options': None,
+    }
+
+    def _transform(self):
+        if (not self._bdm_obj.get('source_type') == 'image' or
+            not self._bdm_obj.get('destination_type') == 'local'):
+            raise _InvalidType
+        self.update({
+            'device_name': self._bdm_obj.device_name,
+            'size': self._bdm_obj.volume_size or 0,
+            'disk_bus': self._bdm_obj.disk_bus,
+            'device_type': self._bdm_obj.device_type,
+            'guest_format': self._bdm_obj.guest_format,
+            'image_id': self._bdm_obj.image_id,
+            'boot_index': 0,
+            'encrypted': self._bdm_obj.encrypted,
+            'encryption_secret_uuid': self._bdm_obj.encryption_secret_uuid,
+            'encryption_format': self._bdm_obj.encryption_format,
+            'encryption_options': self._bdm_obj.encryption_options
+        })
+
+
 class DriverEphemeralBlockDevice(DriverBlockDevice):
-    _new_only_fields = set(['disk_bus', 'device_type', 'guest_format'])
+    _new_only_fields = set([
+        'disk_bus',
+        'device_type',
+        'guest_format',
+        'encrypted',
+        'encryption_secret_uuid',
+        'encryption_format',
+        'encryption_options'])
     _fields = set(['device_name', 'size']) | _new_only_fields
+    _update_on_save = {
+        'disk_bus': None,
+        'device_name': None,
+        'device_type': None,
+        'encryption_secret_uuid': None,
+        'encryption_format': None,
+        'encryption_options': None,
+    }
 
     def _transform(self):
         if not block_device.new_format_is_ephemeral(self._bdm_obj):
@@ -239,7 +300,11 @@ class DriverEphemeralBlockDevice(DriverBlockDevice):
             'size': self._bdm_obj.volume_size or 0,
             'disk_bus': self._bdm_obj.disk_bus,
             'device_type': self._bdm_obj.device_type,
-            'guest_format': self._bdm_obj.guest_format
+            'guest_format': self._bdm_obj.guest_format,
+            'encrypted': self._bdm_obj.encrypted,
+            'encryption_secret_uuid': self._bdm_obj.encryption_secret_uuid,
+            'encryption_format': self._bdm_obj.encryption_format,
+            'encryption_options': self._bdm_obj.encryption_options
         })
 
 
@@ -450,7 +515,18 @@ class DriverVolumeBlockDevice(DriverBlockDevice):
             volume_api.detach(context.elevated(), volume_id, instance.uuid,
                               attachment_id)
         else:
-            volume_api.attachment_delete(context, self['attachment_id'])
+            try:
+                volume_api.attachment_delete(context, self['attachment_id'])
+            except exception.VolumeAttachmentNotFound:
+                LOG.info(
+                    "Ignoring a volume attachment deletion failure as the "
+                    "volume %(volume_id)s or the volume attachment "
+                    "%(attachment_id)s disappeared during the request.",
+                    {
+                        'volume_id': volume_id,
+                        'attachment_id': self['attachment_id']
+                    }
+                )
 
     def detach(self, context, instance, volume_api, virt_driver,
                attachment_id=None, destroy_bdm=False):
@@ -791,14 +867,14 @@ def _convert_block_devices(device_type, block_device_mapping):
 convert_swap = functools.partial(_convert_block_devices,
                                  DriverSwapBlockDevice)
 
+convert_local_images = functools.partial(_convert_block_devices,
+                                         DriverImageBlockDevice)
 
 convert_ephemerals = functools.partial(_convert_block_devices,
                                       DriverEphemeralBlockDevice)
 
-
 convert_volumes = functools.partial(_convert_block_devices,
                                    DriverVolumeBlockDevice)
-
 
 convert_snapshots = functools.partial(_convert_block_devices,
                                      DriverVolSnapshotBlockDevice)
@@ -886,9 +962,15 @@ def get_swap(transformed_list):
         return None
 
 
-_IMPLEMENTED_CLASSES = (DriverSwapBlockDevice, DriverEphemeralBlockDevice,
-                        DriverVolumeBlockDevice, DriverVolSnapshotBlockDevice,
-                        DriverVolImageBlockDevice, DriverVolBlankBlockDevice)
+_IMPLEMENTED_CLASSES = (
+    DriverSwapBlockDevice,
+    DriverEphemeralBlockDevice,
+    DriverVolumeBlockDevice,
+    DriverVolSnapshotBlockDevice,
+    DriverVolImageBlockDevice,
+    DriverVolBlankBlockDevice,
+    DriverImageBlockDevice
+)
 
 
 def is_implemented(bdm):
@@ -899,6 +981,10 @@ def is_implemented(bdm):
         except _NotTransformable:
             pass
     return False
+
+
+def is_local_image(bdm):
+    return bdm.source_type == 'image' and bdm.destination_type == 'local'
 
 
 def is_block_device_mapping(bdm):

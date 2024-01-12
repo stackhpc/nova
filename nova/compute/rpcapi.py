@@ -402,6 +402,8 @@ class ComputeAPI(object):
         * ...  - Rename the instance_type argument of prep_resize() to flavor
         * ...  - Rename the instance_type argument of resize_instance() to
                  flavor
+        * 6.1 - Add reimage_boot_volume parameter to rebuild_instance()
+        * 6.2 - Add target_state parameter to rebuild_instance()
     '''
 
     VERSION_ALIASES = {
@@ -421,6 +423,10 @@ class ComputeAPI(object):
         'victoria': '5.12',
         'wallaby': '6.0',
         'xena': '6.0',
+        'yoga': '6.0',
+        'zed': '6.1',
+        'antelope': '6.2',
+        'bobcat': '6.2',
     }
 
     @property
@@ -1079,7 +1085,8 @@ class ComputeAPI(object):
             self, ctxt, instance, new_pass, injected_files,
             image_ref, orig_image_ref, orig_sys_metadata, bdms,
             recreate, on_shared_storage, host, node,
-            preserve_ephemeral, migration, limits, request_spec, accel_uuids):
+            preserve_ephemeral, migration, limits, request_spec, accel_uuids,
+            reimage_boot_volume, target_state):
 
         # NOTE(edleafe): compute nodes can only use the dict form of limits.
         if isinstance(limits, objects.SchedulerLimits):
@@ -1091,10 +1098,28 @@ class ComputeAPI(object):
             'scheduled_node': node,
             'limits': limits,
             'request_spec': request_spec,
-            'accel_uuids': accel_uuids
+            'accel_uuids': accel_uuids,
+            'reimage_boot_volume': reimage_boot_volume,
+            'target_state': target_state,
         }
-        version = self._ver(ctxt, '5.12')
+        version = '6.2'
         client = self.router.client(ctxt)
+        if not client.can_send_version(version):
+            if msg_args['target_state']:
+                raise exception.UnsupportedRPCVersion(
+                    api="rebuild_instance",
+                    required="6.2")
+            else:
+                del msg_args['target_state']
+            version = '6.1'
+        if not client.can_send_version(version):
+            if msg_args['reimage_boot_volume']:
+                raise exception.NovaException(
+                    'Compute RPC version does not support '
+                    'reimage_boot_volume parameter.')
+            else:
+                del msg_args['reimage_boot_volume']
+            version = self._ver(ctxt, '5.12')
         if not client.can_send_version(version):
             del msg_args['accel_uuids']
             version = '5.0'
@@ -1502,7 +1527,7 @@ class ComputeAPI(object):
         client = self.router.client(ctxt)
         cctxt = client.prepare(server=_compute_host(None, instance),
                 version=version)
-        return cctxt.cast(ctxt, "trigger_crash_dump", instance=instance)
+        cctxt.cast(ctxt, "trigger_crash_dump", instance=instance)
 
     def cache_images(self, ctxt, host, image_ids):
         version = self._ver(ctxt, '5.4')

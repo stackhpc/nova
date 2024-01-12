@@ -67,6 +67,36 @@ Possible Values:
     Required NUMA affinity of device. Valid values are: ``legacy``,
     ``preferred`` and ``required``.
 
+  ``resource_class``
+    The optional Placement resource class name that is used
+    to track the requested PCI devices in Placement. It can be a standard
+    resource class from the ``os-resource-classes`` lib. Or it can be an
+    arbitrary string. If it is an non-standard resource class then Nova will
+    normalize it to a proper Placement resource class by
+    making it upper case, replacing any consecutive character outside of
+    ``[A-Z0-9_]`` with a single '_', and prefixing the name with ``CUSTOM_`` if
+    not yet prefixed. The maximum allowed length is 255 character including the
+    prefix. If ``resource_class`` is not provided Nova will generate it from
+    ``vendor_id`` and ``product_id`` values of the alias in the form of
+    ``CUSTOM_PCI_{vendor_id}_{product_id}``. The ``resource_class`` requested
+    in the alias is matched against the ``resource_class`` defined in the
+    ``[pci]device_spec``. This field can only be used only if
+    ``[filter_scheduler]pci_in_placement`` is enabled.
+
+  ``traits``
+    An optional comma separated list of Placement trait names requested to be
+    present on the resource provider that fulfills this alias. Each trait can
+    be a standard trait from ``os-traits`` lib or it can be an arbitrary
+    string. If it is a non-standard trait then Nova will normalize the
+    trait name by making it upper case, replacing any consecutive character
+    outside of  ``[A-Z0-9_]`` with a single '_', and  prefixing the name
+    with ``CUSTOM_`` if not yet prefixed. The maximum allowed length of a
+    trait name is 255 character including the prefix. Every trait in
+    ``traits`` requested in the alias ensured to be in the list of traits
+    provided in the ``traits`` field of the ``[pci]device_spec`` when
+    scheduling the request. This field can only be used only if
+    ``[filter_scheduler]pci_in_placement`` is enabled.
+
 * Supports multiple aliases by repeating the option (not by specifying
   a list value)::
 
@@ -85,16 +115,18 @@ Possible Values:
       "numa_policy": "required"
     }
 """),
-    cfg.MultiStrOpt('passthrough_whitelist',
+    cfg.MultiStrOpt('device_spec',
         default=[],
-        deprecated_name='pci_passthrough_whitelist',
-        deprecated_group='DEFAULT',
+        deprecated_opts=[
+            cfg.DeprecatedOpt('passthrough_whitelist', group='pci'),
+            cfg.DeprecatedOpt('pci_passthrough_whitelist', group='DEFAULT'),
+        ],
         help="""
-White list of PCI devices available to VMs.
+Specify the PCI devices available to VMs.
 
 Possible values:
 
-* A JSON dictionary which describe a whitelisted PCI device. It should take
+* A JSON dictionary which describe a PCI device. It should take
   the following format::
 
     ["vendor_id": "<id>",] ["product_id": "<id>",]
@@ -129,48 +161,115 @@ Possible values:
     have a name.
 
   ``<tag>``
-    Additional ``<tag>`` and ``<tag_value>`` used for matching PCI devices.
+    Additional ``<tag>`` and ``<tag_value>`` used for specifying PCI devices.
     Supported ``<tag>`` values are :
 
     - ``physical_network``
     - ``trusted``
+    - ``remote_managed`` - a VF is managed remotely by an off-path networking
+      backend. May have boolean-like string values case-insensitive values:
+      "true" or "false". By default, "false" is assumed for all devices.
+      Using this option requires a networking service backend capable of
+      handling those devices. PCI devices are also required to have a PCI
+      VPD capability with a card serial number (either on a VF itself on
+      its corresponding PF), otherwise they will be ignored and not
+      available for allocation.
+    - ``resource_class`` - optional Placement resource class name to be used
+      to track the matching PCI devices in Placement when [pci]device_spec is
+      True. It can be a standard resource class from the
+      ``os-resource-classes`` lib. Or can be any string. In that case Nova will
+      normalize it to a proper Placement resource class by making it upper
+      case, replacing any consecutive character outside of ``[A-Z0-9_]`` with a
+      single '_', and prefixing the name with ``CUSTOM_`` if not yet prefixed.
+      The maximum allowed length is 255 character including the prefix.
+      If ``resource_class`` is not provided Nova will generate it from the PCI
+      device's ``vendor_id`` and ``product_id`` in the form of
+      ``CUSTOM_PCI_{vendor_id}_{product_id}``.
+      The ``resource_class`` can be requested from a ``[pci]alias``
+    - ``traits`` - optional comma separated list of Placement trait names to
+      report on the resource provider that will represent the matching PCI
+      device. Each trait can be a standard trait from ``os-traits`` lib or can
+      be any string. If it is not a standard trait then Nova will normalize the
+      trait name by making it upper case, replacing any consecutive character
+      outside of  ``[A-Z0-9_]`` with a single '_', and  prefixing the name with
+      ``CUSTOM_`` if not yet prefixed. The maximum allowed length of a trait
+      name is 255 character including the prefix.
+      Any trait from ``traits`` can be requested from a ``[pci]alias``.
+
 
   Valid examples are::
 
-    passthrough_whitelist = {"devname":"eth0",
-                             "physical_network":"physnet"}
-    passthrough_whitelist = {"address":"*:0a:00.*"}
-    passthrough_whitelist = {"address":":0a:00.",
-                             "physical_network":"physnet1"}
-    passthrough_whitelist = {"vendor_id":"1137",
-                             "product_id":"0071"}
-    passthrough_whitelist = {"vendor_id":"1137",
-                             "product_id":"0071",
-                             "address": "0000:0a:00.1",
-                             "physical_network":"physnet1"}
-    passthrough_whitelist = {"address":{"domain": ".*",
-                                        "bus": "02", "slot": "01",
-                                        "function": "[2-7]"},
-                             "physical_network":"physnet1"}
-    passthrough_whitelist = {"address":{"domain": ".*",
-                                        "bus": "02", "slot": "0[1-2]",
-                                        "function": ".*"},
-                             "physical_network":"physnet1"}
-    passthrough_whitelist = {"devname": "eth0", "physical_network":"physnet1",
-                             "trusted": "true"}
+    device_spec = {"devname":"eth0",
+                   "physical_network":"physnet"}
+    device_spec = {"address":"*:0a:00.*"}
+    device_spec = {"address":":0a:00.",
+                   "physical_network":"physnet1"}
+    device_spec = {"vendor_id":"1137",
+                   "product_id":"0071"}
+    device_spec = {"vendor_id":"1137",
+                   "product_id":"0071",
+                   "address": "0000:0a:00.1",
+                   "physical_network":"physnet1"}
+    device_spec = {"address":{"domain": ".*",
+                              "bus": "02", "slot": "01",
+                              "function": "[2-7]"},
+                   "physical_network":"physnet1"}
+    device_spec = {"address":{"domain": ".*",
+                              "bus": "02", "slot": "0[1-2]",
+                              "function": ".*"},
+                   "physical_network":"physnet1"}
+    device_spec = {"devname": "eth0", "physical_network":"physnet1",
+                   "trusted": "true"}
+    device_spec = {"vendor_id":"a2d6",
+                   "product_id":"15b3",
+                   "remote_managed": "true"}
+    device_spec = {"vendor_id":"a2d6",
+                   "product_id":"15b3",
+                   "address": "0000:82:00.0",
+                   "physical_network":"physnet1",
+                   "remote_managed": "true"}
+    device_spec = {"vendor_id":"1002",
+                   "product_id":"6929",
+                   "address": "0000:82:00.0",
+                   "resource_class": "PGPU",
+                   "traits": "HW_GPU_API_VULKAN,my-awesome-gpu"}
 
   The following are invalid, as they specify mutually exclusive options::
 
-    passthrough_whitelist = {"devname":"eth0",
-                             "physical_network":"physnet",
-                             "address":"*:0a:00.*"}
+    device_spec = {"devname":"eth0",
+                   "physical_network":"physnet",
+                   "address":"*:0a:00.*"}
+
+  The following example is invalid because it specifies the ``remote_managed``
+  tag for a PF - it will result in an error during config validation at the
+  Nova Compute service startup::
+
+    device_spec = {"address": "0000:82:00.0",
+                   "product_id": "a2d6",
+                   "vendor_id": "15b3",
+                   "physical_network": null,
+                   "remote_managed": "true"}
 
 * A JSON list of JSON dictionaries corresponding to the above format. For
   example::
 
-    passthrough_whitelist = [{"product_id":"0001", "vendor_id":"8086"},
-                             {"product_id":"0002", "vendor_id":"8086"}]
-""")
+    device_spec = [{"product_id":"0001", "vendor_id":"8086"},
+                   {"product_id":"0002", "vendor_id":"8086"}]
+"""),
+    cfg.BoolOpt('report_in_placement',
+                default=False,
+                help="""
+Enable PCI resource inventory reporting to Placement. If it is enabled then the
+nova-compute service will report PCI resource inventories to Placement
+according to the [pci]device_spec configuration and the PCI devices reported
+by the hypervisor. Once it is enabled it cannot be disabled any more. In a
+future release the default of this config will be change to True.
+
+Related options:
+
+* [pci]device_spec: to define which PCI devices nova are allowed to track and
+  assign to guests.
+"""),
 ]
 
 

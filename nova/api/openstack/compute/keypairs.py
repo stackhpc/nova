@@ -26,7 +26,6 @@ from nova.api.openstack import wsgi
 from nova.api import validation
 from nova.compute import api as compute_api
 from nova import exception
-from nova.i18n import _
 from nova.objects import keypair as keypair_obj
 from nova.policies import keypairs as kp_policies
 
@@ -44,15 +43,19 @@ class KeypairController(wsgi.Controller):
     @wsgi.Controller.api_version("2.10")
     @wsgi.response(201)
     @wsgi.expected_errors((400, 403, 409))
-    @validation.schema(keypairs.create_v210)
+    @validation.schema(keypairs.create_v210, "2.10", "2.91")
+    @validation.schema(keypairs.create_v292, "2.92")
     def create(self, req, body):
         """Create or import keypair.
+
+        Keypair generations are allowed until version 2.91.
+        Afterwards, only imports are allowed.
 
         A policy check restricts users from creating keys for other users
 
         params: keypair object with:
             name (required) - string
-            public_key (optional) - string
+            public_key (optional or required if >=2.92) - string
             type (optional) - string
             user_id (optional) - string
         """
@@ -115,13 +118,14 @@ class KeypairController(wsgi.Controller):
                     context, user_id, name, params['public_key'],
                     key_type_value)
             else:
+                # public_key is a required field starting with 2.92 so this
+                # generation should only happen with older versions.
                 keypair, private_key = self.api.create_key_pair(
                     context, user_id, name, key_type_value)
                 keypair['private_key'] = private_key
                 return_priv_key = True
-        except exception.KeypairLimitExceeded:
-            msg = _("Quota exceeded, too many key pairs.")
-            raise webob.exc.HTTPForbidden(explanation=msg)
+        except exception.KeypairLimitExceeded as e:
+            raise webob.exc.HTTPForbidden(explanation=str(e))
         except exception.InvalidKeypair as exc:
             raise webob.exc.HTTPBadRequest(explanation=exc.format_message())
         except exception.KeyPairExists as exc:

@@ -39,6 +39,7 @@ from nova.pci import utils as pci_utils
 import nova.privsep.linux_net
 from nova import profiler
 from nova import utils
+from nova.virt import hardware
 from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt import designer
 from nova.virt.libvirt import host as libvirt_host
@@ -191,11 +192,13 @@ class LibvirtGenericVIFDriver(object):
         vhost_queues = None
         rx_queue_size = None
 
+        packed = self._get_packed_virtqueue_settings(
+            image_meta, flavor)
         # NOTE(stephenfin): Skip most things here as only apply to virtio
         # devices
         if vnic_type in network_model.VNIC_TYPES_DIRECT_PASSTHROUGH:
             designer.set_vif_guest_frontend_config(
-                conf, mac, model, driver, vhost_queues, rx_queue_size)
+                conf, mac, model, driver, vhost_queues, rx_queue_size, packed)
             return conf
 
         rx_queue_size = CONF.libvirt.rx_queue_size
@@ -210,7 +213,7 @@ class LibvirtGenericVIFDriver(object):
         # The rest of this only applies to virtio
         if model != network_model.VIF_MODEL_VIRTIO:
             designer.set_vif_guest_frontend_config(
-                conf, mac, model, driver, vhost_queues, rx_queue_size)
+                conf, mac, model, driver, vhost_queues, rx_queue_size, packed)
             return conf
 
         # Workaround libvirt bug, where it mistakenly enables vhost mode, even
@@ -242,7 +245,7 @@ class LibvirtGenericVIFDriver(object):
                 driver = 'vhost'
 
         designer.set_vif_guest_frontend_config(
-            conf, mac, model, driver, vhost_queues, rx_queue_size)
+            conf, mac, model, driver, vhost_queues, rx_queue_size, packed)
 
         return conf
 
@@ -256,9 +259,12 @@ class LibvirtGenericVIFDriver(object):
         """A methods to set the number of virtio queues,
            if it has been requested in extra specs.
         """
+        if not isinstance(image_meta, objects.ImageMeta):
+            image_meta = objects.ImageMeta.from_dict(image_meta)
+
         driver = None
         vhost_queues = None
-        if self._requests_multiqueue(image_meta):
+        if hardware.get_vif_multiqueue_constraint(flavor, image_meta):
             driver = 'vhost'
             max_tap_queues = self._get_max_tap_queues()
             if max_tap_queues:
@@ -268,19 +274,6 @@ class LibvirtGenericVIFDriver(object):
                 vhost_queues = flavor.vcpus
 
         return (driver, vhost_queues)
-
-    def _requests_multiqueue(self, image_meta):
-        """Check if multiqueue property is set in the image metadata."""
-
-        if not isinstance(image_meta, objects.ImageMeta):
-            image_meta = objects.ImageMeta.from_dict(image_meta)
-
-        img_props = image_meta.properties
-
-        if img_props.get('hw_vif_multiqueue_enabled'):
-            return True
-
-        return False
 
     def _get_max_tap_queues(self):
         # Note(sean-k-mooney): some linux distros have backported
@@ -304,6 +297,13 @@ class LibvirtGenericVIFDriver(object):
             return 256
         else:
             return None
+
+    def _get_packed_virtqueue_settings(self, image_meta, flavor):
+        """A method to check if Virtio Packed Ring was requested."""
+        if not isinstance(image_meta, objects.ImageMeta):
+            image_meta = objects.ImageMeta.from_dict(image_meta)
+
+        return hardware.get_packed_virtqueue_constraint(flavor, image_meta)
 
     def get_bridge_name(self, vif):
         return vif['network']['bridge']
@@ -632,7 +632,7 @@ class LibvirtGenericVIFDriver(object):
         #  2. libvirt driver does not change mac address for macvtap VNICs
         #     or Alternatively does not rely on recreating libvirt's nodev
         #     name from the current mac address set on the netdevice.
-        #     See: virt.libvrit.driver.LibvirtDriver._get_pcinet_info
+        #     See: virt.libvirt.driver.LibvirtDriver._get_pcinet_info
         if vif['vnic_type'] == network_model.VNIC_TYPE_MACVTAP:
             set_vf_interface_vlan(
                 vif['profile']['pci_slot'],
@@ -692,9 +692,10 @@ class LibvirtGenericVIFDriver(object):
         vif_model = self.get_vif_model(image_meta=image_meta)
         # TODO(ganso): explore whether multiqueue works for other vif models
         # that go through this code path.
-        multiqueue = (instance.get_flavor().vcpus > 1 and
-                      self._requests_multiqueue(image_meta) and
-                      vif_model == network_model.VIF_MODEL_VIRTIO)
+        multiqueue = False
+        if vif_model == network_model.VIF_MODEL_VIRTIO:
+            multiqueue = hardware.get_vif_multiqueue_constraint(
+                instance.flavor, image_meta)
         nova.privsep.linux_net.create_tap_dev(dev, mac, multiqueue=multiqueue)
         network = vif.get('network')
         mtu = network.get_meta('mtu') if network else None

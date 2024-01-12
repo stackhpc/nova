@@ -18,13 +18,12 @@ Unit tests for the nova-status CLI interfaces.
 
 # NOTE(cdent): Additional tests of nova-status may be found in
 # nova/tests/functional/test_nova_status.py. Those tests use the external
-# PlacementFixture, which is only available in functioanl tests.
+# PlacementFixture, which is only available in functional tests.
 
 from io import StringIO
+from unittest import mock
 
 import fixtures
-import mock
-
 from keystoneauth1 import exceptions as ks_exc
 from keystoneauth1 import loading as keystone
 from keystoneauth1 import session
@@ -40,7 +39,6 @@ from nova import exception
 # in the tests, we don't use them in the actual CLI.
 from nova import objects
 from nova.objects import service
-from nova import policy
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 
@@ -394,60 +392,6 @@ class TestUpgradeCheckCinderAPI(test.NoDBTestCase):
         self.assertEqual(upgradecheck.Code.SUCCESS, result.code)
 
 
-class TestUpgradeCheckPolicy(test.NoDBTestCase):
-
-    new_default_status = upgradecheck.Code.WARNING
-
-    def setUp(self):
-        super(TestUpgradeCheckPolicy, self).setUp()
-        self.cmd = status.UpgradeCommands()
-        self.rule_name = "system_admin_api"
-
-    def tearDown(self):
-        super(TestUpgradeCheckPolicy, self).tearDown()
-        # Check if policy is reset back after the upgrade check
-        self.assertIsNone(policy._ENFORCER)
-
-    def test_policy_rule_with_new_defaults(self):
-        new_default = "role:admin and system_scope:all"
-        rule = {self.rule_name: new_default}
-        self.policy.set_rules(rule, overwrite=False)
-        self.assertEqual(self.new_default_status,
-                         self.cmd._check_policy().code)
-
-    def test_policy_rule_with_old_defaults(self):
-        new_default = "is_admin:True"
-        rule = {self.rule_name: new_default}
-        self.policy.set_rules(rule, overwrite=False)
-
-        self.assertEqual(upgradecheck.Code.SUCCESS,
-                         self.cmd._check_policy().code)
-
-    def test_policy_rule_with_both_defaults(self):
-        new_default = "(role:admin and system_scope:all) or is_admin:True"
-        rule = {self.rule_name: new_default}
-        self.policy.set_rules(rule, overwrite=False)
-
-        self.assertEqual(upgradecheck.Code.SUCCESS,
-                         self.cmd._check_policy().code)
-
-    def test_policy_checks_with_fresh_init_and_no_policy_override(self):
-        self.policy = self.useFixture(nova_fixtures.OverridePolicyFixture(
-                                      rules_in_file={}))
-        policy.reset()
-        self.assertEqual(upgradecheck.Code.SUCCESS,
-                         self.cmd._check_policy().code)
-
-
-class TestUpgradeCheckPolicyEnableScope(TestUpgradeCheckPolicy):
-
-    new_default_status = upgradecheck.Code.SUCCESS
-
-    def setUp(self):
-        super(TestUpgradeCheckPolicyEnableScope, self).setUp()
-        self.flags(enforce_scope=True, group="oslo_policy")
-
-
 class TestUpgradeCheckOldCompute(test.NoDBTestCase):
 
     def setUp(self):
@@ -474,7 +418,7 @@ class TestUpgradeCheckOldCompute(test.NoDBTestCase):
                 "nova.objects.service.get_minimum_version_all_cells",
                 return_value=too_old):
             result = self.cmd._check_old_computes()
-            self.assertEqual(upgradecheck.Code.WARNING, result.code)
+            self.assertEqual(upgradecheck.Code.FAILURE, result.code)
 
 
 class TestCheckMachineTypeUnset(test.NoDBTestCase):
@@ -502,3 +446,19 @@ class TestCheckMachineTypeUnset(test.NoDBTestCase):
             upgradecheck.Code.SUCCESS,
             result.code
         )
+
+
+class TestUpgradeCheckServiceUserToken(test.NoDBTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.cmd = status.UpgradeCommands()
+
+    def test_service_user_token_not_configured(self):
+        result = self.cmd._check_service_user_token()
+        self.assertEqual(upgradecheck.Code.FAILURE, result.code)
+
+    def test_service_user_token_configured(self):
+        self.flags(send_service_user_token=True, group='service_user')
+        result = self.cmd._check_service_user_token()
+        self.assertEqual(upgradecheck.Code.SUCCESS, result.code)

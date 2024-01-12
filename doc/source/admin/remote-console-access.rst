@@ -221,6 +221,9 @@ server. In :file:`/etc/libvirt/qemu.conf`, uncomment the following settings:
   service, this ensures that only approved VNC proxy servers can connect to the
   Compute nodes.
 
+Make sure to provide correct permissions to the certificate files for the process
+which creates instance. Please follow the libvirt wiki page [3]_ for the same.
+
 After editing :file:`qemu.conf`, the ``libvirtd`` service must be restarted:
 
 .. code-block:: shell
@@ -362,6 +365,16 @@ For example, to configure this via a ``nova.conf`` file:
 Replace ``IP_ADDRESS`` with the IP address from which the proxy is accessible
 by the outside world. For example, this may be the management interface IP
 address of the controller or the VIP.
+
+Optionally, the :program:`nova-compute` service supports the following
+additional options to configure compression settings (algorithms and modes)
+for SPICE consoles.
+
+- :oslo.config:option:`spice.image_compression`
+- :oslo.config:option:`spice.jpeg_compression`
+- :oslo.config:option:`spice.zlib_compression`
+- :oslo.config:option:`spice.playback_compression`
+- :oslo.config:option:`spice.streaming_mode`
 
 
 Serial
@@ -610,5 +623,6 @@ Frequently Asked Questions
 References
 ----------
 
-.. [1] https://qemu.weilnetz.de/doc/qemu-doc.html#vnc_005fsec_005fcertificate_005fverify
+.. [1] https://qemu.weilnetz.de/doc/4.2/qemu-doc.html#vnc_005fsec_005fcertificate_005fverify
 .. [2] https://tools.ietf.org/html/rfc3280#section-4.2.1.10
+.. [3] https://wiki.libvirt.org/page/VNCTLSSetup#Changes_to_be_made_on_the_virtualisation_host_server

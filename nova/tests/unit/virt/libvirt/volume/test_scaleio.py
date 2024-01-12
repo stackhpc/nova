@@ -13,7 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
 from nova.tests.unit.virt.libvirt.volume import test_volume
 from nova.virt.libvirt.volume import scaleio
@@ -49,7 +49,13 @@ class LibvirtScaleIOVolumeDriverTestCase(
         conn = {'data': mock.sentinel.conn_data}
         sio.disconnect_volume(conn, mock.sentinel.instance)
         sio.connector.disconnect_volume.assert_called_once_with(
-            mock.sentinel.conn_data, None)
+            mock.sentinel.conn_data, None, force=False)
+
+        # Verify force=True
+        sio.connector.disconnect_volume.reset_mock()
+        sio.disconnect_volume(conn, mock.sentinel.instance, force=True)
+        sio.connector.disconnect_volume.assert_called_once_with(
+            mock.sentinel.conn_data, None, force=True)
 
     @mock.patch('os_brick.initiator.connector.InitiatorConnector.factory',
         new=mock.Mock(return_value=mock.Mock()))

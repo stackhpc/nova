@@ -18,9 +18,9 @@ import grp
 import os
 import pwd
 import tempfile
+from unittest import mock
 
 import ddt
-import mock
 import os_traits
 from oslo_config import cfg
 from oslo_utils import fileutils
@@ -103,33 +103,98 @@ class LibvirtUtilsTestCase(test.NoDBTestCase):
     def test_valid_hostname_bad(self):
         self.assertFalse(libvirt_utils.is_valid_hostname("foo/?com=/bin/sh"))
 
-    @mock.patch('oslo_concurrency.processutils.execute')
-    def test_create_image(self, mock_execute):
-        libvirt_utils.create_image('raw', '/some/path', '10G')
-        libvirt_utils.create_image('qcow2', '/some/stuff', '1234567891234')
-        expected_args = [(('qemu-img', 'create', '-f', 'raw',
-                           '/some/path', '10G'),),
-                         (('qemu-img', 'create', '-f', 'qcow2',
-                           '/some/stuff', '1234567891234'),)]
-        self.assertEqual(expected_args, mock_execute.call_args_list)
-
-    @mock.patch('os.path.exists', return_value=True)
+    @mock.patch('tempfile.NamedTemporaryFile')
     @mock.patch('oslo_concurrency.processutils.execute')
     @mock.patch('nova.virt.images.qemu_img_info')
-    def test_create_cow_image(self, mock_info, mock_execute, mock_exists):
-        mock_execute.return_value = ('stdout', None)
+    def _test_create_image(
+        self, path, disk_format, disk_size, mock_info, mock_execute,
+        mock_ntf, backing_file=None, encryption=None
+    ):
         mock_info.return_value = mock.Mock(
             file_format=mock.sentinel.backing_fmt,
-            cluster_size=mock.sentinel.cluster_size)
-        libvirt_utils.create_cow_image(mock.sentinel.backing_path,
-                                       mock.sentinel.new_path)
-        mock_info.assert_called_once_with(mock.sentinel.backing_path)
-        mock_execute.assert_has_calls([mock.call(
-            'qemu-img', 'create', '-f', 'qcow2', '-o',
-            'backing_file=%s,backing_fmt=%s,cluster_size=%s' % (
-                mock.sentinel.backing_path, mock.sentinel.backing_fmt,
-                mock.sentinel.cluster_size),
-             mock.sentinel.new_path)])
+            cluster_size=mock.sentinel.cluster_size,
+        )
+        fh = mock_ntf.return_value.__enter__.return_value
+
+        libvirt_utils.create_image(
+            path, disk_format, disk_size, backing_file=backing_file,
+            encryption=encryption,
+        )
+
+        cow_opts = []
+
+        if backing_file is None:
+            mock_info.assert_not_called()
+        else:
+            mock_info.assert_called_once_with(backing_file)
+            cow_opts = [
+                '-o',
+                f'backing_file={mock.sentinel.backing_file},'
+                f'backing_fmt={mock.sentinel.backing_fmt},'
+                f'cluster_size={mock.sentinel.cluster_size}',
+            ]
+
+        encryption_opts = []
+
+        if encryption:
+            encryption_opts = [
+                '--object', f"secret,id=sec,file={fh.name}",
+                '-o', 'encrypt.key-secret=sec',
+                '-o', f"encrypt.format={encryption.get('format')}",
+            ]
+
+            encryption_options = {
+                'cipher-alg': 'aes-256',
+                'cipher-mode': 'xts',
+                'hash-alg': 'sha256',
+                'iter-time': 2000,
+                'ivgen-alg': 'plain64',
+                'ivgen-hash-alg': 'sha256',
+            }
+            for option, value in encryption_options.items():
+                encryption_opts += [
+                    '-o',
+                    f'encrypt.{option}={value}',
+                ]
+
+        expected_args = (
+            'env', 'LC_ALL=C', 'LANG=C', 'qemu-img', 'create', '-f',
+            disk_format, *cow_opts, *encryption_opts, path,
+        )
+        if disk_size is not None:
+            expected_args += (disk_size,)
+
+        self.assertEqual([(expected_args,)], mock_execute.call_args_list)
+
+    def test_create_image_raw(self):
+        self._test_create_image('/some/path', 'raw', '10G')
+
+    def test_create_image_qcow2(self):
+        self._test_create_image(
+            '/some/stuff', 'qcow2', '1234567891234',
+        )
+
+    def test_create_image_backing_file(self):
+        self._test_create_image(
+            '/some/stuff', 'qcow2', '1234567891234',
+            backing_file=mock.sentinel.backing_file,
+        )
+
+    def test_create_image_size_none(self):
+        self._test_create_image(
+            '/some/stuff', 'qcow2', None,
+            backing_file=mock.sentinel.backing_file,
+        )
+
+    def test_create_image_encryption(self):
+        encryption = {
+            'secret': 'a_secret',
+            'format': 'luks',
+        }
+        self._test_create_image(
+            '/some/stuff', 'qcow2', '1234567891234',
+            encryption=encryption,
+        )
 
     @ddt.unpack
     @ddt.data({'fs_type': 'some_fs_type',
@@ -645,6 +710,10 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
         os_mach_type = libvirt_utils.get_machine_type(image_meta)
         self.assertEqual('q35', os_mach_type)
 
+    def test_make_reverse_cpu_traits_mapping(self):
+        for k in libvirt_utils.make_reverse_cpu_traits_mapping():
+            self.assertIsInstance(k, str)
+
     def test_get_flags_by_flavor_specs(self):
         flavor = objects.Flavor(
             id=1, flavorid='fakeid-1', name='fake1.small', memory_mb=128,
@@ -653,11 +722,15 @@ sunrpc /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0
                 'trait:%s' % os_traits.HW_CPU_X86_3DNOW: 'required',
                 'trait:%s' % os_traits.HW_CPU_X86_SSE2: 'required',
                 'trait:%s' % os_traits.HW_CPU_HYPERTHREADING: 'required',
+                'trait:%s' % os_traits.HW_CPU_X86_INTEL_VMX: 'required',
+                'trait:%s' % os_traits.HW_CPU_X86_VMX: 'required',
+                'trait:%s' % os_traits.HW_CPU_X86_SVM: 'required',
+                'trait:%s' % os_traits.HW_CPU_X86_AMD_SVM: 'required',
             })
         traits = libvirt_utils.get_flags_by_flavor_specs(flavor)
         # we shouldn't see the hyperthreading trait since that's a valid trait
         # but not a CPU flag
-        self.assertEqual(set(['3dnow', 'sse2']), traits)
+        self.assertEqual(set(['3dnow', 'sse2', 'vmx', 'svm']), traits)
 
     @mock.patch('nova.virt.libvirt.utils.copy_image')
     @mock.patch('nova.privsep.path.chown')

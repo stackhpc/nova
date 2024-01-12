@@ -45,7 +45,7 @@ def supports_vif_related_pci_allocations(context, host):
 
 
 def supports_vpmem_live_migration(context):
-    """Checks if the commpute host service is new enough to support
+    """Checks if the compute host service is new enough to support
     instance live migration with virtual persistent memory.
 
     :param context: The user request context.
@@ -245,8 +245,7 @@ class LiveMigrationTask(base.TaskBase):
                             "are not allowed for live migration.")
         # All PCI requests are VIF related, now check neutron,
         # source and destination compute nodes.
-        if not self.network_api.supports_port_binding_extension(
-                self.context):
+        if not self.network_api.has_port_binding_extension(self.context):
             raise exception.MigrationPreCheckError(
                 reason="Cannot live migrate VIF with related PCI, Neutron "
                        "does not support required port binding extension.")
@@ -348,8 +347,9 @@ class LiveMigrationTask(base.TaskBase):
 
         source_version = source_info.hypervisor_version
         destination_version = destination_info.hypervisor_version
-        if source_version > destination_version:
-            raise exception.DestinationHypervisorTooOld()
+        if not CONF.workarounds.skip_hypervisor_version_check_on_lm:
+            if source_version > destination_version:
+                raise exception.DestinationHypervisorTooOld()
         return source_info, destination_info
 
     def _call_livem_checks_on_host(self, destination, provider_mapping):
@@ -366,7 +366,7 @@ class LiveMigrationTask(base.TaskBase):
             raise exception.MigrationPreCheckError(msg)
 
         # Check to see that neutron supports the binding-extended API.
-        if self.network_api.supports_port_binding_extension(self.context):
+        if self.network_api.has_port_binding_extension(self.context):
             bindings = self._bind_ports_on_destination(
                 destination, provider_mapping)
             self._update_migrate_vifs_from_bindings(self.migrate_data.vifs,
@@ -542,7 +542,7 @@ class LiveMigrationTask(base.TaskBase):
                 # will be persisted when post_live_migration_at_destination
                 # runs.
                 compute_utils.\
-                    update_pci_request_spec_with_allocated_interface_name(
+                    update_pci_request_with_placement_allocations(
                         self.context, self.report_client,
                         self.instance.pci_requests.requests, provider_mapping)
             try:

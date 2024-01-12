@@ -39,10 +39,6 @@ Guests will get created with graphical devices to support this. Clients
     cfg.HostAddressOpt(
         'server_listen',
         default='127.0.0.1',
-        deprecated_opts=[
-            cfg.DeprecatedOpt('vncserver_listen', group='DEFAULT'),
-            cfg.DeprecatedOpt('vncserver_listen', group='vnc'),
-        ],
         help="""
 The IP address or hostname on which an instance should listen to for
 incoming VNC connection requests on this node.
@@ -51,11 +47,6 @@ incoming VNC connection requests on this node.
     cfg.HostAddressOpt(
         'server_proxyclient_address',
         default='127.0.0.1',
-        deprecated_opts=[
-            cfg.DeprecatedOpt('vncserver_proxyclient_address',
-                              group='DEFAULT'),
-            cfg.DeprecatedOpt('vncserver_proxyclient_address', group='vnc'),
-        ],
         help="""
 Private, internal IP address or hostname of VNC console proxy.
 
@@ -170,7 +161,7 @@ Related options:
 The fully qualified path to a PEM file containing the x509 certificate which
 the VNC proxy server presents to the compute node during VNC authentication.
 
-Realted options:
+Related options:
 
 * ``vnc.auth_schemes``: must include ``vencrypt``
 * ``vnc.vencrypt_client_key``: must also be set

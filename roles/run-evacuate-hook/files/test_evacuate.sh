@@ -22,7 +22,10 @@ done
 function evacuate_and_wait_for_active() {
     local server="$1"
 
-    nova evacuate ${server}
+    # Shared storage will be auto-calculated with -–os-compute-api-version 2.14
+    # and greater and --shared-storage should not be used with later
+    # microversions.
+    openstack --os-compute-api-version 2.14 server evacuate ${server}
     # Wait for the instance to go into ACTIVE state from the evacuate.
     count=0
     status=$(openstack server show ${server} -f value -c status)
@@ -38,11 +41,17 @@ function evacuate_and_wait_for_active() {
     done
 }
 
-evacuate_and_wait_for_active evacuate-test
-evacuate_and_wait_for_active evacuate-bfv-test
+servers="evacuate-test"
+if openstack endpoint list | grep cinder; then
+    servers="$servers evacuate-bfv-test"
+fi
+
+for server in $servers; do
+    evacuate_and_wait_for_active $server
+done
 
 # Make sure the servers moved.
-for server in evacuate-test evacuate-bfv-test; do
+for server in $servers; do
     host=$(openstack server show ${server} -f value -c OS-EXT-SRV-ATTR:host)
     if [[ ${host} != ${CONTROLLER_HOSTNAME} ]]; then
         echo "Unexpected host ${host} for server ${server} after evacuate."
@@ -52,4 +61,6 @@ done
 
 # Cleanup test servers
 openstack server delete --wait evacuate-test
-openstack server delete --wait evacuate-bfv-test
+if [[ "$servers" =~ "bfv" ]]; then
+    openstack server delete --wait evacuate-bfv-test
+fi

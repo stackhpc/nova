@@ -20,7 +20,6 @@ The VMware API VM utility module to build SOAP object specs.
 
 import collections
 import copy
-import functools
 
 from oslo_log import log as logging
 from oslo_service import loopingcall
@@ -37,6 +36,7 @@ from nova import exception
 from nova.i18n import _
 from nova.network import model as network_model
 from nova.virt.vmwareapi import constants
+from nova.virt.vmwareapi import session
 from nova.virt.vmwareapi import vim_util
 
 LOG = logging.getLogger(__name__)
@@ -119,32 +119,16 @@ def vm_refs_cache_reset():
     _VM_REFS_CACHE = {}
 
 
-def vm_ref_cache_delete(id):
-    _VM_REFS_CACHE.pop(id, None)
+def vm_ref_cache_delete(id_):
+    _VM_REFS_CACHE.pop(id_, None)
 
 
-def vm_ref_cache_update(id, vm_ref):
-    _VM_REFS_CACHE[id] = vm_ref
+def vm_ref_cache_update(id_, vm_ref):
+    _VM_REFS_CACHE[id_] = vm_ref
 
 
-def vm_ref_cache_get(id):
-    return _VM_REFS_CACHE.get(id)
-
-
-def _vm_ref_cache(id, func, session, data):
-    vm_ref = vm_ref_cache_get(id)
-    if not vm_ref:
-        vm_ref = func(session, data)
-        vm_ref_cache_update(id, vm_ref)
-    return vm_ref
-
-
-def vm_ref_cache_from_instance(func):
-    @functools.wraps(func)
-    def wrapper(session, instance):
-        id = instance.uuid
-        return _vm_ref_cache(id, func, session, instance)
-    return wrapper
+def vm_ref_cache_get(id_):
+    return _VM_REFS_CACHE.get(id_)
 
 
 # the config key which stores the VNC port
@@ -1131,15 +1115,25 @@ def _get_vm_ref_from_extraconfig(session, instance_uuid):
                                      _get_object_for_optionvalue)
 
 
-@vm_ref_cache_from_instance
+class VmMoRefProxy(session.StableMoRefProxy):
+    def __init__(self, ref, uuid):
+        super(VmMoRefProxy, self).__init__(ref)
+        self._uuid = uuid
+
+    def fetch_moref(self, session):
+        self.moref = search_vm_ref_by_identifier(session, self._uuid)
+        if not self.moref:
+            raise exception.InstanceNotFound(instance_id=self._uuid)
+        vm_ref_cache_update(self._uuid, self.moref)
+
+
 def get_vm_ref(session, instance):
-    """Get reference to the VM through uuid or vm name."""
-    uuid = instance.uuid
-    vm_ref = (search_vm_ref_by_identifier(session, uuid) or
-              _get_vm_ref_from_name(session, instance.name))
-    if vm_ref is None:
-        raise exception.InstanceNotFound(instance_id=uuid)
-    return vm_ref
+    """Get reference to the VM through uuid."""
+    moref = vm_ref_cache_get(instance.uuid)
+    stable_ref = VmMoRefProxy(moref, instance.uuid)
+    if not moref:
+        stable_ref.fetch_moref(session)
+    return stable_ref
 
 
 def search_vm_ref_by_identifier(session, identifier):
@@ -1151,8 +1145,7 @@ def search_vm_ref_by_identifier(session, identifier):
     use get_vm_ref instead.
     """
     vm_ref = (_get_vm_ref_from_vm_uuid(session, identifier) or
-              _get_vm_ref_from_extraconfig(session, identifier) or
-              _get_vm_ref_from_name(session, identifier))
+              _get_vm_ref_from_extraconfig(session, identifier))
     return vm_ref
 
 
@@ -1520,7 +1513,7 @@ def find_rescue_device(hardware_devices, instance):
     """Returns the rescue device.
 
     The method will raise an exception if the rescue device does not
-    exist. The resuce device has suffix '-rescue.vmdk'.
+    exist. The rescue device has suffix '-rescue.vmdk'.
     :param hardware_devices: the hardware devices for the instance
     :param instance: nova.objects.instance.Instance object
     :return: the rescue disk device object
@@ -1536,8 +1529,8 @@ def find_rescue_device(hardware_devices, instance):
     raise exception.NotFound(msg)
 
 
-def get_ephemeral_name(id):
-    return 'ephemeral_%d.vmdk' % id
+def get_ephemeral_name(id_):
+    return 'ephemeral_%d.vmdk' % id_
 
 
 def _detach_and_delete_devices_config_spec(client_factory, devices):
@@ -1619,11 +1612,11 @@ def folder_ref_cache_get(path):
     return _FOLDER_PATH_REF_MAPPING.get(path)
 
 
-def _get_vm_name(display_name, id):
+def _get_vm_name(display_name, id_):
     if display_name:
-        return '%s (%s)' % (display_name[:41], id[:36])
-    else:
-        return id[:36]
+        return '%s (%s)' % (display_name[:41], id_[:36])
+
+    return id_[:36]
 
 
 def rename_vm(session, vm_ref, instance):
@@ -1631,3 +1624,36 @@ def rename_vm(session, vm_ref, instance):
     rename_task = session._call_method(session.vim, "Rename_Task", vm_ref,
                                        newName=vm_name)
     session._wait_for_task(rename_task)
+
+
+def _create_fcd_id_obj(client_factory, fcd_id):
+    id_obj = client_factory.create('ns0:ID')
+    id_obj.id = fcd_id
+    return id_obj
+
+
+def attach_fcd(
+        session, vm_ref, fcd_id, ds_ref_val, controller_key, unit_number
+    ):
+    client_factory = session.vim.client.factory
+    disk_id = _create_fcd_id_obj(client_factory, fcd_id)
+    ds_ref = vutil.get_moref(ds_ref_val, 'Datastore')
+    LOG.debug("Attaching fcd (id: %(fcd_id)s, datastore: %(ds_ref_val)s) to "
+              "vm: %(vm_ref)s.",
+              {'fcd_id': fcd_id,
+               'ds_ref_val': ds_ref_val,
+               'vm_ref': vm_ref})
+    task = session._call_method(
+        session.vim, "AttachDisk_Task", vm_ref, diskId=disk_id,
+        datastore=ds_ref, controllerKey=controller_key, unitNumber=unit_number)
+    session._wait_for_task(task)
+
+
+def detach_fcd(session, vm_ref, fcd_id):
+    client_factory = session.vim.client.factory
+    disk_id = _create_fcd_id_obj(client_factory, fcd_id)
+    LOG.debug("Detaching fcd (id: %(fcd_id)s) from vm: %(vm_ref)s.",
+              {'fcd_id': fcd_id, 'vm_ref': vm_ref})
+    task = session._call_method(
+        session.vim, "DetachDisk_Task", vm_ref, diskId=disk_id)
+    session._wait_for_task(task)

@@ -10,7 +10,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
 from nova.tests.unit.virt.libvirt.volume import test_volume
 from nova.virt.libvirt.volume import nvme
@@ -29,7 +29,21 @@ class LibvirtNVMEVolumeDriverTestCase(test_volume.LibvirtVolumeBaseTestCase):
 
         nvme.LibvirtNVMEVolumeDriver(self.fake_host)
         mock_factory.assert_called_once_with(
-            initiator.NVME, 'sudo',
+            initiator.NVME, 'sudo', use_multipath=False,
+            device_scan_attempts=3)
+
+    @mock.patch('os.path.exists', return_value=True)
+    @mock.patch('nova.utils.get_root_helper')
+    @mock.patch('os_brick.initiator.connector.InitiatorConnector.factory')
+    def test_libvirt_nvme_driver_multipath(self, mock_factory, mock_helper,
+                                           exists):
+        self.flags(num_nvme_discover_tries=3, volume_use_multipath=True,
+                   group='libvirt')
+        mock_helper.return_value = 'sudo'
+
+        nvme.LibvirtNVMEVolumeDriver(self.fake_host)
+        mock_factory.assert_called_once_with(
+            initiator.NVME, 'sudo', use_multipath=True,
             device_scan_attempts=3)
 
     @mock.patch('os_brick.initiator.connector.InitiatorConnector.factory',
@@ -42,14 +56,15 @@ class LibvirtNVMEVolumeDriverTestCase(test_volume.LibvirtVolumeBaseTestCase):
             'name': 'aNVMEVolume',
             'conf': config}
         connection_info = {'data': disk_info}
-        with mock.patch.object(nvme_driver.connector,
-                               'connect_volume',
-                               return_value={'path': '/dev/dms1234567'}):
-            nvme_driver.connect_volume(connection_info, None)
-            nvme_driver.connector.connect_volume.assert_called_once_with(
-                connection_info['data'])
-            self.assertEqual('/dev/dms1234567',
-                             connection_info['data']['device_path'])
+        nvme_driver.connector.connect_volume.return_value = (
+            {'path': '/dev/dms1234567'})
+
+        nvme_driver.connect_volume(connection_info, None)
+
+        nvme_driver.connector.connect_volume.assert_called_once_with(
+            connection_info['data'])
+        self.assertEqual(
+            '/dev/dms1234567', connection_info['data']['device_path'])
 
     @mock.patch('os_brick.initiator.connector.InitiatorConnector.factory',
         new=mock.Mock(return_value=mock.Mock()))
@@ -62,7 +77,13 @@ class LibvirtNVMEVolumeDriverTestCase(test_volume.LibvirtVolumeBaseTestCase):
         connection_info = {'data': disk_info}
         nvme_driver.disconnect_volume(connection_info, None)
         nvme_driver.connector.disconnect_volume.assert_called_once_with(
-            disk_info, None)
+            disk_info, None, force=False)
+
+        # Verify force=True
+        nvme_driver.connector.disconnect_volume.reset_mock()
+        nvme_driver.disconnect_volume(connection_info, None, force=True)
+        nvme_driver.connector.disconnect_volume.assert_called_once_with(
+            disk_info, None, force=True)
 
     @mock.patch('os_brick.initiator.connector.InitiatorConnector.factory',
         new=mock.Mock(return_value=mock.Mock()))

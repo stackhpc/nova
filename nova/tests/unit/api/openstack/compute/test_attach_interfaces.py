@@ -13,7 +13,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from webob import exc
 
 from nova.api.openstack import common
@@ -560,6 +561,7 @@ class InterfaceAttachTestsV249(test.NoDBTestCase):
 
 class InterfaceAttachTestsV270(test.NoDBTestCase):
     """os-interface API tests for microversion 2.70"""
+
     def setUp(self):
         super(InterfaceAttachTestsV270, self).setUp()
         self.attachments = (

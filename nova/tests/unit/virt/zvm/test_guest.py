@@ -12,7 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
 from nova.compute import power_state as compute_power_state
 from nova import context
@@ -65,7 +65,7 @@ class TestZVMGuestOp(test.NoDBTestCase):
     @mock.patch('nova.virt.zvm.utils.ConnectorClient.call')
     def test_get_info_err_general(self, call):
         res = {'overallRC': 500, 'errmsg': 'err', 'rc': 0, 'rs': 0}
-        call.side_effect = exception.ZVMConnectorError(res)
+        call.side_effect = exception.ZVMConnectorError(results=res)
         self.assertRaises(exception.ZVMConnectorError, self._guest.get_info)
 
     @mock.patch('nova.virt.zvm.utils.ConnectorClient.call')

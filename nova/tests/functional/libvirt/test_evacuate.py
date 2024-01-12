@@ -13,10 +13,10 @@
 # under the License.
 
 import collections
-import fixtures
-import mock
 import os.path
+from unittest import mock
 
+import fixtures
 from oslo_utils import fileutils
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import units
@@ -107,6 +107,7 @@ SERVER_DISKS = {
 
 class _FileTest(object):
     """A base class for the _FlatTest and _Qcow2Test mixin test classes"""
+
     def setUp(self):
         super(_FileTest, self).setUp()
 
@@ -148,6 +149,7 @@ class _FlatTest(_FileTest):
     mock create_image to touch a file so we can assert its existence/removal in
     tests.
     """
+
     def setUp(self):
         super(_FlatTest, self).setUp()
 
@@ -172,6 +174,7 @@ class _Qcow2Test(_FileTest):
     mock create_image to touch a file so we can assert its existence/removal in
     tests.
     """
+
     def setUp(self):
         super(_Qcow2Test, self).setUp()
 
@@ -193,6 +196,7 @@ class _RbdTest(object):
     create_image to store which rbd volumes would have been created, and exists
     to reference that store.
     """
+
     def setUp(self):
         super(_RbdTest, self).setUp()
 
@@ -287,6 +291,7 @@ class _LVMTest(object):
     the nova.virt.libvirt.storage.lvm module immediately before starting a new
     compute.
     """
+
     def setUp(self):
         super(_LVMTest, self).setUp()
 
@@ -395,6 +400,7 @@ class _LibvirtEvacuateTest(integrated_helpers.InstanceHelperMixin):
     with these mixins we get test coverage of all combinations of
     shared/nonshared instanace directories and block storage.
     """
+
     def _start_compute(self, name):
         # NOTE(mdbooth): fakelibvirt's getHostname currently returns a
         # hardcoded 'compute1', which is undesirable if we want multiple fake
@@ -409,7 +415,9 @@ class _LibvirtEvacuateTest(integrated_helpers.InstanceHelperMixin):
 
         with mock.patch.object(fakelibvirt.Connection, 'getHostname',
                                return_value=name):
-            compute = self.start_service('compute', host=name)
+            with mock.patch('nova.virt.node.get_local_node_uuid') as m:
+                m.return_value = str(getattr(uuids, 'node_%s' % name))
+                compute = self.start_service('compute', host=name)
 
         compute.driver._host.get_connection().getHostname = lambda: name
         return compute
@@ -421,6 +429,7 @@ class _LibvirtEvacuateTest(integrated_helpers.InstanceHelperMixin):
         self.useFixture(nova_fixtures.NeutronFixture(self))
         self.useFixture(nova_fixtures.GlanceFixture(self))
         self.useFixture(func_fixtures.PlacementFixture())
+        self.useFixture(nova_fixtures.CGroupsFixture())
         fake_network.set_stub_network_methods(self)
 
         api_fixture = self.useFixture(

@@ -15,10 +15,10 @@
 import os.path
 import threading
 import time
+from unittest import mock
 
 import eventlet
 import fixtures
-import mock
 from oslo_concurrency import processutils
 from oslo_utils.fixture import uuidsentinel as uuids
 
@@ -117,7 +117,7 @@ class ThreadController(object):
                 self.waiting = True
                 self.wait_lock.notify_all()
                 self.wait_lock.wait(1)
-                assert(time.time() - wait_since < MAX_WAIT)
+                assert time.time() - wait_since < MAX_WAIT
 
             self.epoch += 1
             self.waiting = False
@@ -141,7 +141,7 @@ class ThreadController(object):
             wait_since = time.time()
             while self.epoch == self.last_epoch or not self.waiting:
                 self.wait_lock.wait(1)
-                assert(time.time() - wait_since < MAX_WAIT)
+                assert time.time() - wait_since < MAX_WAIT
 
             self.last_epoch = self.epoch
 
@@ -164,7 +164,7 @@ class ThreadController(object):
             self.wait_lock.notify_all()
             while not self.complete:
                 self.wait_lock.wait(1)
-                assert(time.time() - wait_since < MAX_WAIT)
+                assert time.time() - wait_since < MAX_WAIT
 
         self.thread.wait()
 
@@ -579,6 +579,32 @@ class HostMountStateTestCase(test.NoDBTestCase):
         self._sentinel_umount(m, mock.sentinel.vol_a)
 
         mock_log.assert_called()
+
+    @mock.patch.object(mount.LOG, 'exception')
+    def test_mount_failure(self, mock_log_exc):
+        m = self._get_clean_hostmountstate()
+        err = processutils.ProcessExecutionError
+        self.mock_mount.side_effect = err
+
+        # Mount vol_a
+        self.assertRaises(err, self._sentinel_mount, m, mock.sentinel.vol_a)
+
+        # Verify the mountpoint got removed after the failure
+        self.assertEqual({}, m.mountpoints)
+
+        # Now try a scenario where the mount failed because the volume was
+        # already mounted
+        self.mock_ismount.side_effect = [False, True]
+
+        # Mount vol_a
+        self._sentinel_mount(m, mock.sentinel.vol_a)
+
+        # Verify the mountpoint is present despite the error
+        self.assertEqual(1, len(m.mountpoints))
+        self.assertIn(mock.sentinel.mountpoint, m.mountpoints)
+
+        # Verify we logged an exception
+        mock_log_exc.assert_called()
 
 
 class MountManagerTestCase(test.NoDBTestCase):

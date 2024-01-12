@@ -15,6 +15,7 @@
 """Validators for ``hw`` namespaced extra specs."""
 
 from nova.api.validation.extra_specs import base
+from nova.objects import fields
 
 
 realtime_validators = [
@@ -160,6 +161,18 @@ hugepage_validators = [
             'type': str,
             'description': 'The size of memory page to allocate',
             'pattern': r'(large|small|any|\d+([kKMGT]i?)?(b|bit|B)?)',
+        },
+    ),
+    base.ExtraSpecValidator(
+        name='hw:locked_memory',
+        description=(
+            'Determine if **guest** (instance) memory should be locked '
+            'preventing swapping. This is required in rare cases for device '
+            'DMA transfers. Only supported by the libvirt virt driver.'
+        ),
+        value={
+            'type': bool,
+            'description': 'Whether to lock **guest** (instance) memory.',
         },
     ),
 ]
@@ -369,6 +382,20 @@ feature_flag_validators = [
         },
     ),
     base.ExtraSpecValidator(
+        name='hw:vif_multiqueue_enabled',
+        description=(
+            'Whether to enable the virtio-net multiqueue feature. '
+            'When set, the driver sets the number of queues equal to the '
+            'number of guest vCPUs. This makes the network performance scale '
+            'across a number of vCPUs. This requires guest support and is '
+            'only supported by the libvirt driver.'
+        ),
+        value={
+            'type': bool,
+            'description': 'Whether to enable multiqueue',
+        },
+    ),
+    base.ExtraSpecValidator(
         name='hw:mem_encryption',
         description=(
             'Whether to enable memory encryption for the guest. '
@@ -484,6 +511,59 @@ feature_flag_validators = [
             ],
         },
     ),
+    base.ExtraSpecValidator(
+        name='hw:viommu_model',
+        description=(
+            'This can be used to set model for virtual IOMMU device.'
+        ),
+        value={
+            'type': str,
+            'enum': [
+                'intel',
+                'smmuv3',
+                'virtio',
+                'auto'
+            ],
+            'description': 'model for vIOMMU',
+        },
+    ),
+    base.ExtraSpecValidator(
+        name='hw:virtio_packed_ring',
+        description=(
+            'Permit guests to negotiate the virtio packed ring format. '
+            'This requires guest support and is only supported by '
+            'the libvirt driver.'
+        ),
+        value={
+            'type': bool,
+            'description': 'Whether to enable packed virtqueue',
+        },
+    ),
+]
+
+ephemeral_encryption_validators = [
+    base.ExtraSpecValidator(
+        name='hw:ephemeral_encryption',
+        description=(
+            'Whether to enable ephemeral storage encryption.'
+        ),
+        value={
+            'type': bool,
+            'description': 'Whether to enable ephemeral storage encryption.',
+        },
+    ),
+    base.ExtraSpecValidator(
+        name='hw:ephemeral_encryption_format',
+        description=(
+            'The encryption format to be used if ephemeral storage '
+            'encryption is enabled via hw:ephemeral_encryption.'
+        ),
+        value={
+            'type': str,
+            'description': 'The encryption format to be used if enabled.',
+            'enum': fields.BlockDeviceEncryptionFormatType.ALL,
+        },
+    ),
 ]
 
 
@@ -495,5 +575,6 @@ def register():
         hugepage_validators +
         numa_validators +
         cpu_topology_validators +
-        feature_flag_validators
+        feature_flag_validators +
+        ephemeral_encryption_validators
     )

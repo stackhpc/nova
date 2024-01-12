@@ -12,7 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from oslo_policy import policy as oslo_policy
 
 from nova import exception
@@ -58,6 +59,15 @@ class InstanceActionsTestV221(InstanceActionsTestV21):
         self.assertEqual('delete', actions[0]['action'])
         self.assertEqual('create', actions[1]['action'])
 
+    def test_get_instance_actions_shelve_deleted(self):
+        server = self._create_server()
+        self._shelve_server(server)
+        self._delete_server(server)
+        actions = self.api.get_instance_actions(server['id'])
+        self.assertEqual('delete', actions[0]['action'])
+        self.assertEqual('shelve', actions[1]['action'])
+        self.assertEqual('create', actions[2]['action'])
+
 
 class HypervisorError(Exception):
     """This is just used to make sure the exception type is in the events."""
@@ -75,6 +85,7 @@ class InstanceActionEventFaultsTestCase(
         self.useFixture(nova_fixtures.NeutronFixture(self))
         self.useFixture(func_fixtures.PlacementFixture())
         self.useFixture(nova_fixtures.RealPolicyFixture())
+        self.useFixture(nova_fixtures.CinderFixture(self))
 
         # Start the compute services.
         self.start_service('conductor')

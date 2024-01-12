@@ -18,7 +18,8 @@
 Unit Tests for remote procedure calls using queue
 """
 
-import mock
+from unittest import mock
+
 from oslo_concurrency import processutils
 from oslo_config import cfg
 from oslo_service import service as _service
@@ -48,6 +49,7 @@ CONF.register_opts(test_service_opts)
 
 class FakeManager(manager.Manager):
     """Fake manager for tests."""
+
     def test_method(self):
         return 'manager'
 
@@ -126,13 +128,14 @@ class ServiceTestCase(test.NoDBTestCase):
         serv.manager.additional_endpoints = []
         serv.start()
         # init_host is called before any service record is created
-        serv.manager.init_host.assert_called_once_with()
+        serv.manager.init_host.assert_called_once_with(None)
         mock_get_by_host_and_binary.assert_called_once_with(mock.ANY,
                                                        self.host, self.binary)
         mock_create.assert_called_once_with()
         # pre_start_hook is called after service record is created,
         # but before RPC consumer is created
-        serv.manager.pre_start_hook.assert_called_once_with()
+        serv.manager.pre_start_hook.assert_called_once_with(
+            serv.service_ref)
         # post_start_hook is called after RPC consumer is created.
         serv.manager.post_start_hook.assert_called_once_with()
 
@@ -156,7 +159,7 @@ class ServiceTestCase(test.NoDBTestCase):
         service_obj = mock.Mock()
         service_obj.binary = 'fake-binary'
         service_obj.host = 'fake-host'
-        service_obj.version = -42
+        service_obj.version = 42
         mock_get_by_host_and_binary.return_value = service_obj
 
         serv = service.Service(self.host, self.binary, self.topic,
@@ -184,7 +187,7 @@ class ServiceTestCase(test.NoDBTestCase):
         mock_create.side_effect = ex
         serv.manager = mock_manager
         self.assertRaises(test.TestingException, serv.start)
-        serv.manager.init_host.assert_called_with()
+        serv.manager.init_host.assert_called_with(None)
         mock_get_by_host_and_binary.assert_has_calls([
                 mock.call(mock.ANY, self.host, self.binary),
                 mock.call(mock.ANY, self.host, self.binary)])
@@ -214,12 +217,12 @@ class ServiceTestCase(test.NoDBTestCase):
         serv.manager.service_name = self.topic
         serv.manager.additional_endpoints = []
         serv.start()
-        serv.manager.init_host.assert_called_once_with()
+        serv.manager.init_host.assert_called_once_with(None)
         mock_get_by_host_and_binary.assert_called_once_with(mock.ANY,
                                                             self.host,
                                                             self.binary)
         mock_create.assert_called_once_with()
-        serv.manager.pre_start_hook.assert_called_once_with()
+        serv.manager.pre_start_hook.assert_called_once_with(serv.service_ref)
         serv.manager.post_start_hook.assert_called_once_with()
         serv.stop()
         mock_stop.assert_called_once_with()
@@ -239,7 +242,8 @@ class ServiceTestCase(test.NoDBTestCase):
         serv.manager.additional_endpoints = []
 
         serv.start()
-        serv.manager.init_host.assert_called_with()
+        serv.manager.init_host.assert_called_with(
+            mock_svc_get_by_host_and_binary.return_value)
 
         serv.stop()
         serv.manager.cleanup_host.assert_called_with()
@@ -286,6 +290,29 @@ class ServiceTestCase(test.NoDBTestCase):
         mock_check_old.assert_called_once_with()
         mock_wait.assert_called_once_with(mock.ANY)
 
+    @mock.patch('nova.utils.raise_if_old_compute')
+    def test_old_compute_version_check_workaround(
+            self, mock_check_old):
+
+        mock_check_old.side_effect = exception.TooOldComputeService(
+            oldest_supported_version='2',
+            scope='scope',
+            min_service_level=2,
+            oldest_supported_service=1)
+
+        self.assertRaises(exception.TooOldComputeService,
+                          service.Service.create,
+                          self.host, 'nova-conductor', self.topic,
+                          'nova.tests.unit.test_service.FakeManager')
+
+        CONF.set_override('disable_compute_service_check_for_ffu', True,
+                          group='workarounds')
+
+        service.Service.create(self.host, 'nova-conductor', self.topic,
+                               'nova.tests.unit.test_service.FakeManager')
+
+        mock_check_old.assert_has_calls([mock.call(), mock.call()])
+
 
 class TestWSGIService(test.NoDBTestCase):
 
@@ -300,6 +327,7 @@ class TestWSGIService(test.NoDBTestCase):
         mock_get.return_value = None
         test_service = service.WSGIService("test_service")
         test_service.start()
+        self.addCleanup(test_service.stop)
         self.assertTrue(mock_create.called)
 
     @mock.patch('nova.objects.Service.get_by_host_and_binary')
@@ -307,14 +335,15 @@ class TestWSGIService(test.NoDBTestCase):
     def test_service_start_does_not_create_record(self, mock_create, mock_get):
         test_service = service.WSGIService("test_service")
         test_service.start()
+        self.addCleanup(test_service.stop)
         self.assertFalse(mock_create.called)
 
     @mock.patch('nova.objects.Service.get_by_host_and_binary')
     def test_service_random_port(self, mock_get):
         test_service = service.WSGIService("test_service")
         test_service.start()
+        self.addCleanup(test_service.stop)
         self.assertNotEqual(0, test_service.port)
-        test_service.stop()
 
     def test_workers_set_default(self):
         test_service = service.WSGIService("osapi_compute")
@@ -340,9 +369,9 @@ class TestWSGIService(test.NoDBTestCase):
         CONF.set_default("test_service_listen", "::1")
         test_service = service.WSGIService("test_service")
         test_service.start()
+        self.addCleanup(test_service.stop)
         self.assertEqual("::1", test_service.host)
         self.assertNotEqual(0, test_service.port)
-        test_service.stop()
 
     @mock.patch('nova.objects.Service.get_by_host_and_binary')
     def test_reset_pool_size_to_default(self, mock_get):
@@ -356,6 +385,7 @@ class TestWSGIService(test.NoDBTestCase):
         # Resetting pool size to default
         test_service.reset()
         test_service.start()
+        self.addCleanup(test_service.stop)
         self.assertEqual(test_service.server._pool.size,
                          CONF.wsgi.default_pool_size)
 

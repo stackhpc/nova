@@ -271,7 +271,7 @@ New Features
 
 .. releasenotes/notes/instance-hostname-used-to-populate-ports-dns-name-08341ec73dc076c0.yaml @ b'997d8f516cee99b4e16429d13ca5cf7fc05166aa'
 
-- When booting an instance, its sanitized 'hostname' attribute is now used to populate the 'dns_name' attribute of the Neutron ports the instance is attached to. This functionality enables the Neutron internal DNS service to know the ports by the instance's hostname. As a consequence, commands like 'hostname -f' will work as expected when executed in the instance. When a port's network has a non-blank 'dns_domain' attribute, the port's 'dns_name' combined with the network's 'dns_domain' will be published by Neutron in an external DNS as a service like Designate. As a consequence, the instance's hostname is published in the external DNS as a service. This functionality is added to Nova when the 'DNS Integration' extension is enabled in Neutron. The publication of 'dns_name' and 'dns_domain' combinations to an external DNS as a service additionaly requires the configuration of the appropriate driver in Neutron. When the 'Port Binding' extension is also enabled in Neutron, the publication of a 'dns_name' and 'dns_domain' combination to the external DNS as a service will require one additional update operation when Nova allocates the port during the instance boot. This may have a noticeable impact on the performance of the boot process.
+- When booting an instance, its sanitized 'hostname' attribute is now used to populate the 'dns_name' attribute of the Neutron ports the instance is attached to. This functionality enables the Neutron internal DNS service to know the ports by the instance's hostname. As a consequence, commands like 'hostname -f' will work as expected when executed in the instance. When a port's network has a non-blank 'dns_domain' attribute, the port's 'dns_name' combined with the network's 'dns_domain' will be published by Neutron in an external DNS as a service like Designate. As a consequence, the instance's hostname is published in the external DNS as a service. This functionality is added to Nova when the 'DNS Integration' extension is enabled in Neutron. The publication of 'dns_name' and 'dns_domain' combinations to an external DNS as a service additionally requires the configuration of the appropriate driver in Neutron. When the 'Port Binding' extension is also enabled in Neutron, the publication of a 'dns_name' and 'dns_domain' combination to the external DNS as a service will require one additional update operation when Nova allocates the port during the instance boot. This may have a noticeable impact on the performance of the boot process.
 
 .. releasenotes/notes/libvirt-live-migration-new-tunneled-option-d7ebb1eb1e95e683.yaml @ b'621594fc41d0e07fd63dfe7c3c5cfee9edc380ad'
 
@@ -287,7 +287,7 @@ New Features
 
 .. releasenotes/notes/online-data-migrations-48dde6a1d8661e47.yaml @ b'c2bd7e4cdcb3c81700977155c93561f50c6b415d'
 
-- Added a `nova-manage db online_data_migrations` command for forcing online data migrations, which will run all registered migrations for the release, instead of there being a separate command for each logical data migration. Operators need to make sure all data is migrated before upgrading to the next release, and the new command provides a unified interface for doing it.
+- Added a ``nova-manage db online_data_migrations`` command for forcing online data migrations, which will run all registered migrations for the release, instead of there being a separate command for each logical data migration. Operators need to make sure all data is migrated before upgrading to the next release, and the new command provides a unified interface for doing it.
 
 .. releasenotes/notes/optional_project_id-6aebf1cb394d498f.yaml @ b'eea7169474d3cf6b9ac27036ae3ca5a95b461b8d'
 
@@ -624,7 +624,7 @@ Deprecation Notes
 
 .. releasenotes/notes/os-migrations-ef225e5b309d5497.yaml @ b'98e4a64ad3f1f975e78224d19e729787b902e84c'
 
-- The old top-level resource `/os-migrations` is deprecated, it won't be extended anymore. And migration_type for /os-migrations, also add ref link to the /servers/{uuid}/migrations/{id} for it when the migration is an in-progress live-migration. This has been added in microversion 2.23.
+- The old top-level resource ``/os-migrations`` is deprecated, it won't be extended anymore. And migration_type for /os-migrations, also add ref link to the /servers/{uuid}/migrations/{id} for it when the migration is an in-progress live-migration. This has been added in microversion 2.23.
 
 .. releasenotes/notes/rm_volume_manager-78fed5be43d285b3.yaml @ b'6e8e322718529e50bf2035507b970058ddaa836a'
 
@@ -638,7 +638,7 @@ Deprecation Notes
 
 - The Zookeeper Service Group driver has been removed.
 
-  The driver has no known users and is not actively mantained. A warning log
+  The driver has no known users and is not actively maintained. A warning log
   message about the driver's state was added for the Kilo release. Also,
   evzookeeper library that the driver depends on is unmaintained and
   `incompatible with recent eventlet releases`_.

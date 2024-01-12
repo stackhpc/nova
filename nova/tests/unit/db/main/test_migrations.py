@@ -25,17 +25,20 @@ test will then use that DB and username/password combo to run the tests. Refer
 to the 'tools/test-setup.sh' for an example of how to configure this.
 """
 
+from unittest import mock
+
 from alembic import command as alembic_api
 from alembic import script as alembic_script
 import fixtures
-from migrate.versioning import api as migrate_api
-import mock
 from oslo_db.sqlalchemy import enginefacade
 from oslo_db.sqlalchemy import test_fixtures
 from oslo_db.sqlalchemy import test_migrations
+from oslo_db.sqlalchemy import utils as oslodbutils
 from oslo_log.fixture import logging_error as log_fixture
 from oslo_log import log as logging
 from oslotest import base
+import sqlalchemy as sa
+import sqlalchemy.exc
 
 from nova.db.main import models
 from nova.db import migration
@@ -47,6 +50,10 @@ LOG = logging.getLogger(__name__)
 
 class NovaModelsMigrationsSync(test_migrations.ModelsMigrationsSync):
     """Test sqlalchemy-migrate migrations."""
+
+    # Migrations can take a long time, particularly on underpowered CI nodes.
+    # Give them some breathing room.
+    TIMEOUT_SCALING_FACTOR = 4
 
     def setUp(self):
         # Ensure BaseTestCase's ConfigureLogging fixture is disabled since
@@ -72,39 +79,44 @@ class NovaModelsMigrationsSync(test_migrations.ModelsMigrationsSync):
 
     def include_object(self, object_, name, type_, reflected, compare_to):
         if type_ == 'table':
-            # migrate_version is a sqlalchemy-migrate control table and
-            # isn't included in the model. shadow_* are generated from
-            # the model and have their own tests to ensure they don't
-            # drift.
-            if name == 'migrate_version' or name.startswith('shadow_'):
+            # shadow_* are generated from the model and have their own tests to
+            # ensure they don't drift.
+            if name.startswith('shadow_'):
                 return False
+
+            # Define a whitelist of tables that will be removed from the DB in
+            # a later release and don't have a corresponding model anymore.
+
+            return name not in models.REMOVED_TABLES
 
         return True
 
     def filter_metadata_diff(self, diff):
-        # Overriding the parent method to decide on certain attributes
-        # that maybe present in the DB but not in the models.py
+        # Filter out diffs that shouldn't cause a sync failure.
+        new_diff = []
 
-        def removed_column(element):
-            # Define a whitelist of columns that would be removed from the
-            # DB at a later release.
-            # NOTE(Luyao) The vpmems column was added to the schema in train,
-            # and removed from the model in train.
-            column_whitelist = {
-                'instances': ['internal_id'],
-                'instance_extra': ['vpmems'],
-            }
+        for element in diff:
+            if isinstance(element, list):
+                # modify_nullable is a list
+                new_diff.append(element)
+            else:
+                # tuple with action as first element. Different actions have
+                # different tuple structures.
+                if element[0] == 'add_fk':
+                    fkey = element[1]
+                    tablename = fkey.table.name
+                    column_keys = fkey.column_keys
+                    if (tablename, column_keys) in models.REMOVED_FKEYS:
+                        continue
+                if element[0] == 'remove_column':
+                    table = element[2]
+                    column = element[3].name
+                    if (table, column) in models.REMOVED_COLUMNS:
+                        continue
 
-            if element[0] != 'remove_column':
-                return False
+                new_diff.append(element)
 
-            table_name, column = element[2], element[3]
-            return (
-                table_name in column_whitelist and
-                column.name in column_whitelist[table_name]
-            )
-
-        return [element for element in diff if not removed_column(element)]
+        return new_diff
 
 
 class TestModelsSyncSQLite(
@@ -125,21 +137,28 @@ class TestModelsSyncMySQL(
     def test_innodb_tables(self):
         self.db_sync(self.get_engine())
 
-        total = self.engine.execute(
-            "SELECT count(*) "
-            "FROM information_schema.TABLES "
-            "WHERE TABLE_SCHEMA = '%(database)s'" %
-            {'database': self.engine.url.database})
+        with self.engine.connect() as conn:
+            total = conn.execute(
+                sa.text(
+                    "SELECT count(*) "
+                    "FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA = :database"
+                ),
+                {'database': self.engine.url.database},
+            )
         self.assertGreater(total.scalar(), 0, "No tables found. Wrong schema?")
 
-        noninnodb = self.engine.execute(
-            "SELECT count(*) "
-            "FROM information_schema.TABLES "
-            "WHERE TABLE_SCHEMA='%(database)s' "
-            "AND ENGINE != 'InnoDB' "
-            "AND TABLE_NAME != 'migrate_version'" %
-            {'database': self.engine.url.database})
-        count = noninnodb.scalar()
+        with self.engine.connect() as conn:
+            noninnodb = conn.execute(
+                sa.text(
+                    "SELECT count(*) "
+                    "FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA = :database "
+                    "AND ENGINE != 'InnoDB' "
+                ),
+                {'database': self.engine.url.database},
+            )
+            count = noninnodb.scalar()
         self.assertEqual(count, 0, "%d non InnoDB tables created" % count)
 
 
@@ -151,56 +170,37 @@ class TestModelsSyncPostgreSQL(
     FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
 
 
-class NovaModelsMigrationsLegacySync(NovaModelsMigrationsSync):
-    """Test that the models match the database after old migrations are run."""
-
-    def db_sync(self, engine):
-        # the 'nova.db.migration.db_sync' method will not use the legacy
-        # sqlalchemy-migrate-based migration flow unless the database is
-        # already controlled with sqlalchemy-migrate, so we need to manually
-        # enable version controlling with this tool to test this code path
-        repository = migration._find_migrate_repo(database='main')
-        migrate_api.version_control(
-            engine, repository, migration.MIGRATE_INIT_VERSION['main'])
-
-        # now we can apply migrations as expected and the legacy path will be
-        # followed
-        super().db_sync(engine)
-
-
-class TestModelsLegacySyncSQLite(
-    NovaModelsMigrationsLegacySync,
-    test_fixtures.OpportunisticDBTestMixin,
-    base.BaseTestCase,
-):
-    pass
-
-
-class TestModelsLegacySyncMySQL(
-    NovaModelsMigrationsLegacySync,
-    test_fixtures.OpportunisticDBTestMixin,
-    base.BaseTestCase,
-):
-    FIXTURE = test_fixtures.MySQLOpportunisticFixture
-
-
-class TestModelsLegacySyncPostgreSQL(
-    NovaModelsMigrationsLegacySync,
-    test_fixtures.OpportunisticDBTestMixin,
-    base.BaseTestCase,
-):
-    FIXTURE = test_fixtures.PostgresqlOpportunisticFixture
-
-
 class NovaMigrationsWalk(
     test_fixtures.OpportunisticDBTestMixin, test.NoDBTestCase,
 ):
+
+    # Migrations can take a long time, particularly on underpowered CI nodes.
+    # Give them some breathing room.
+    TIMEOUT_SCALING_FACTOR = 4
 
     def setUp(self):
         super().setUp()
         self.engine = enginefacade.writer.get_engine()
         self.config = migration._find_alembic_conf('main')
-        self.init_version = migration.ALEMBIC_INIT_VERSION['main']
+        self.init_version = '8f2f1571d55b'
+
+    def assertIndexExists(self, connection, table_name, index):
+        self.assertTrue(
+            oslodbutils.index_exists(connection, table_name, index),
+            'Index %s on table %s should not exist' % (index, table_name),
+        )
+
+    def assertIndexNotExists(self, connection, table_name, index):
+        self.assertFalse(
+            oslodbutils.index_exists(connection, table_name, index),
+            'Index %s on table %s should not exist' % (index, table_name),
+        )
+
+    def assertColumnExists(self, connection, table_name, column):
+        self.assertTrue(
+            oslodbutils.column_exists(connection, table_name, column),
+            'Column %s on table %s should exist' % (column, table_name),
+        )
 
     def _migrate_up(self, connection, revision):
         if revision == self.init_version:  # no tests for the initial revision
@@ -223,6 +223,83 @@ class NovaMigrationsWalk(
         post_upgrade = getattr(self, '_check_%s' % revision, None)
         if post_upgrade:
             post_upgrade(connection)
+
+    def _pre_upgrade_16f1fbcab42b(self, connection):
+        self.assertIndexExists(
+            connection, 'shadow_instance_extra', 'shadow_instance_extra_idx',
+        )
+        self.assertIndexExists(
+            connection, 'shadow_migrations', 'shadow_migrations_uuid',
+        )
+
+    def _check_16f1fbcab42b(self, connection):
+        self.assertIndexNotExists(
+            connection, 'shadow_instance_extra', 'shadow_instance_extra_idx',
+        )
+        self.assertIndexNotExists(
+            connection, 'shadow_migrations', 'shadow_migrations_uuid',
+        )
+
+        # no check for the MySQL-specific change
+
+    def _check_ccb0fa1a2252(self, connection):
+        for prefix in ('', 'shadow_'):
+            table_name = prefix + 'block_device_mapping'
+            table = oslodbutils.get_table(connection, table_name)
+
+            self.assertColumnExists(connection, table_name, 'encrypted')
+            self.assertColumnExists(
+                connection, table_name, 'encryption_secret_uuid')
+            self.assertColumnExists(
+                connection, table_name, 'encryption_format')
+            self.assertColumnExists(
+                connection, table_name, 'encryption_options')
+
+            # Only check for the expected types if we're using sqlite because
+            # other databases' types may be different. For example, Boolean
+            # may be represented as an integer in MySQL
+            if connection.engine.name != 'sqlite':
+                return
+
+            self.assertIsInstance(table.c.encrypted.type, sa.types.Boolean)
+            self.assertIsInstance(
+                table.c.encryption_secret_uuid.type, sa.types.String)
+            self.assertIsInstance(
+                table.c.encryption_format.type, sa.types.String)
+            self.assertIsInstance(
+                table.c.encryption_options.type, sa.types.String)
+
+    def _check_960aac0e09ea(self, connection):
+        self.assertIndexNotExists(
+            connection, 'console_auth_tokens',
+            'console_auth_tokens_token_hash_idx',
+        )
+        self.assertIndexNotExists(
+            connection, 'instances', 'uuid',
+        )
+
+    def _check_1b91788ec3a6(self, connection):
+        # the table optionally existed: there's no way to check for its
+        # removal without creating it first, which is dumb
+        pass
+
+    def _check_1acf2c98e646(self, connection):
+        for prefix in ('', 'shadow_'):
+            self.assertColumnExists(connection,
+                                    prefix + 'instances',
+                                    'compute_id')
+            self.assertColumnExists(connection,
+                                    prefix + 'migrations',
+                                    'dest_compute_id')
+            if not prefix:
+                self.assertIndexExists(
+                    connection,
+                    prefix + 'instances',
+                    'instances_compute_id_deleted_idx')
+                self.assertIndexExists(
+                    connection,
+                    prefix + 'migrations',
+                    'migrations_dest_compute_id_deleted_idx')
 
     def test_single_base_revision(self):
         """Ensure we only have a single base revision.
@@ -262,11 +339,14 @@ class NovaMigrationsWalk(
                 self._migrate_up(connection, revision)
 
     def test_db_version_alembic(self):
-        migration.db_sync(database='main')
+        engine = enginefacade.writer.get_engine()
 
-        script = alembic_script.ScriptDirectory.from_config(self.config)
-        head = script.get_current_head()
-        self.assertEqual(head, migration.db_version(database='main'))
+        with mock.patch.object(migration, '_get_engine', return_value=engine):
+            migration.db_sync(database='main')
+
+            script = alembic_script.ScriptDirectory.from_config(self.config)
+            head = script.get_current_head()
+            self.assertEqual(head, migration.db_version(database='main'))
 
 
 class TestMigrationsWalkSQLite(

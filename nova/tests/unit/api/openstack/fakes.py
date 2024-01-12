@@ -105,12 +105,10 @@ def stub_out_key_pair_funcs(testcase, have_key_pair=True, **kwargs):
         return []
 
     if have_key_pair:
-        testcase.stub_out(
-            'nova.db.main.api.key_pair_get_all_by_user', key_pair)
-        testcase.stub_out('nova.db.main.api.key_pair_get', one_key_pair)
+        testcase.stub_out('nova.objects.KeyPairList._get_from_db', key_pair)
+        testcase.stub_out('nova.objects.KeyPair._get_from_db', one_key_pair)
     else:
-        testcase.stub_out(
-            'nova.db.main.api.key_pair_get_all_by_user', no_key_pair)
+        testcase.stub_out('nova.objects.KeyPairList._get_from_db', key_pair)
 
 
 def stub_out_instance_quota(test, allowed, quota, resource='instances'):
@@ -242,6 +240,9 @@ class HTTPRequest(os_wsgi.Request):
     def blank(cls, *args, **kwargs):
         defaults = {'base_url': 'http://localhost/v2'}
         use_admin_context = kwargs.pop('use_admin_context', False)
+        roles = kwargs.pop('roles', [])
+        if use_admin_context:
+            roles.append('admin')
         project_id = kwargs.pop('project_id', FAKE_PROJECT_ID)
         version = kwargs.pop('version', os_wsgi.DEFAULT_API_VERSION)
         defaults.update(kwargs)
@@ -249,9 +250,18 @@ class HTTPRequest(os_wsgi.Request):
         out.environ['nova.context'] = FakeRequestContext(
             user_id='fake_user',
             project_id=project_id,
-            is_admin=use_admin_context)
+            is_admin=use_admin_context,
+            roles=roles)
         out.api_version_request = api_version.APIVersionRequest(version)
         return out
+
+    @classmethod
+    def member_req(cls, *args, **kwargs):
+        return cls.blank(*args, roles=['member', 'reader'], **kwargs)
+
+    @classmethod
+    def reader_req(cls, *args, **kwargs):
+        return cls.blank(*args, roles=['reader'], **kwargs)
 
 
 class HTTPRequestV21(HTTPRequest):
@@ -421,7 +431,8 @@ def stub_instance(id=1, user_id=None, project_id=None, host=None,
                   memory_mb=0, vcpus=0, root_gb=0, ephemeral_gb=0,
                   flavor=None, launch_index=0, kernel_id="",
                   ramdisk_id="", user_data=None, system_metadata=None,
-                  services=None, trusted_certs=None, hidden=False):
+                  services=None, trusted_certs=None, hidden=False,
+                  compute_id=None):
     if user_id is None:
         user_id = 'fake_user'
     if project_id is None:
@@ -494,6 +505,7 @@ def stub_instance(id=1, user_id=None, project_id=None, host=None,
         "ephemeral_key_uuid": None,
         "host": host,
         "node": node,
+        "compute_id": compute_id,
         "instance_type_id": flavor.id,
         "user_data": user_data,
         "reservation_id": reservation_id,

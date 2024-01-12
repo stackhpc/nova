@@ -12,8 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 import collections
+from unittest import mock
 
-import mock
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import uuidutils
@@ -116,14 +116,19 @@ class _TestRequestSpecObject(object):
             else:
                 self.assertEqual(instance.get(field), getattr(spec, field))
 
-    @mock.patch.object(objects.InstancePCIRequests,
-                       'from_request_spec_instance_props')
-    def test_from_instance_with_pci_requests(self, pci_from_spec):
-        fake_pci_requests = objects.InstancePCIRequests()
-        pci_from_spec.return_value = fake_pci_requests
+    def test_from_instance_with_pci_requests(self):
+        fake_pci_requests = objects.InstancePCIRequests(
+            instance_uuid=uuids.instance,
+            requests=[
+                objects.InstancePCIRequest(
+                    count=1,
+                    spec=[{'vendor_id': '8086'}],
+                ),
+            ],
+        )
 
         instance = dict(
-            uuid=uuidutils.generate_uuid(),
+            uuid=uuids.instance,
             root_gb=10,
             ephemeral_gb=0,
             memory_mb=10,
@@ -132,14 +137,15 @@ class _TestRequestSpecObject(object):
             project_id=fakes.FAKE_PROJECT_ID,
             user_id=fakes.FAKE_USER_ID,
             availability_zone='nova',
-            pci_requests={
-                'instance_uuid': 'fakeid',
-                'requests': [{'count': 1, 'spec': [{'vendor_id': '8086'}]}]})
+            pci_requests=fake_pci_requests.obj_to_primitive(),
+        )
         spec = objects.RequestSpec()
 
         spec._from_instance(instance)
-        pci_from_spec.assert_called_once_with(instance['pci_requests'])
-        self.assertEqual(fake_pci_requests, spec.pci_requests)
+        self.assertEqual(
+            fake_pci_requests.requests[0].spec,
+            spec.pci_requests.requests[0].spec,
+        )
 
     def test_from_instance_with_numa_stuff(self):
         instance = dict(
@@ -424,6 +430,62 @@ class _TestRequestSpecObject(object):
         self.assertListEqual([rg], spec.requested_resources)
         self.assertEqual(req_lvl_params, spec.request_level_params)
 
+    def test_from_components_flavor_based_pci_requests(self):
+        self.flags(group='filter_scheduler', pci_in_placement=True)
+        ctxt = context.RequestContext(
+            fakes.FAKE_USER_ID, fakes.FAKE_PROJECT_ID
+        )
+        instance = fake_instance.fake_instance_obj(ctxt)
+        image = {
+            "id": uuids.image_id,
+            "properties": {"mappings": []},
+            "status": "fake-status",
+            "location": "far-away",
+        }
+        flavor = fake_flavor.fake_flavor_obj(ctxt)
+        filter_properties = {"fake": "property"}
+
+        qos_port_rg = request_spec.RequestGroup()
+        req_lvl_params = request_spec.RequestLevelParams()
+
+        pci_requests = objects.InstancePCIRequests(
+            requests=[
+                objects.InstancePCIRequest(
+                    count=1,
+                    alias_name='a-dev',
+                    request_id=uuids.req1,
+                    spec=[{"vendor_id": "1234", "product_id": "fe12"}],
+                )
+            ]
+        )
+        pci_request_group = request_spec.RequestGroup(
+            requester_id=f"{uuids.req1}-0",
+            resources={"CUSTOM_PCI_1234_FE12": 1},
+            same_provider=True,
+        )
+
+        spec = objects.RequestSpec.from_components(
+            ctxt,
+            instance.uuid,
+            image,
+            flavor,
+            instance.numa_topology,
+            pci_requests,
+            filter_properties,
+            None,
+            instance.availability_zone,
+            port_resource_requests=[qos_port_rg],
+            request_level_params=req_lvl_params,
+        )
+
+        self.assertEqual(2, len(spec.requested_resources))
+        self.assertEqual(qos_port_rg, spec.requested_resources[0])
+        self.assertEqual(
+            pci_request_group.obj_to_primitive(),
+            spec.requested_resources[1].obj_to_primitive(),
+        )
+        self.assertEqual(req_lvl_params, spec.request_level_params)
+
     def test_get_scheduler_hint(self):
         spec_obj = objects.RequestSpec(scheduler_hints={'foo_single': ['1'],
                                                         'foo_mul': ['1', '2']})
@@ -614,6 +676,68 @@ class _TestRequestSpecObject(object):
         self.assertIsInstance(req_obj.limits, objects.SchedulerLimits)
         self.assertIsInstance(req_obj.instance_group, objects.InstanceGroup)
         self.assertEqual('fresh', req_obj.instance_group.name)
+
+    @mock.patch.object(
+        request_spec.RequestSpec, '_get_by_instance_uuid_from_db'
+    )
+    @mock.patch('nova.objects.InstanceGroup.get_by_uuid')
+    def test_get_by_instance_uuid_deleted_group(
+            self, mock_get_ig, get_by_uuid
+    ):
+        fake_spec_obj = fake_request_spec.fake_spec_obj()
+        fake_spec_obj.scheduler_hints['group'] = ['fresh']
+        fake_spec = fake_request_spec.fake_db_spec(fake_spec_obj)
+        get_by_uuid.return_value = fake_spec
+        mock_get_ig.side_effect = exception.InstanceGroupNotFound(
+            group_uuid=uuids.instgroup
+        )
+
+        req_obj = request_spec.RequestSpec.get_by_instance_uuid(
+            self.context, fake_spec['instance_uuid']
+        )
+        # assert that both the instance_group object and scheduler hint
+        # are cleared if the instance_group was deleted since the request
+        # spec was last saved to the db.
+        self.assertIsNone(req_obj.instance_group, objects.InstanceGroup)
+        self.assertEqual({'hint': ['over-there']}, req_obj.scheduler_hints)
+
+    @mock.patch('nova.objects.request_spec.RequestSpec.save')
+    @mock.patch.object(
+        request_spec.RequestSpec, '_get_by_instance_uuid_from_db')
+    @mock.patch('nova.objects.InstanceGroup.get_by_uuid')
+    def test_get_by_instance_uuid_numa_topology_migration(
+        self, mock_get_ig, get_by_uuid, mock_save
+    ):
+        # Simulate a pre-Victoria RequestSpec where the pcpuset field is not
+        # defined for the embedded InstanceNUMACell objects but the cpu_policy
+        # is dedicated meaning that cores in cpuset defines pinned cpus. So
+        # in Victoria or later these InstanceNUMACell objects should be
+        # translated to hold the cores in the pcpuset field instead.
+        numa_topology = objects.InstanceNUMATopology(
+            instance_uuid=uuids.instance_uuid,
+            cells=[
+                objects.InstanceNUMACell(
+                    id=0, cpuset={1, 2}, memory=512, cpu_policy="dedicated"),
+                objects.InstanceNUMACell(
+                    id=1, cpuset={3, 4}, memory=512, cpu_policy="dedicated"),
+            ]
+        )
+        spec_obj = fake_request_spec.fake_spec_obj()
+        spec_obj.numa_topology = numa_topology
+        fake_spec = fake_request_spec.fake_db_spec(spec_obj)
+        fake_spec['instance_uuid'] = uuids.instance_uuid
+
+        get_by_uuid.return_value = fake_spec
+        mock_get_ig.return_value = objects.InstanceGroup(name='fresh')
+
+        req_obj = request_spec.RequestSpec.get_by_instance_uuid(
+            self.context, fake_spec['instance_uuid'])
+
+        self.assertEqual(2, len(req_obj.numa_topology.cells))
+        self.assertEqual({1, 2}, req_obj.numa_topology.cells[0].pcpuset)
+        self.assertEqual({3, 4}, req_obj.numa_topology.cells[1].pcpuset)
+
+        mock_save.assert_called_once()
 
     def _check_update_primitive(self, req_obj, changes):
         self.assertEqual(req_obj.instance_uuid, changes['instance_uuid'])
@@ -984,6 +1108,183 @@ class TestRequestSpecObject(test_objects._LocalTest,
 class TestRemoteRequestSpecObject(test_objects._RemoteTest,
                                   _TestRequestSpecObject):
     pass
+
+
+class TestInstancePCIRequestToRequestGroups(test.NoDBTestCase):
+    def setUp(self):
+        super().setUp()
+        self.flags(group='filter_scheduler', pci_in_placement=True)
+
+    def test_pci_reqs_ignored_if_disabled(self):
+        self.flags(group='filter_scheduler', pci_in_placement=False)
+
+        spec = request_spec.RequestSpec(
+            requested_resources=[],
+            pci_requests=objects.InstancePCIRequests(
+                requests=[
+                    objects.InstancePCIRequest(
+                        count=1,
+                        request_id=uuids.req1,
+                        spec=[{"vendor_id": "de12", "product_id": "1234"}],
+                        alias_name="a-dev",
+                    ),
+                ]
+            ),
+        )
+
+        spec.generate_request_groups_from_pci_requests()
+
+        self.assertEqual(0, len(spec.requested_resources))
+
+    def test_neutron_based_requests_are_ignored(self):
+        pci_req = objects.InstancePCIRequest(
+            count=1,
+            request_id=uuids.req1,
+            spec=[],
+        )
+        spec = request_spec.RequestSpec(
+            requested_resources=[],
+            pci_requests=objects.InstancePCIRequests(requests=[pci_req]),
+        )
+        self.assertEqual(
+            objects.InstancePCIRequest.NEUTRON_PORT, pci_req.source
+        )
+
+        spec.generate_request_groups_from_pci_requests()
+
+        self.assertEqual(0, len(spec.requested_resources))
+
+    def test_rc_from_product_and_vendor(self):
+        spec = request_spec.RequestSpec(
+            requested_resources=[],
+            pci_requests=objects.InstancePCIRequests(
+                requests=[
+                    objects.InstancePCIRequest(
+                        count=1,
+                        request_id=uuids.req1,
+                        spec=[{"vendor_id": "de12", "product_id": "1234"}],
+                        alias_name="a-dev",
+                    ),
+                    objects.InstancePCIRequest(
+                        count=1,
+                        request_id=uuids.req2,
+                        spec=[{"vendor_id": "fff", "product_id": "dead"}],
+                        alias_name="a-dev",
+                    ),
+                ]
+            ),
+        )
+
+        spec.generate_request_groups_from_pci_requests()
+
+        self.assertEqual(2, len(spec.requested_resources))
+        self.assertEqual(
+            request_spec.RequestGroup(
+                requester_id=f"{uuids.req1}-0",
+                resources={"CUSTOM_PCI_DE12_1234": 1},
+                use_same_provider=True,
+            ).obj_to_primitive(),
+            spec.requested_resources[0].obj_to_primitive(),
+        )
+        self.assertEqual(
+            request_spec.RequestGroup(
+                requester_id=f"{uuids.req2}-0",
+                resources={"CUSTOM_PCI_FFF_DEAD": 1},
+                use_same_provider=True,
+            ).obj_to_primitive(),
+            spec.requested_resources[1].obj_to_primitive(),
+        )
+
+    def test_multi_device_split_to_multiple_groups(self):
+        spec = request_spec.RequestSpec(
+            requested_resources=[],
+            pci_requests=objects.InstancePCIRequests(
+                requests=[
+                    objects.InstancePCIRequest(
+                        count=2,
+                        request_id=uuids.req1,
+                        spec=[{"vendor_id": "de12", "product_id": "1234"}],
+                        alias_name="a-dev",
+                    ),
+                ]
+            ),
+        )
+
+        spec.generate_request_groups_from_pci_requests()
+
+        self.assertEqual(2, len(spec.requested_resources))
+        self.assertEqual(
+            request_spec.RequestGroup(
+                requester_id=f"{uuids.req1}-0",
+                resources={"CUSTOM_PCI_DE12_1234": 1},
+                use_same_provider=True,
+            ).obj_to_primitive(),
+            spec.requested_resources[0].obj_to_primitive(),
+        )
+        self.assertEqual(
+            request_spec.RequestGroup(
+                requester_id=f"{uuids.req1}-1",
+                resources={"CUSTOM_PCI_DE12_1234": 1},
+                use_same_provider=True,
+            ).obj_to_primitive(),
+            spec.requested_resources[1].obj_to_primitive(),
+        )
+
+    def test_with_rc_and_traits_from_the_pci_req_spec(self):
+        spec = request_spec.RequestSpec(
+            requested_resources=[],
+            pci_requests=objects.InstancePCIRequests(
+                requests=[
+                    objects.InstancePCIRequest(
+                        count=1,
+                        request_id=uuids.req1,
+                        spec=[
+                            {
+                                "vendor_id": "de12",
+                                "product_id": "1234",
+                                "resource_class": "gpu",
+                            }
+                        ],
+                        alias_name="a-dev",
+                    ),
+                    objects.InstancePCIRequest(
+                        count=1,
+                        request_id=uuids.req2,
+                        spec=[
+                            {
+                                "vendor_id": "fff",
+                                "product_id": "dead",
+                                "traits": "foo,bar,CUSTOM_BLUE",
+                            }
+                        ],
+                        alias_name="a-dev",
+                    ),
+                ]
+            ),
+        )
+
+        spec.generate_request_groups_from_pci_requests()
+
+        self.assertEqual(2, len(spec.requested_resources))
+        self.assertEqual(
+            request_spec.RequestGroup(
+                requester_id=f"{uuids.req1}-0",
+                resources={"CUSTOM_GPU": 1},
+                use_same_provider=True,
+            ).obj_to_primitive(),
+            spec.requested_resources[0].obj_to_primitive(),
+        )
+        # Note that sets would be serialized to tuples by obj_to_primitive in
+        # random order, so we need to match this spec field by field
+        expected = request_spec.RequestGroup(
+            requester_id=f"{uuids.req2}-0",
+            resources={"CUSTOM_PCI_FFF_DEAD": 1},
+            required_traits={"CUSTOM_FOO", "CUSTOM_BAR", "CUSTOM_BLUE"},
+            use_same_provider=True,
+        )
+        actual = spec.requested_resources[1]
+        for field in request_spec.RequestGroup.fields.keys():
+            self.assertEqual(getattr(expected, field), getattr(actual, field))
 
 
 class TestRequestGroupObject(test.NoDBTestCase):

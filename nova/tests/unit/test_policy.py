@@ -16,8 +16,8 @@
 """Test of Policy Engine For Nova."""
 
 import os.path
+from unittest import mock
 
-import mock
 from oslo_policy import policy as oslo_policy
 from oslo_serialization import jsonutils
 import requests_mock
@@ -303,10 +303,10 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
     def setUp(self):
         super(RealRolePolicyTestCase, self).setUp()
         self.policy = self.useFixture(nova_fixtures.RealPolicyFixture())
-        self.non_admin_context = context.RequestContext('fake', 'fake',
-                                                        roles=['member'])
-        self.admin_context = context.RequestContext('fake', 'fake', True,
-                                                     roles=['member'])
+        self.non_admin_context = context.RequestContext(
+            'fake', 'fake', roles=['member', 'reader'])
+        self.admin_context = context.RequestContext(
+            'fake', 'fake', True, roles=['admin', 'member', 'reader'])
         self.target = {}
         self.fake_policy = jsonutils.loads(fake_policy.policy_data)
 
@@ -350,6 +350,7 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:os-instance-actions:events",
 "os_compute_api:os-lock-server:unlock:unlock_override",
 "os_compute_api:os-migrate-server:migrate",
+"os_compute_api:os-migrate-server:migrate:host",
 "os_compute_api:os-migrate-server:migrate_live",
 "os_compute_api:os-quota-sets:update",
 "os_compute_api:os-quota-sets:delete",
@@ -358,6 +359,7 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:os-services:update",
 "os_compute_api:os-services:delete",
 "os_compute_api:os-shelve:shelve_offload",
+"os_compute_api:os-shelve:unshelve_to_host",
 "os_compute_api:os-availability-zone:detail",
 "os_compute_api:os-assisted-volume-snapshots:create",
 "os_compute_api:os-assisted-volume-snapshots:delete",
@@ -366,6 +368,27 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:os-server-external-events:create",
 "os_compute_api:os-volumes-attachments:swap",
 "os_compute_api:servers:create:zero_disk_flavor",
+"os_compute_api:os-baremetal-nodes:list",
+"os_compute_api:os-baremetal-nodes:show",
+"os_compute_api:servers:migrations:index",
+"os_compute_api:servers:migrations:show",
+"os_compute_api:os-simple-tenant-usage:list",
+"os_compute_api:os-migrations:index",
+"os_compute_api:os-services:list",
+"os_compute_api:os-instance-actions:events:details",
+"os_compute_api:os-instance-usage-audit-log:list",
+"os_compute_api:os-instance-usage-audit-log:show",
+"os_compute_api:os-hosts:list",
+"os_compute_api:os-hosts:show",
+"os_compute_api:os-hypervisors:list",
+"os_compute_api:os-hypervisors:list-detail",
+"os_compute_api:os-hypervisors:show",
+"os_compute_api:os-hypervisors:statistics",
+"os_compute_api:os-hypervisors:uptime",
+"os_compute_api:os-hypervisors:search",
+"os_compute_api:os-hypervisors:servers",
+"os_compute_api:limits:other_project",
+"os_compute_api:os-flavor-access",
 )
 
         self.admin_or_owner_rules = (
@@ -409,6 +432,7 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:servers:resize",
 "os_compute_api:servers:revert_resize",
 "os_compute_api:servers:show",
+"os_compute_api:servers:show:flavor-extra-specs",
 "os_compute_api:servers:update",
 "os_compute_api:servers:create_image:allow_volume_backed",
 "os_compute_api:os-admin-password",
@@ -418,7 +442,6 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:os-remote-consoles",
 "os_compute_api:os-deferred-delete:restore",
 "os_compute_api:os-deferred-delete:force",
-"os_compute_api:os-flavor-access",
 "os_compute_api:os-flavor-extra-specs:index",
 "os_compute_api:os-flavor-extra-specs:show",
 "os_compute_api:os-floating-ips:add",
@@ -454,44 +477,6 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:os-volumes-attachments:create",
 "os_compute_api:os-volumes-attachments:delete",
 "os_compute_api:os-volumes-attachments:update",
-)
-
-        self.allow_all_rules = (
-"os_compute_api:os-quota-sets:defaults",
-"os_compute_api:os-availability-zone:list",
-"os_compute_api:limits",
-"os_compute_api:extensions",
-"os_compute_api:os-floating-ip-pools",
-)
-
-        self.system_reader_rules = (
-"os_compute_api:os-tenant-networks:list",
-"os_compute_api:os-tenant-networks:show",
-"os_compute_api:os-baremetal-nodes:list",
-"os_compute_api:os-baremetal-nodes:show",
-"os_compute_api:servers:migrations:index",
-"os_compute_api:servers:migrations:show",
-"os_compute_api:os-simple-tenant-usage:list",
-"os_compute_api:os-migrations:index",
-"os_compute_api:os-services:list",
-"os_compute_api:os-instance-actions:events:details",
-"os_compute_api:os-instance-usage-audit-log:list",
-"os_compute_api:os-instance-usage-audit-log:show",
-"os_compute_api:os-hosts:list",
-"os_compute_api:os-hosts:show",
-"os_compute_api:os-hypervisors:list",
-"os_compute_api:os-hypervisors:list-detail",
-"os_compute_api:os-hypervisors:show",
-"os_compute_api:os-hypervisors:statistics",
-"os_compute_api:os-hypervisors:uptime",
-"os_compute_api:os-hypervisors:search",
-"os_compute_api:os-hypervisors:servers",
-"os_compute_api:limits:other_project",
-"os_compute_api:os-networks:list",
-"os_compute_api:os-networks:show",
-)
-
-        self.system_reader_or_owner_rules = (
 "os_compute_api:os-simple-tenant-usage:show",
 "os_compute_api:os-security-groups:get",
 "os_compute_api:os-security-groups:show",
@@ -513,6 +498,18 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
 "os_compute_api:os-volumes:snapshots:show",
 "os_compute_api:os-volumes:snapshots:list",
 "os_compute_api:os-volumes:snapshots:detail",
+"os_compute_api:os-networks:list",
+"os_compute_api:os-networks:show",
+"os_compute_api:os-tenant-networks:list",
+"os_compute_api:os-tenant-networks:show",
+)
+
+        self.allow_all_rules = (
+"os_compute_api:os-quota-sets:defaults",
+"os_compute_api:os-availability-zone:list",
+"os_compute_api:limits",
+"os_compute_api:extensions",
+"os_compute_api:os-floating-ip-pools",
 )
 
         self.allow_nobody_rules = (
@@ -557,13 +554,11 @@ class RealRolePolicyTestCase(test.NoDBTestCase):
         # admin_only, non_admin, admin_or_user, empty_rule
         special_rules = ('admin_api', 'admin_or_owner', 'context_is_admin',
                          'os_compute_api:os-quota-class-sets:show',
-                         'system_admin_api', 'system_reader_api',
                          'project_admin_api', 'project_member_api',
-                         'project_reader_api', 'system_admin_or_owner',
-                         'system_or_project_reader')
+                         'project_reader_api', 'project_member_or_admin',
+                         'project_reader_or_admin')
         result = set(rules.keys()) - set(self.admin_only_rules +
             self.admin_or_owner_rules +
-            self.allow_all_rules + self.system_reader_rules +
-            self.system_reader_or_owner_rules +
+            self.allow_all_rules +
             self.allow_nobody_rules + special_rules)
         self.assertEqual(set([]), result)

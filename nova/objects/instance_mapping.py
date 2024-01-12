@@ -60,6 +60,7 @@ class InstanceMapping(base.NovaTimestampObject, base.NovaObject):
             if 'queued_for_delete' in primitive:
                 del primitive['queued_for_delete']
 
+    @base.lazy_load_counter
     def obj_load_attr(self, attrname):
         if attrname == 'user_id':
             LOG.error('The unset user_id attribute of an unmigrated instance '
@@ -99,7 +100,7 @@ class InstanceMapping(base.NovaTimestampObject, base.NovaObject):
     @api_db_api.context_manager.reader
     def _get_by_instance_uuid_from_db(context, instance_uuid):
         db_mapping = context.session.query(api_models.InstanceMapping)\
-            .options(orm.joinedload('cell_mapping'))\
+            .options(orm.joinedload(api_models.InstanceMapping.cell_mapping))\
             .filter(api_models.InstanceMapping.instance_uuid == instance_uuid)\
             .first()
         if not db_mapping:
@@ -312,7 +313,7 @@ class InstanceMappingList(base.ObjectListBase, base.NovaObject):
     @api_db_api.context_manager.reader
     def _get_by_project_id_from_db(context, project_id):
         return context.session.query(api_models.InstanceMapping)\
-            .options(orm.joinedload('cell_mapping'))\
+            .options(orm.joinedload(api_models.InstanceMapping.cell_mapping))\
             .filter(api_models.InstanceMapping.project_id == project_id).all()
 
     @base.remotable_classmethod
@@ -326,7 +327,7 @@ class InstanceMappingList(base.ObjectListBase, base.NovaObject):
     @api_db_api.context_manager.reader
     def _get_by_cell_id_from_db(context, cell_id):
         return context.session.query(api_models.InstanceMapping)\
-            .options(orm.joinedload('cell_mapping'))\
+            .options(orm.joinedload(api_models.InstanceMapping.cell_mapping))\
             .filter(api_models.InstanceMapping.cell_id == cell_id).all()
 
     @base.remotable_classmethod
@@ -339,7 +340,7 @@ class InstanceMappingList(base.ObjectListBase, base.NovaObject):
     @api_db_api.context_manager.reader
     def _get_by_instance_uuids_from_db(context, uuids):
         return context.session.query(api_models.InstanceMapping)\
-            .options(orm.joinedload('cell_mapping'))\
+            .options(orm.joinedload(api_models.InstanceMapping.cell_mapping))\
             .filter(api_models.InstanceMapping.instance_uuid.in_(uuids))\
             .all()
 
@@ -373,12 +374,16 @@ class InstanceMappingList(base.ObjectListBase, base.NovaObject):
         # queued_for_delete was not run) and False (cases when the online
         # data migration for queued_for_delete was run) are assumed to mean
         # that the instance is not queued for deletion.
-        query = (query.filter(sql.or_(
-            api_models.InstanceMapping.queued_for_delete == sql.false(),
-            api_models.InstanceMapping.queued_for_delete.is_(None)))
-            .join('cell_mapping')
-            .options(orm.joinedload('cell_mapping'))
-            .filter(api_models.CellMapping.uuid == cell_uuid))
+        query = query.filter(
+            sql.or_(
+                api_models.InstanceMapping.queued_for_delete == sql.false(),
+                api_models.InstanceMapping.queued_for_delete.is_(None)
+            )
+        ).join(
+            api_models.InstanceMapping.cell_mapping
+        ).options(
+            orm.joinedload(api_models.InstanceMapping.cell_mapping)
+        ).filter(api_models.CellMapping.uuid == cell_uuid)
         if limit is not None:
             query = query.limit(limit)
         return query.all()

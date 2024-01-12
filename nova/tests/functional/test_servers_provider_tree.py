@@ -14,8 +14,8 @@
 #    under the License.
 
 
-import mock
 import os_traits
+from unittest import mock
 
 from oslo_log import log as logging
 from oslo_utils.fixture import uuidsentinel as uuids
@@ -45,6 +45,8 @@ class ProviderTreeTests(integrated_helpers.ProviderUsageBaseTestCase):
             os_traits.COMPUTE_VOLUME_EXTEND,
             os_traits.COMPUTE_VOLUME_MULTI_ATTACH,
             os_traits.COMPUTE_TRUSTED_CERTS,
+            os_traits.COMPUTE_ADDRESS_SPACE_EMULATED,
+            os_traits.COMPUTE_ADDRESS_SPACE_PASSTHROUGH,
         ]
     ])
 
@@ -56,7 +58,7 @@ class ProviderTreeTests(integrated_helpers.ProviderUsageBaseTestCase):
         # Start compute without mocking update_provider_tree. The fake driver
         # doesn't implement the method, so this will cause us to start with the
         # legacy get_available_resource()-based inventory discovery and
-        # boostrapping of placement data.
+        # bootstrapping of placement data.
         self.compute = self._start_compute(host='host1')
 
         # Mock out update_provider_tree *after* starting compute with the
@@ -82,7 +84,7 @@ class ProviderTreeTests(integrated_helpers.ProviderUsageBaseTestCase):
             },
             'MEMORY_MB': {
                 'total': 8192,
-                'allocation_ratio': 1.5,
+                'allocation_ratio': 1.0,
                 'max_unit': 8192,
                 'min_unit': 1,
                 'reserved': 512,
@@ -90,7 +92,7 @@ class ProviderTreeTests(integrated_helpers.ProviderUsageBaseTestCase):
             },
             'VCPU': {
                 'total': 10,
-                'allocation_ratio': 16.0,
+                'allocation_ratio': 4.0,
                 'max_unit': 10,
                 'min_unit': 1,
                 'reserved': 0,

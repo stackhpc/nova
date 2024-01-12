@@ -14,13 +14,14 @@
 #    under the License.
 
 import copy
+from unittest import mock
 
-import mock
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel
 
 from nova.compute import vm_states
 from nova import context
+from nova import exception
 from nova import objects
 from nova.objects import fields
 from nova.pci import manager
@@ -42,6 +43,8 @@ fake_pci_1 = dict(fake_pci, address='0000:00:00.2',
                   product_id='p1', vendor_id='v1')
 fake_pci_2 = dict(fake_pci, address='0000:00:00.3')
 
+fake_pci_devs = [fake_pci, fake_pci_1, fake_pci_2]
+
 fake_pci_3 = dict(fake_pci, address='0000:00:01.1',
                   dev_type=fields.PciDeviceType.SRIOV_PF,
                   vendor_id='v2', product_id='p2', numa_node=None)
@@ -53,6 +56,7 @@ fake_pci_5 = dict(fake_pci, address='0000:00:02.2',
                   dev_type=fields.PciDeviceType.SRIOV_VF,
                   parent_addr='0000:00:01.1',
                   vendor_id='v2', product_id='p2', numa_node=None)
+fake_pci_devs_tree = [fake_pci_3, fake_pci_4, fake_pci_5]
 
 fake_db_dev = {
     'created_at': None,
@@ -142,14 +146,14 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
                 requests=pci_reqs)
 
     def _create_tracker(self, fake_devs):
-        self.fake_devs = fake_devs
+        self.fake_devs = copy.deepcopy(fake_devs)
         self.tracker = manager.PciDevTracker(
             self.fake_context, objects.ComputeNode(id=1, numa_topology=None))
 
     def setUp(self):
         super(PciDevTrackerTestCase, self).setUp()
         self.fake_context = context.get_admin_context()
-        self.fake_devs = fake_db_devs[:]
+        self.fake_devs = copy.deepcopy(fake_db_devs)
         self.stub_out('nova.db.main.api.pci_device_get_all_by_node',
             self._fake_get_pci_devices)
         # The fake_pci_whitelist must be called before creating the fake
@@ -157,7 +161,7 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         patcher = pci_fakes.fake_pci_whitelist()
         self.addCleanup(patcher.stop)
         self._create_fake_instance()
-        self._create_tracker(fake_db_devs[:])
+        self._create_tracker(fake_db_devs)
 
     def test_pcidev_tracker_create(self):
         self.assertEqual(len(self.tracker.pci_devs), 3)
@@ -231,7 +235,7 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
             self, mock_debug):
         self.flags(
             group='pci',
-            passthrough_whitelist=[
+            device_spec=[
                 '{"product_id":"2032", "vendor_id":"8086"}'])
         # There are systems where 32 bit PCI domain is used. See bug 1897528
         # for example. While nova (and qemu) does not support assigning such
@@ -266,9 +270,8 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
 
     def test_set_hvdev_new_dev(self):
         fake_pci_3 = dict(fake_pci, address='0000:00:00.4', vendor_id='v2')
-        fake_pci_devs = [copy.deepcopy(fake_pci), copy.deepcopy(fake_pci_1),
-                         copy.deepcopy(fake_pci_2), copy.deepcopy(fake_pci_3)]
-        self.tracker._set_hvdevs(fake_pci_devs)
+        fake_pci_devs = [fake_pci, fake_pci_1, fake_pci_2, fake_pci_3]
+        self.tracker._set_hvdevs(copy.deepcopy(fake_pci_devs))
         self.assertEqual(len(self.tracker.pci_devs), 4)
         self.assertEqual(set([dev.address for
                               dev in self.tracker.pci_devs]),
@@ -284,11 +287,8 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         self._create_tracker(fake_db_devs_tree)
 
         fake_new_device = dict(fake_pci_5, id=12, address='0000:00:02.3')
-        fake_pci_devs = [copy.deepcopy(fake_pci_3),
-                         copy.deepcopy(fake_pci_4),
-                         copy.deepcopy(fake_pci_5),
-                         copy.deepcopy(fake_new_device)]
-        self.tracker._set_hvdevs(fake_pci_devs)
+        fake_pci_devs = [fake_pci_3, fake_pci_4, fake_pci_5, fake_new_device]
+        self.tracker._set_hvdevs(copy.deepcopy(fake_pci_devs))
         self.assertEqual(len(self.tracker.pci_devs), 4)
 
         pf = [dev for dev in self.tracker.pci_devs
@@ -304,15 +304,14 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
 
     def test_set_hvdev_changed(self):
         fake_pci_v2 = dict(fake_pci, address='0000:00:00.2', vendor_id='v1')
-        fake_pci_devs = [copy.deepcopy(fake_pci), copy.deepcopy(fake_pci_2),
-                         copy.deepcopy(fake_pci_v2)]
-        self.tracker._set_hvdevs(fake_pci_devs)
+        fake_pci_devs = [fake_pci, fake_pci_2, fake_pci_v2]
+        self.tracker._set_hvdevs(copy.deepcopy(fake_pci_devs))
         self.assertEqual(set([dev.vendor_id for
                              dev in self.tracker.pci_devs]),
                          set(['v', 'v1']))
 
     def test_set_hvdev_remove(self):
-        self.tracker._set_hvdevs([fake_pci])
+        self.tracker._set_hvdevs(copy.deepcopy([fake_pci]))
         self.assertEqual(
             len([dev for dev in self.tracker.pci_devs
                  if dev.status == fields.PciDeviceStatus.REMOVED]),
@@ -324,8 +323,8 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         # from previous scans)
         self._create_tracker(fake_db_devs_tree)
 
-        fake_pci_devs = [copy.deepcopy(fake_pci_3), copy.deepcopy(fake_pci_4)]
-        self.tracker._set_hvdevs(fake_pci_devs)
+        fake_pci_devs = [fake_pci_3, fake_pci_4]
+        self.tracker._set_hvdevs(copy.deepcopy(fake_pci_devs))
         self.assertEqual(
             2,
             len([dev for dev in self.tracker.pci_devs
@@ -344,8 +343,9 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         # Make sure the device tree is properly maintained when there are
         # devices removed from the system that are allocated to vms.
 
-        all_devs = fake_db_devs_tree[:]
-        self._create_tracker(all_devs)
+        all_db_devs = fake_db_devs_tree
+        all_pci_devs = fake_pci_devs_tree
+        self._create_tracker(all_db_devs)
         # we start with 3 devices
         self.assertEqual(
             3,
@@ -358,7 +358,7 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         claimed_dev = self.tracker.claim_instance(
             mock.sentinel.context, pci_requests_obj, None)[0]
 
-        self.tracker._set_hvdevs(all_devs)
+        self.tracker._set_hvdevs(copy.deepcopy(all_pci_devs))
         # and assert that no devices were removed
         self.assertEqual(
             0,
@@ -366,10 +366,10 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
                  if dev.status == fields.PciDeviceStatus.REMOVED]))
         # we then try to remove the allocated device from the set reported
         # by the driver.
-        fake_pci_devs = [dev for dev in all_devs
+        fake_pci_devs = [dev for dev in all_pci_devs
                          if dev['address'] != claimed_dev.address]
         with mock.patch("nova.pci.manager.LOG.warning") as log:
-            self.tracker._set_hvdevs(fake_pci_devs)
+            self.tracker._set_hvdevs(copy.deepcopy(fake_pci_devs))
             log.assert_called_once()
             args = log.call_args_list[0][0]  # args of first call
             self.assertIn('Unable to remove device with', args[0])
@@ -380,7 +380,7 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
                  if dev.status == fields.PciDeviceStatus.REMOVED]))
         # free the device that was allocated and update tracker again
         self.tracker._free_device(claimed_dev)
-        self.tracker._set_hvdevs(fake_pci_devs)
+        self.tracker._set_hvdevs(copy.deepcopy(fake_pci_devs))
         # and assert that one device is removed from the tracker
         self.assertEqual(
             1,
@@ -393,11 +393,248 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         self.tracker.claim_instance(mock.sentinel.context,
                                     pci_requests_obj, None)
         fake_pci_3 = dict(fake_pci, address='0000:00:00.2', vendor_id='v2')
-        fake_pci_devs = [copy.deepcopy(fake_pci), copy.deepcopy(fake_pci_2),
-                         copy.deepcopy(fake_pci_3)]
-        self.tracker._set_hvdevs(fake_pci_devs)
+        fake_pci_devs = [fake_pci, fake_pci_2, fake_pci_3]
+        self.tracker._set_hvdevs(copy.deepcopy(fake_pci_devs))
         self.assertEqual(len(self.tracker.stale), 1)
         self.assertEqual(self.tracker.stale['0000:00:00.2']['vendor_id'], 'v2')
+
+    def _get_device_by_address(self, address):
+        devs = [dev for dev in self.tracker.pci_devs if dev.address == address]
+        if len(devs) == 1:
+            return devs[0]
+        if devs:
+            raise ValueError('ambiguous address', devs)
+        else:
+            raise ValueError('device not found', address)
+
+    def test_set_hvdevs_unavailable_vf_removed(self):
+        # We start with a PF parent and two VF children
+        self._create_tracker([fake_db_dev_3, fake_db_dev_4, fake_db_dev_5])
+        pci_requests_obj = self._create_pci_requests_object(
+            [
+                {
+                    'count': 1,
+                    'spec': [{'dev_type': fields.PciDeviceType.SRIOV_PF}]
+                }
+            ],
+            instance_uuid=uuidsentinel.instance1,
+        )
+        # then claim and allocate the PF that makes the VFs unavailable
+        self.tracker.claim_instance(
+            mock.sentinel.context, pci_requests_obj, None)
+        self.tracker.allocate_instance({'uuid': uuidsentinel.instance1})
+
+        dev3_pf = self._get_device_by_address(fake_db_dev_3['address'])
+        self.assertEqual('allocated', dev3_pf.status)
+        self.assertEqual(uuidsentinel.instance1, dev3_pf.instance_uuid)
+        dev4_vf = self._get_device_by_address(fake_db_dev_4['address'])
+        self.assertEqual('unavailable', dev4_vf.status)
+        dev5_vf = self._get_device_by_address(fake_db_dev_5['address'])
+        self.assertEqual('unavailable', dev5_vf.status)
+
+        # now simulate that one VF (dev_5) is removed from the hypervisor and
+        # the compute is restarted. As the VF is not claimed or allocated we
+        # are free to remove it from the tracker.
+        self.tracker._set_hvdevs(copy.deepcopy([fake_pci_3, fake_pci_4]))
+
+        dev3_pf = self._get_device_by_address(fake_db_dev_3['address'])
+        self.assertEqual('allocated', dev3_pf.status)
+        self.assertEqual(uuidsentinel.instance1, dev3_pf.instance_uuid)
+        dev4_vf = self._get_device_by_address(fake_db_dev_4['address'])
+        self.assertEqual('unavailable', dev4_vf.status)
+        dev5_vf = self._get_device_by_address(fake_db_dev_5['address'])
+        self.assertEqual('removed', dev5_vf.status)
+
+    def test_set_hvdevs_unavailable_pf_removed(self):
+        # We start with one PF parent and one child VF
+        self._create_tracker([fake_db_dev_3, fake_db_dev_4])
+        pci_requests_obj = self._create_pci_requests_object(
+            [
+                {
+                    'count': 1,
+                    'spec': [{'dev_type': fields.PciDeviceType.SRIOV_VF}]
+                }
+            ],
+            instance_uuid=uuidsentinel.instance1,
+        )
+        # Then we claim and allocate the VF that makes the PF unavailable
+        self.tracker.claim_instance(
+            mock.sentinel.context, pci_requests_obj, None)
+        self.tracker.allocate_instance({'uuid': uuidsentinel.instance1})
+
+        dev3_pf = self._get_device_by_address(fake_db_dev_3['address'])
+        self.assertEqual('unavailable', dev3_pf.status)
+        dev4_vf = self._get_device_by_address(fake_db_dev_4['address'])
+        self.assertEqual('allocated', dev4_vf.status)
+        self.assertEqual(uuidsentinel.instance1, dev4_vf.instance_uuid)
+
+        # now simulate that the parent PF is removed from the hypervisor and
+        # the compute is restarted. As the PF is not claimed or allocated we
+        # are free to remove it from the tracker.
+        self.tracker._set_hvdevs(copy.deepcopy([fake_pci_4]))
+
+        dev3_pf = self._get_device_by_address(fake_db_dev_3['address'])
+        self.assertEqual('removed', dev3_pf.status)
+        dev4_vf = self._get_device_by_address(fake_db_dev_4['address'])
+        self.assertEqual('allocated', dev4_vf.status)
+        self.assertEqual(uuidsentinel.instance1, dev4_vf.instance_uuid)
+
+    def test_claim_available_pf_while_child_vf_is_unavailable(self):
+        # NOTE(gibi): this is bug 1969496. The state created here is
+        # inconsistent and should not happen. But it did happen in some cases
+        # where we were not able to track down the way how it happened.
+
+        # We start with a PF parent and a VF child. The PF is available and
+        # the VF is unavailable.
+        pf = copy.deepcopy(fake_db_dev_3)
+        vf = copy.deepcopy(fake_db_dev_4)
+        vf['status'] = fields.PciDeviceStatus.UNAVAILABLE
+        self._create_tracker([pf, vf])
+
+        pf_dev = self._get_device_by_address(pf['address'])
+        self.assertEqual('available', pf_dev.status)
+        vf_dev = self._get_device_by_address(vf['address'])
+        self.assertEqual('unavailable', vf_dev.status)
+
+        pci_requests_obj = self._create_pci_requests_object(
+            [
+                {
+                    'count': 1,
+                    'spec': [{'dev_type': fields.PciDeviceType.SRIOV_PF}]
+                }
+            ],
+            instance_uuid=uuidsentinel.instance1,
+        )
+        # now try to claim and allocate the PF. It should work as it is
+        # available
+        self.tracker.claim_instance(
+            mock.sentinel.context, pci_requests_obj, None)
+        self.tracker.allocate_instance({'uuid': uuidsentinel.instance1})
+
+        pf_dev = self._get_device_by_address(pf['address'])
+        self.assertEqual('allocated', pf_dev.status)
+        vf_dev = self._get_device_by_address(vf['address'])
+        self.assertEqual('unavailable', vf_dev.status)
+
+        self.assertIn(
+            'Some child device of parent 0000:00:01.1 is in an inconsistent '
+            'state. If you can reproduce this warning then please report a '
+            'bug at https://bugs.launchpad.net/nova/+filebug with '
+            'reproduction steps. Inconsistent children with state: '
+            '0000:00:02.1 - unavailable',
+            self.stdlog.logger.output
+        )
+
+        # Ensure that the claim actually fixes the inconsistency so when the
+        # parent if freed the children become available too.
+        self.tracker.free_instance(
+            mock.sentinel.context, {'uuid': uuidsentinel.instance1})
+
+        pf_dev = self._get_device_by_address(pf['address'])
+        self.assertEqual('available', pf_dev.status)
+        vf_dev = self._get_device_by_address(vf['address'])
+        self.assertEqual('available', vf_dev.status)
+
+    def test_claim_available_pf_while_children_vfs_are_in_mixed_state(self):
+        # We start with a PF parent and two VF children. The PF is available
+        # and one of the VF is unavailable while the other is available.
+        pf = copy.deepcopy(fake_db_dev_3)
+        vf1 = copy.deepcopy(fake_db_dev_4)
+        vf1['status'] = fields.PciDeviceStatus.UNAVAILABLE
+        vf2 = copy.deepcopy(fake_db_dev_5)
+        vf2['status'] = fields.PciDeviceStatus.AVAILABLE
+        self._create_tracker([pf, vf1, vf2])
+
+        pf_dev = self._get_device_by_address(pf['address'])
+        self.assertEqual('available', pf_dev.status)
+        vf1_dev = self._get_device_by_address(vf1['address'])
+        self.assertEqual('unavailable', vf1_dev.status)
+        vf2_dev = self._get_device_by_address(vf2['address'])
+        self.assertEqual('available', vf2_dev.status)
+
+        pci_requests_obj = self._create_pci_requests_object(
+            [
+                {
+                    'count': 1,
+                    'spec': [{'dev_type': fields.PciDeviceType.SRIOV_PF}]
+                }
+            ],
+            instance_uuid=uuidsentinel.instance1,
+        )
+        # now try to claim and allocate the PF. It should work as it is
+        # available
+        self.tracker.claim_instance(
+            mock.sentinel.context, pci_requests_obj, None)
+        self.tracker.allocate_instance({'uuid': uuidsentinel.instance1})
+
+        pf_dev = self._get_device_by_address(pf['address'])
+        self.assertEqual('allocated', pf_dev.status)
+        vf1_dev = self._get_device_by_address(vf1['address'])
+        self.assertEqual('unavailable', vf1_dev.status)
+        vf2_dev = self._get_device_by_address(vf2['address'])
+        self.assertEqual('unavailable', vf2_dev.status)
+
+        self.assertIn(
+            'Some child device of parent 0000:00:01.1 is in an inconsistent '
+            'state. If you can reproduce this warning then please report a '
+            'bug at https://bugs.launchpad.net/nova/+filebug with '
+            'reproduction steps. Inconsistent children with state: '
+            '0000:00:02.1 - unavailable',
+            self.stdlog.logger.output
+        )
+
+        # Ensure that the claim actually fixes the inconsistency so when the
+        # parent if freed the children become available too.
+        self.tracker.free_instance(
+            mock.sentinel.context, {'uuid': uuidsentinel.instance1})
+
+        pf_dev = self._get_device_by_address(pf['address'])
+        self.assertEqual('available', pf_dev.status)
+        vf1_dev = self._get_device_by_address(vf1['address'])
+        self.assertEqual('available', vf1_dev.status)
+        vf2_dev = self._get_device_by_address(vf2['address'])
+        self.assertEqual('available', vf2_dev.status)
+
+    def test_claim_available_pf_while_a_child_is_used(self):
+        pf = copy.deepcopy(fake_db_dev_3)
+        vf1 = copy.deepcopy(fake_db_dev_4)
+        vf1['status'] = fields.PciDeviceStatus.UNAVAILABLE
+        vf2 = copy.deepcopy(fake_db_dev_5)
+        vf2['status'] = fields.PciDeviceStatus.CLAIMED
+        self._create_tracker([pf, vf1, vf2])
+
+        pf_dev = self._get_device_by_address(pf['address'])
+        self.assertEqual('available', pf_dev.status)
+        vf1_dev = self._get_device_by_address(vf1['address'])
+        self.assertEqual('unavailable', vf1_dev.status)
+        vf2_dev = self._get_device_by_address(vf2['address'])
+        self.assertEqual('claimed', vf2_dev.status)
+
+        pci_requests_obj = self._create_pci_requests_object(
+            [
+                {
+                    'count': 1,
+                    'spec': [{'dev_type': fields.PciDeviceType.SRIOV_PF}]
+                }
+            ],
+            instance_uuid=uuidsentinel.instance1,
+        )
+        # now try to claim and allocate the PF. The claim should fail as on of
+        # the child is used.
+        self.assertRaises(
+            exception.PciDeviceVFInvalidStatus,
+            self.tracker.claim_instance,
+            mock.sentinel.context,
+            pci_requests_obj,
+            None,
+        )
+
+        pf_dev = self._get_device_by_address(pf['address'])
+        self.assertEqual('available', pf_dev.status)
+        vf1_dev = self._get_device_by_address(vf1['address'])
+        self.assertEqual('unavailable', vf1_dev.status)
+        vf2_dev = self._get_device_by_address(vf2['address'])
+        self.assertEqual('claimed', vf2_dev.status)
 
     def test_update_pci_for_instance_active(self):
         pci_requests_obj = self._create_pci_requests_object(fake_pci_requests)
@@ -414,8 +651,13 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         pci_requests = copy.deepcopy(fake_pci_requests)
         pci_requests[0]['count'] = 4
         pci_requests_obj = self._create_pci_requests_object(pci_requests)
-        self.tracker.claim_instance(mock.sentinel.context,
-                                    pci_requests_obj, None)
+        self.assertRaises(
+            exception.PciDeviceRequestFailed,
+            self.tracker.claim_instance,
+            mock.sentinel.context,
+            pci_requests_obj,
+            None
+        )
         self.assertEqual(len(self.tracker.claims[self.inst['uuid']]), 0)
         devs = self.tracker.update_pci_for_instance(None,
                                                     self.inst,
@@ -424,13 +666,13 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         self.assertIsNone(devs)
 
     def test_pci_claim_instance_with_numa(self):
-        fake_db_dev_3 = dict(fake_db_dev_1, id=4, address='0000:00:00.4')
-        fake_devs_numa = copy.deepcopy(fake_db_devs)
-        fake_devs_numa.append(fake_db_dev_3)
+        fake_pci_3 = dict(fake_pci_1, address='0000:00:00.4')
+        fake_devs_numa = copy.deepcopy(fake_pci_devs)
+        fake_devs_numa.append(fake_pci_3)
         self.tracker = manager.PciDevTracker(
             mock.sentinel.context,
             objects.ComputeNode(id=1, numa_topology=None))
-        self.tracker._set_hvdevs(fake_devs_numa)
+        self.tracker._set_hvdevs(copy.deepcopy(fake_devs_numa))
         pci_requests = copy.deepcopy(fake_pci_requests)[:1]
         pci_requests[0]['count'] = 2
         pci_requests_obj = self._create_pci_requests_object(pci_requests)
@@ -450,11 +692,13 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         self.inst.numa_topology = objects.InstanceNUMATopology(
                     cells=[objects.InstanceNUMACell(
                         id=1, cpuset=set([1, 2]), memory=512)])
-        claims = self.tracker.claim_instance(
+        self.assertRaises(
+            exception.PciDeviceRequestFailed,
+            self.tracker.claim_instance,
             mock.sentinel.context,
             pci_requests_obj,
-            self.inst.numa_topology)
-        self.assertEqual([], claims)
+            self.inst.numa_topology
+        )
 
     def test_update_pci_for_instance_deleted(self):
         pci_requests_obj = self._create_pci_requests_object(fake_pci_requests)
@@ -477,9 +721,8 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
                 'nova.db.main.api.pci_device_update',
                 self._fake_pci_device_update)
         fake_pci_v3 = dict(fake_pci, address='0000:00:00.2', vendor_id='v3')
-        fake_pci_devs = [copy.deepcopy(fake_pci), copy.deepcopy(fake_pci_2),
-                         copy.deepcopy(fake_pci_v3)]
-        self.tracker._set_hvdevs(fake_pci_devs)
+        fake_pci_devs = [fake_pci, fake_pci_2, fake_pci_v3]
+        self.tracker._set_hvdevs(copy.deepcopy(fake_pci_devs))
         self.update_called = 0
         self.tracker.save(self.fake_context)
         self.assertEqual(self.update_called, 3)
@@ -503,7 +746,10 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
     def test_clean_usage(self):
         inst_2 = copy.copy(self.inst)
         inst_2.uuid = uuidsentinel.instance2
-        migr = {'instance_uuid': 'uuid2', 'vm_state': vm_states.BUILDING}
+        migr = objects.Migration(
+            instance_uuid='uuid2',
+            vm_state=vm_states.BUILDING,
+        )
 
         pci_requests_obj = self._create_pci_requests_object(
             [{'count': 1, 'spec': [{'vendor_id': 'v'}]}])
@@ -564,7 +810,7 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         free_pci_device_ids = (
             [dev.id for dev in self.tracker.pci_stats.get_free_devs()])
         self.assertEqual(2, len(free_pci_device_ids))
-        allocated_devs = manager.get_instance_pci_devs(self.inst)
+        allocated_devs = self.inst.get_pci_devices()
         pci_device = allocated_devs[0]
         self.assertNotIn(pci_device.id, free_pci_device_ids)
         instance_uuid = self.inst['uuid']
@@ -627,24 +873,3 @@ class PciDevTrackerTestCase(test.NoDBTestCase):
         self.assertIsNone(self.tracker.allocations.get(instance_uuid))
         free_devs = self.tracker.pci_stats.get_free_devs()
         self.assertEqual(len(fake_db_devs), len(free_devs))
-
-
-class PciGetInstanceDevs(test.NoDBTestCase):
-
-    def test_get_devs_object(self):
-        def _fake_obj_load_attr(foo, attrname):
-            if attrname == 'pci_devices':
-                self.load_attr_called = True
-                foo.pci_devices = objects.PciDeviceList()
-
-        self.stub_out(
-                'nova.objects.Instance.obj_load_attr',
-                _fake_obj_load_attr)
-
-        self.load_attr_called = False
-        manager.get_instance_pci_devs(objects.Instance())
-        self.assertTrue(self.load_attr_called)
-
-    def test_get_devs_no_pci_devices(self):
-        inst = objects.Instance(pci_devices=None)
-        self.assertEqual([], manager.get_instance_pci_devs(inst))

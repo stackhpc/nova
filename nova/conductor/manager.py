@@ -20,9 +20,12 @@ import copy
 import eventlet
 import functools
 import sys
+import typing as ty
 
+from keystoneauth1 import exceptions as ks_exc
 from oslo_config import cfg
 from oslo_db import exception as db_exc
+from oslo_limit import exception as limit_exceptions
 from oslo_log import log as logging
 import oslo_messaging as messaging
 from oslo_serialization import jsonutils
@@ -45,6 +48,8 @@ from nova import context as nova_context
 from nova import exception
 from nova.i18n import _
 from nova.image import glance
+from nova.limit import placement as placement_limits
+from nova.limit import utils as limit_utils
 from nova import manager
 from nova.network import neutron
 from nova import notifications
@@ -232,7 +237,7 @@ class ComputeTaskManager:
     may involve coordinating activities on multiple compute nodes.
     """
 
-    target = messaging.Target(namespace='compute_task', version='1.23')
+    target = messaging.Target(namespace='compute_task', version='1.25')
 
     def __init__(self):
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
@@ -241,10 +246,41 @@ class ComputeTaskManager:
         self.network_api = neutron.API()
         self.servicegroup_api = servicegroup.API()
         self.query_client = query.SchedulerQueryClient()
-        self.report_client = report.SchedulerReportClient()
         self.notifier = rpc.get_notifier('compute')
         # Help us to record host in EventReporter
         self.host = CONF.host
+
+        try:
+            # Test our placement client during initialization
+            self.report_client
+        except (ks_exc.EndpointNotFound,
+                ks_exc.DiscoveryFailure,
+                ks_exc.RequestTimeout,
+                ks_exc.GatewayTimeout,
+                ks_exc.ConnectFailure) as e:
+            # Non-fatal, likely transient (although not definitely);
+            # continue startup but log the warning so that when things
+            # fail later, it will be clear why we can not do certain
+            # things.
+            LOG.warning('Unable to initialize placement client (%s); '
+                        'Continuing with startup, but some operations '
+                        'will not be possible.', e)
+        except (ks_exc.MissingAuthPlugin,
+                ks_exc.Unauthorized) as e:
+            # This is almost definitely fatal mis-configuration. The
+            # Unauthorized error might be transient, but it is
+            # probably reasonable to consider it fatal.
+            LOG.error('Fatal error initializing placement client; '
+                      'config is incorrect or incomplete: %s', e)
+            raise
+        except Exception as e:
+            # Unknown/unexpected errors here are fatal
+            LOG.error('Fatal error initializing placement client: %s', e)
+            raise
+
+    @property
+    def report_client(self):
+        return report.report_client_singleton()
 
     def reset(self):
         LOG.info('Reloading compute RPC API')
@@ -936,6 +972,33 @@ class ComputeTaskManager:
                 objects.Destination(
                     cell=instance_mapping.cell_mapping))
 
+    def _recheck_quota(
+        self,
+        context: nova_context.RequestContext,
+        flavor: 'objects.Flavor',
+        request_spec: 'objects.RequestSpec',
+        orig_num_req: int,
+        project_id: ty.Optional[str] = None,
+        user_id: ty.Optional[str] = None
+    ) -> None:
+        # A quota "recheck" is a quota check that is performed *after* quota
+        # limited resources are consumed. It is meant to address race
+        # conditions where a request that was not over quota at the beginning
+        # of the request before resources are allocated becomes over quota
+        # after resources (like database rows or placement allocations) are
+        # created. An example of this would be a large number of requests for
+        # the same resource for the same project sent simultaneously.
+        if CONF.quota.recheck_quota:
+            # The orig_num_req is the number of instances requested, which is
+            # the delta that was quota checked before resources were allocated.
+            # This is only used for the exception message is the recheck fails
+            # for lack of enough quota.
+            compute_utils.check_num_instances_quota(
+                context, flavor, 0, 0, project_id=project_id,
+                user_id=user_id, orig_num_req=orig_num_req)
+            placement_limits.enforce_num_instances_and_flavor(
+                context, project_id, flavor, request_spec.is_bfv, 0, 0)
+
     # TODO(mriedem): Make request_spec required in ComputeTaskAPI RPC v2.0.
     @targets_cell
     def unshelve_instance(self, context, instance, request_spec=None):
@@ -1003,6 +1066,12 @@ class ComputeTaskManager:
                     request_spec.requested_resources = res_req
                     request_spec.request_level_params = req_lvl_params
 
+                    # NOTE(gibi): as PCI devices is tracked in placement we
+                    # need to generate request groups from InstancePCIRequests.
+                    # This will append new RequestGroup objects to the
+                    # request_spec.requested_resources list if needed
+                    request_spec.generate_request_groups_from_pci_requests()
+
                     # NOTE(cfriesen): Ensure that we restrict the scheduler to
                     # the cell specified by the instance mapping.
                     self._restrict_request_spec_to_cell(
@@ -1015,11 +1084,41 @@ class ComputeTaskManager:
                     host_lists = self._schedule_instances(context,
                             request_spec, [instance.uuid],
                             return_alternates=False)
+
+                    # NOTE(melwitt): We recheck the quota after allocating the
+                    # resources in placement, to prevent users from allocating
+                    # more resources than their allowed quota in the event of a
+                    # race. This is configurable because it can be expensive if
+                    # strict quota limits are not required in a deployment.
+                    try:
+                        # Quota should only be checked for unshelve only if
+                        # resources are being counted in placement. Legacy
+                        # quotas continue to consume resources while
+                        # SHELVED_OFFLOADED and will not allocate any new
+                        # resources during unshelve.
+                        if (CONF.quota.count_usage_from_placement or
+                                limit_utils.use_unified_limits()):
+                            self._recheck_quota(
+                                context, instance.flavor, request_spec, 0,
+                                project_id=instance.project_id,
+                                user_id=instance.user_id)
+                    except (exception.TooManyInstances,
+                            limit_exceptions.ProjectOverLimit):
+                        with excutils.save_and_reraise_exception():
+                            self.report_client.delete_allocation_for_instance(
+                                context, instance.uuid, force=True)
+
                     host_list = host_lists[0]
                     selection = host_list[0]
                     scheduler_utils.populate_filter_properties(
                             filter_properties, selection)
                     (host, node) = (selection.service_host, selection.nodename)
+                    LOG.debug(
+                        "Scheduler selected host: %s, node:%s",
+                        host,
+                        node,
+                        instance=instance
+                    )
                     instance.availability_zone = (
                         availability_zones.get_host_availability_zone(
                             context, host))
@@ -1106,7 +1205,8 @@ class ComputeTaskManager:
                          injected_files, new_pass, orig_sys_metadata,
                          bdms, recreate, on_shared_storage,
                          preserve_ephemeral=False, host=None,
-                         request_spec=None):
+                         request_spec=None, reimage_boot_volume=False,
+                         target_state=None):
         # recreate=True means the instance is being evacuated from a failed
         # host to a new destination host. The 'recreate' variable name is
         # confusing, so rename it to evacuate here at the top, which is simpler
@@ -1201,6 +1301,12 @@ class ComputeTaskManager:
                     # add them to the RequestSpec.
                     request_spec.requested_resources = res_req
                     request_spec.request_level_params = req_lvl_params
+
+                    # NOTE(gibi): as PCI devices is tracked in placement we
+                    # need to generate request groups from InstancePCIRequests.
+                    # This will append new RequestGroup objects to the
+                    # request_spec.requested_resources list if needed
+                    request_spec.generate_request_groups_from_pci_requests()
 
                 try:
                     # if this is a rebuild of instance on the same host with
@@ -1303,7 +1409,9 @@ class ComputeTaskManager:
                 node=node,
                 limits=limits,
                 request_spec=request_spec,
-                accel_uuids=accel_uuids)
+                accel_uuids=accel_uuids,
+                reimage_boot_volume=reimage_boot_volume,
+                target_state=target_state)
 
     def _validate_image_traits_for_rebuild(self, context, instance, image_ref):
         """Validates that the traits specified in the image can be satisfied
@@ -1622,23 +1730,22 @@ class ComputeTaskManager:
                     instances.append(instance)
                     cell_mapping_cache[instance.uuid] = cell
 
-        # NOTE(melwitt): We recheck the quota after creating the
-        # objects to prevent users from allocating more resources
+        # NOTE(melwitt): We recheck the quota after allocating the
+        # resources to prevent users from allocating more resources
         # than their allowed quota in the event of a race. This is
         # configurable because it can be expensive if strict quota
         # limits are not required in a deployment.
-        if CONF.quota.recheck_quota:
-            try:
-                compute_utils.check_num_instances_quota(
-                    context, instance.flavor, 0, 0,
-                    orig_num_req=len(build_requests))
-            except exception.TooManyInstances as exc:
-                with excutils.save_and_reraise_exception():
-                    self._cleanup_build_artifacts(context, exc, instances,
-                                                  build_requests,
-                                                  request_specs,
-                                                  block_device_mapping, tags,
-                                                  cell_mapping_cache)
+        try:
+            self._recheck_quota(context, instance.flavor, request_specs[0],
+                len(build_requests), project_id=instance.project_id,
+                user_id=instance.user_id
+            )
+        except (exception.TooManyInstances,
+                limit_exceptions.ProjectOverLimit) as exc:
+            with excutils.save_and_reraise_exception():
+                self._cleanup_build_artifacts(
+                    context, exc, instances, build_requests, request_specs,
+                    block_device_mapping, tags, cell_mapping_cache)
 
         zipped = zip(build_requests, request_specs, host_lists, instances)
         for (build_request, request_spec, host_list, instance) in zipped:
@@ -2037,8 +2144,8 @@ class ComputeTaskManager:
                         skipped_host(target_ctxt, host, image_ids)
                         continue
 
-                    fetch_pool.spawn_n(wrap_cache_images, target_ctxt, host,
-                                       image_ids)
+                    utils.pass_context(fetch_pool.spawn_n, wrap_cache_images,
+                                       target_ctxt, host, image_ids)
 
         # Wait until all those things finish
         fetch_pool.waitall()

@@ -15,9 +15,9 @@
 
 import copy
 import datetime
+from unittest import mock
 
 import iso8601
-import mock
 from oslo_policy import policy as oslo_policy
 from oslo_utils.fixture import uuidsentinel as uuids
 from webob import exc
@@ -49,7 +49,7 @@ def format_action(action, expect_traceback=True, expect_host=False,
                  'deleted')
     for key in to_delete:
         if key in action:
-            del(action[key])
+            del action[key]
     if 'start_time' in action:
         # NOTE(danms): Without WSGI above us, these will be just stringified
         action['start_time'] = str(action['start_time'].replace(tzinfo=None))
@@ -73,7 +73,7 @@ def format_event(event, project_id, expect_traceback=True, expect_host=False,
         to_delete.append('hostId')
     for key in to_delete:
         if key in event:
-            del(event[key])
+            del event[key]
     if 'start_time' in event:
         # NOTE(danms): Without WSGI above us, these will be just stringified
         event['start_time'] = str(event['start_time'].replace(tzinfo=None))

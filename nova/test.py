@@ -35,9 +35,9 @@ import os
 import os.path
 import pprint
 import sys
+from unittest import mock
 
 import fixtures
-import mock
 from oslo_cache import core as cache
 from oslo_concurrency import lockutils
 from oslo_config import cfg
@@ -61,6 +61,8 @@ from nova import exception
 from nova import objects
 from nova.objects import base as objects_base
 from nova import quota
+from nova.scheduler.client import report
+from nova.scheduler import utils as scheduler_utils
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.unit import matchers
 from nova import utils
@@ -170,6 +172,12 @@ class TestCase(base.BaseTestCase):
     # base class when USES_DB is True.
     NUMBER_OF_CELLS = 1
 
+    # The stable compute id stuff is intentionally singleton-ish, which makes
+    # it a nightmare for testing multiple host/node combinations in tests like
+    # we do. So, mock it out by default, unless the test is specifically
+    # designed to handle it.
+    STUB_COMPUTE_ID = True
+
     def setUp(self):
         """Run before each test method to initialize test environment."""
         # Ensure BaseTestCase's ConfigureLogging fixture is disabled since
@@ -177,10 +185,14 @@ class TestCase(base.BaseTestCase):
         with fixtures.EnvironmentVariable('OS_LOG_CAPTURE', '0'):
             super(TestCase, self).setUp()
 
+        self.useFixture(
+            nova_fixtures.PropagateTestCaseIdToChildEventlets(self.id()))
+
         # How many of which service we've started. {$service-name: $count}
         self._service_fixture_count = collections.defaultdict(int)
 
         self.useFixture(nova_fixtures.OpenStackSDKFixture())
+        self.useFixture(nova_fixtures.IsolatedGreenPoolFixture(self.id()))
 
         self.useFixture(log_fixture.get_logging_handle_error_fixture())
 
@@ -282,10 +294,36 @@ class TestCase(base.BaseTestCase):
         quota.UID_QFD_POPULATED_CACHE_ALL = False
 
         self.useFixture(nova_fixtures.GenericPoisonFixture())
+        self.useFixture(nova_fixtures.SysFsPoisonFixture())
+
+        # Additional module names can be added to this set if needed
+        self.useFixture(nova_fixtures.ImportModulePoisonFixture(
+            set(['guestfs', 'libvirt'])))
 
         # make sure that the wsgi app is fully initialized for all testcase
         # instead of only once initialized for test worker
         wsgi_app.init_global_data.reset()
+
+        # Reset the placement client singleton
+        report.PLACEMENTCLIENT = None
+
+        # Reset our local node uuid cache (and avoid writing to the
+        # local filesystem when we generate a new one).
+        if self.STUB_COMPUTE_ID:
+            self.useFixture(nova_fixtures.ComputeNodeIdFixture())
+
+        # Reset globals indicating affinity filter support. Some tests may set
+        # self.flags(enabled_filters=...) which could make the affinity filter
+        # support globals get set to a non-default configuration which affects
+        # all other tests.
+        scheduler_utils.reset_globals()
+
+        # Wait for bare greenlets spawn_n()'ed from a GreenThreadPoolExecutor
+        # to finish before moving on from the test. When greenlets from a
+        # previous test remain running, they may attempt to access structures
+        # (like the database) that have already been torn down and can cause
+        # the currently running test to fail.
+        self.useFixture(nova_fixtures.GreenThreadPoolShutdownWait())
 
     def _setup_cells(self):
         """Setup a normal cellsv2 environment.
@@ -352,7 +390,7 @@ class TestCase(base.BaseTestCase):
         self.useFixture(fixtures.MonkeyPatch(old, new))
 
     @staticmethod
-    def patch_exists(patched_path, result):
+    def patch_exists(patched_path, result, other=None):
         """Provide a static method version of patch_exists(), which if you
         haven't already imported nova.test can be slightly easier to
         use as a context manager within a test method via:
@@ -361,7 +399,7 @@ class TestCase(base.BaseTestCase):
                 with self.patch_exists(path, True):
                     ...
         """
-        return patch_exists(patched_path, result)
+        return patch_exists(patched_path, result, other)
 
     @staticmethod
     def patch_open(patched_path, read_data):
@@ -385,7 +423,7 @@ class TestCase(base.BaseTestCase):
             engine = db_api.get_engine()
         dialect = engine.url.get_dialect()
         if dialect == sqlite.dialect:
-            engine.connect().execute("PRAGMA foreign_keys = ON")
+            engine.connect().exec_driver_sql("PRAGMA foreign_keys = ON")
 
     def start_service(self, name, host=None, cell_name=None, **kwargs):
         # Disallow starting multiple scheduler services
@@ -675,6 +713,7 @@ class SubclassSignatureTestCase(testtools.TestCase, metaclass=abc.ABCMeta):
         raise NotImplementedError()
 
     def setUp(self):
+        self.useFixture(nova_fixtures.ConfFixture(CONF))
         self.base = self._get_base_class()
 
         super(SubclassSignatureTestCase, self).setUp()
@@ -696,7 +735,7 @@ class SubclassSignatureTestCase(testtools.TestCase, metaclass=abc.ABCMeta):
                 # This is a wrapped function. The signature we're going to
                 # see here is that of the wrapper, which is almost certainly
                 # going to involve varargs and kwargs, and therefore is
-                # unlikely to be what we want. If the wrapper manupulates the
+                # unlikely to be what we want. If the wrapper manipulates the
                 # arguments taken by the wrapped function, the wrapped function
                 # isn't what we want either. In that case we're just stumped:
                 # if it ever comes up, add more knobs here to work round it (or
@@ -776,14 +815,15 @@ class MatchType(object):
             "world",
             MatchType(objects.KeyPair))
     """
+
     def __init__(self, wanttype):
         self.wanttype = wanttype
 
     def __eq__(self, other):
-        return type(other) == self.wanttype
+        return type(other) is self.wanttype
 
     def __ne__(self, other):
-        return type(other) != self.wanttype
+        return type(other) is not self.wanttype
 
     def __repr__(self):
         return "<MatchType:" + str(self.wanttype) + ">"
@@ -791,6 +831,7 @@ class MatchType(object):
 
 class MatchObjPrims(object):
     """Matches objects with equal primitives."""
+
     def __init__(self, want_obj):
         self.want_obj = want_obj
 
@@ -820,6 +861,7 @@ class ContainKeyValue(object):
             "world",
             ContainKeyValue('hello', world))
     """
+
     def __init__(self, wantkey, wantvalue):
         self.wantkey = wantkey
         self.wantvalue = wantvalue
@@ -842,10 +884,12 @@ class ContainKeyValue(object):
 
 
 @contextlib.contextmanager
-def patch_exists(patched_path, result):
+def patch_exists(patched_path, result, other=None):
     """Selectively patch os.path.exists() so that if it's called with
     patched_path, return result.  Calls with any other path are passed
-    through to the real os.path.exists() function.
+    through to the real os.path.exists() function if other is not provided.
+    If other is provided then that will be the result of the call on paths
+    other than patched_path.
 
     Either import and use as a decorator / context manager, or use the
     nova.TestCase.patch_exists() static method as a context manager.
@@ -879,7 +923,10 @@ def patch_exists(patched_path, result):
     def fake_exists(path):
         if path == patched_path:
             return result
-        return real_exists(path)
+        elif other is not None:
+            return other
+        else:
+            return real_exists(path)
 
     with mock.patch.object(os.path, "exists") as mock_exists:
         mock_exists.side_effect = fake_exists

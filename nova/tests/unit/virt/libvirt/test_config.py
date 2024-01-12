@@ -16,11 +16,20 @@ from lxml import etree
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import units
 
+from nova import exception
 from nova.objects import fields as obj_fields
 from nova import test
 from nova.tests.fixtures import libvirt_data as fake_libvirt_data
 from nova.virt import hardware
 from nova.virt.libvirt import config
+
+
+class LibvirtConfigUtiltest(test.NoDBTestCase):
+    def test_make_parse_alias(self):
+        self.assertEqual('ua-foo', config.make_libvirt_device_alias('foo'))
+        self.assertEqual('foo', config.parse_libvirt_device_alias('ua-foo'))
+        # if the alias is not a user-specified one, it should come back whole
+        self.assertEqual('foo', config.parse_libvirt_device_alias('foo'))
 
 
 class LibvirtConfigBaseTest(test.NoDBTestCase):
@@ -69,6 +78,23 @@ class LibvirtConfigTest(LibvirtConfigBaseTest):
         inxml = "<demo><foo/></demo>"
         obj = config.LibvirtConfigObject(root_name="demo")
         obj.parse_str(inxml)
+
+    def test_parse_on_off_str(self):
+        obj = config.LibvirtConfigObject(root_name="demo")
+        self.assertTrue(obj.parse_on_off_str('on'))
+        self.assertFalse(obj.parse_on_off_str('off'))
+        self.assertFalse(obj.parse_on_off_str(None))
+        self.assertRaises(exception.InvalidInput, obj.parse_on_off_str, 'foo')
+
+    def test_get_yes_no_str(self):
+        obj = config.LibvirtConfigObject(root_name="demo")
+        self.assertEqual('yes', obj.get_yes_no_str(True))
+        self.assertEqual('no', obj.get_yes_no_str(False))
+
+    def test_get_on_off_str(self):
+        obj = config.LibvirtConfigObject(root_name="demo")
+        self.assertEqual('on', obj.get_on_off_str(True))
+        self.assertEqual('off', obj.get_on_off_str(False))
 
 
 class LibvirtConfigCapsTest(LibvirtConfigBaseTest):
@@ -979,11 +1005,13 @@ class LibvirtConfigGuestDiskTest(LibvirtConfigBaseTest):
         obj.driver_name = "qemu"
         obj.target_dev = "/dev/hdc"
         obj.target_bus = "ide"
+        obj.alias = "ua-this-is-my-disk"
 
         xml = obj.to_xml()
         self.assertXmlEqual(xml, """
             <disk type="block" device="cdrom">
               <driver name="qemu"/>
+              <alias name="ua-this-is-my-disk"/>
               <source dev="/tmp/hello"/>
               <target bus="ide" dev="/dev/hdc"/>
             </disk>""")
@@ -1519,7 +1547,7 @@ class LibvirtConfigGuestInputTest(LibvirtConfigBaseTest):
 
 class LibvirtConfigGuestGraphicsTest(LibvirtConfigBaseTest):
 
-    def test_config_graphics(self):
+    def test_config_graphics_vnc(self):
         obj = config.LibvirtConfigGuestGraphics()
         obj.type = "vnc"
         obj.autoport = True
@@ -1531,11 +1559,38 @@ class LibvirtConfigGuestGraphicsTest(LibvirtConfigBaseTest):
   <graphics type="vnc" autoport="yes" keymap="en_US" listen="127.0.0.1"/>
                             """)
 
+    def test_config_graphics_spice(self):
+        obj = config.LibvirtConfigGuestGraphics()
+        obj.type = "spice"
+        obj.autoport = False
+        obj.keymap = "en_US"
+        obj.listen = "127.0.0.1"
+
+        obj.image_compression = "auto_glz"
+        obj.jpeg_compression = "auto"
+        obj.zlib_compression = "always"
+        obj.playback_compression = True
+        obj.streaming_mode = "filter"
+
+        xml = obj.to_xml()
+        self.assertXmlEqual(xml, """
+  <graphics type="spice" autoport="no" keymap="en_US" listen="127.0.0.1">
+    <image compression="auto_glz"/>
+    <jpeg compression="auto"/>
+    <zlib compression="always"/>
+    <playback compression="on"/>
+    <streaming mode="filter"/>
+  </graphics>
+                            """)
+
 
 class LibvirtConfigGuestHostdev(LibvirtConfigBaseTest):
 
     def test_config_pci_guest_host_dev(self):
-        obj = config.LibvirtConfigGuestHostdev(mode='subsystem', type='pci')
+        obj = config.LibvirtConfigGuestHostdev()
+        obj.mode = 'subsystem'
+        obj.type = 'pci'
+
         xml = obj.to_xml()
         expected = """
             <hostdev mode="subsystem" type="pci" managed="yes"/>
@@ -1570,7 +1625,7 @@ class LibvirtConfigGuestHostdevPCI(LibvirtConfigBaseTest):
             </hostdev>
             """
 
-    def test_config_guest_hosdev_pci(self):
+    def test_config_guest_hostdev_pci(self):
         hostdev = config.LibvirtConfigGuestHostdevPCI()
         hostdev.domain = "1234"
         hostdev.bus = "11"
@@ -1579,7 +1634,7 @@ class LibvirtConfigGuestHostdevPCI(LibvirtConfigBaseTest):
         xml = hostdev.to_xml()
         self.assertXmlEqual(self.expected, xml)
 
-    def test_parse_guest_hosdev_pci(self):
+    def test_parse_guest_hostdev_pci(self):
         xmldoc = self.expected
         obj = config.LibvirtConfigGuestHostdevPCI()
         obj.parse_str(xmldoc)
@@ -1591,7 +1646,7 @@ class LibvirtConfigGuestHostdevPCI(LibvirtConfigBaseTest):
         self.assertEqual(obj.slot, '0x22')
         self.assertEqual(obj.function, '0x3')
 
-    def test_parse_guest_hosdev_usb(self):
+    def test_parse_guest_hostdev_usb(self):
         xmldoc = """<hostdev mode='subsystem' type='usb'>
                       <source startupPolicy='optional'>
                           <vendor id='0x1234'/>
@@ -1877,6 +1932,26 @@ class LibvirtConfigGuestInterfaceTest(LibvirtConfigBaseTest):
         obj.target_dev = "vnet0"
         self.assertTrue(obj.uses_virtio)
         return obj
+
+    def test_config_driver_packed_options(self):
+        obj = self._get_virtio_interface()
+        obj.driver_name = "vhost"
+        obj.driver_packed = True
+
+        xml = obj.to_xml()
+        self.assertXmlEqual(xml, """
+            <interface type="ethernet">
+              <mac address="DE:AD:BE:EF:CA:FE"/>
+              <model type="virtio"/>
+              <driver name="vhost" packed="on"/>
+              <target dev="vnet0"/>
+            </interface>""")
+
+        # parse the xml from the first object into a new object and make sure
+        # they are the same
+        obj2 = config.LibvirtConfigGuestInterface()
+        obj2.parse_str(xml)
+        self.assertXmlEqual(xml, obj2.to_xml())
 
     def test_config_driver_options(self):
         obj = self._get_virtio_interface()
@@ -2318,6 +2393,15 @@ class LibvirtConfigGuestFeatureTest(LibvirtConfigBaseTest):
         obj.vapic = True
         obj.spinlocks = True
         obj.vendorid_spoof = True
+        obj.vpindex = True
+        obj.runtime = True
+        obj.synic = True
+        obj.reset = True
+        obj.frequencies = True
+        obj.reenlightenment = True
+        obj.tlbflush = True
+        obj.ipi = True
+        obj.evmcs = True
 
         xml = obj.to_xml()
         self.assertXmlEqual(xml, """
@@ -2326,6 +2410,15 @@ class LibvirtConfigGuestFeatureTest(LibvirtConfigBaseTest):
             <vapic state="on"/>
             <spinlocks state="on" retries="4095"/>
             <vendor_id state="on" value="1234567890ab"/>
+            <vpindex state='on'/>
+            <runtime state='on'/>
+            <synic state='on'/>
+            <reset state='on'/>
+            <frequencies state='on'/>
+            <reenlightenment state='on'/>
+            <tlbflush state='on'/>
+            <ipi state='on'/>
+            <evmcs state='on'/>
           </hyperv>""")
 
     def test_feature_pmu(self):
@@ -2343,6 +2436,21 @@ class LibvirtConfigGuestFeatureTest(LibvirtConfigBaseTest):
             obj = config.LibvirtConfigGuestFeaturePMU(val)
             xml = obj.to_xml()
             self.assertXmlEqual(xml, "<pmu state='off'/>")
+
+    def test_feature_ioapic(self):
+        obj = config.LibvirtConfigGuestFeatureIOAPIC()
+        obj.driver = "libvirt"
+
+        xml = obj.to_xml()
+        self.assertXmlEqual(xml, "<ioapic driver='libvirt'/>")
+
+    def test_feature_tcg(self):
+        obj = config.LibvirtConfigGuestFeatureTCG(10)
+        obj.driver = "libvirt"
+
+        xml = obj.to_xml()
+        self.assertXmlEqual(xml, '<tcg><tb-cache unit="MiB">10'
+                '</tb-cache></tcg>')
 
 
 class LibvirtConfigGuestTest(LibvirtConfigBaseTest):
@@ -3135,6 +3243,32 @@ class LibvirtConfigNodeDeviceTest(LibvirtConfigBaseTest):
                               config.LibvirtConfigNodeDeviceMdevInformation)
         self.assertEqual("nvidia-11", obj.mdev_information.type)
         self.assertEqual(12, obj.mdev_information.iommu_group)
+        self.assertIsNone(obj.mdev_information.uuid)
+
+    def test_config_mdev_device_uuid(self):
+        xmlin = """
+        <device>
+          <name>mdev_b2107403_110c_45b0_af87_32cc91597b8a_0000_41_00_0</name>
+          <path>/sys/devices/pci0000:40/0000:40:03.1/0000:41:00.0/b2107403-110c-45b0-af87-32cc91597b8a</path>
+          <parent>pci_0000_41_00_0</parent>
+          <driver>
+            <name>vfio_mdev</name>
+          </driver>
+          <capability type='mdev'>
+            <type id='nvidia-442'/>
+            <uuid>b2107403-110c-45b0-af87-32cc91597b8a</uuid>
+            <iommuGroup number='57'/>
+          </capability>
+        </device>"""
+
+        obj = config.LibvirtConfigNodeDevice()
+        obj.parse_str(xmlin)
+        self.assertIsInstance(obj.mdev_information,
+                              config.LibvirtConfigNodeDeviceMdevInformation)
+        self.assertEqual("nvidia-442", obj.mdev_information.type)
+        self.assertEqual(57, obj.mdev_information.iommu_group)
+        self.assertEqual("b2107403-110c-45b0-af87-32cc91597b8a",
+                         obj.mdev_information.uuid)
 
     def test_config_vdpa_device(self):
         xmlin = """
@@ -3272,6 +3406,86 @@ class LibvirtConfigNodeDevicePciCapTest(LibvirtConfigBaseTest):
             'deviceAPI': 'vfio-pci',
             'name': 'GRID M60-0B',
             'type': 'nvidia-11'}], obj.mdev_capability[0].mdev_types)
+
+    def test_config_device_pci_vpd(self):
+        xmlin = """
+    <capability type='pci'>
+      <class>0x020000</class>
+      <domain>0</domain>
+      <bus>130</bus>
+      <slot>0</slot>
+      <function>1</function>
+      <product id='0xa2d6'>MT42822 BlueField-2</product>
+      <vendor id='0x15b3'>Mellanox Technologies</vendor>
+      <capability type='virt_functions' maxCount='16'/>
+      <capability type='vpd'>
+        <name>BlueField-2 DPU 25GbE</name>
+        <fields access='readonly'>
+          <change_level>B1</change_level>
+          <manufacture_id>foobar</manufacture_id>
+          <part_number>MBF2H332A-AEEOT</part_number>
+          <serial_number>MT2113X00000</serial_number>
+          <vendor_field index='0'>PCIeGen4 x8</vendor_field>
+          <vendor_field index='2'>MBF2H332A-AEEOT</vendor_field>
+          <vendor_field index='3'>3c53d07eec484d8aab34dabd24fe575aa</vendor_field>
+          <vendor_field index='A'>MLX:MN=MLNX:CSKU=V2:UUID=V3:PCI=V0:MODL=BF2H332A</vendor_field>
+        </fields>
+        <fields access='readwrite'>
+          <asset_tag>fooasset</asset_tag>
+          <vendor_field index='0'>vendorfield0</vendor_field>
+          <vendor_field index='2'>vendorfield2</vendor_field>
+          <vendor_field index='A'>vendorfieldA</vendor_field>
+          <system_field index='B'>systemfieldB</system_field>
+          <system_field index='0'>systemfield0</system_field>
+        </fields>
+      </capability>
+      <iommuGroup number='66'>
+        <address domain='0x0000' bus='0x82' slot='0x00' function='0x1'/>
+      </iommuGroup>
+      <numa node='1'/>
+      <pci-express>
+        <link validity='cap' port='0' speed='16' width='8'/>
+        <link validity='sta' speed='8' width='8'/>
+      </pci-express>
+    </capability>"""  # noqa: E501
+        obj = config.LibvirtConfigNodeDevicePciCap()
+        obj.parse_str(xmlin)
+
+        # Asserting common PCI attribute parsing.
+        self.assertEqual(0, obj.domain)
+        self.assertEqual(130, obj.bus)
+        self.assertEqual(0, obj.slot)
+        self.assertEqual(1, obj.function)
+        # Asserting vpd capability parsing.
+        self.assertEqual("MT42822 BlueField-2", obj.product)
+        self.assertEqual(0xA2D6, obj.product_id)
+        self.assertEqual("Mellanox Technologies", obj.vendor)
+        self.assertEqual(0x15B3, obj.vendor_id)
+        self.assertEqual(obj.numa_node, 1)
+        self.assertIsInstance(obj.vpd_capability,
+                              config.LibvirtConfigNodeDeviceVpdCap)
+        self.assertEqual(obj.vpd_capability.card_name, 'BlueField-2 DPU 25GbE')
+
+        self.assertEqual(obj.vpd_capability.change_level, 'B1')
+        self.assertEqual(obj.vpd_capability.manufacture_id, 'foobar')
+        self.assertEqual(obj.vpd_capability.part_number, 'MBF2H332A-AEEOT')
+        self.assertEqual(obj.vpd_capability.card_serial_number, 'MT2113X00000')
+        self.assertEqual(obj.vpd_capability.asset_tag, 'fooasset')
+        self.assertEqual(obj.vpd_capability.ro_vendor_fields, {
+            '0': 'PCIeGen4 x8',
+            '2': 'MBF2H332A-AEEOT',
+            '3': '3c53d07eec484d8aab34dabd24fe575aa',
+            'A': 'MLX:MN=MLNX:CSKU=V2:UUID=V3:PCI=V0:MODL=BF2H332A',
+        })
+        self.assertEqual(obj.vpd_capability.rw_vendor_fields, {
+            '0': 'vendorfield0',
+            '2': 'vendorfield2',
+            'A': 'vendorfieldA',
+        })
+        self.assertEqual(obj.vpd_capability.rw_system_fields, {
+            '0': 'systemfield0',
+            'B': 'systemfieldB',
+        })
 
 
 class LibvirtConfigNodeDevicePciSubFunctionCap(LibvirtConfigBaseTest):
@@ -3869,8 +4083,10 @@ class LibvirtConfigSecretTest(LibvirtConfigBaseTest):
 
 class LibvirtConfigGuestVPMEMTest(LibvirtConfigBaseTest):
     def test_config_vpmem(self):
-        obj = config.LibvirtConfigGuestVPMEM(
-                devpath='/dev/dax0.0', size_kb=4096 * units.Ki, align_kb=2048)
+        obj = config.LibvirtConfigGuestVPMEM()
+        obj.source_path = '/dev/dax0.0'
+        obj.target_size = 4096 * units.Ki
+        obj.align_size = 2048
 
         xml = obj.to_xml()
         self.assertXmlEqual(xml, """
@@ -3888,6 +4104,28 @@ class LibvirtConfigGuestVPMEMTest(LibvirtConfigBaseTest):
                 </label>
             </target>
           </memory>""")
+
+
+class LibvirtConfigGuestIOMMUTest(LibvirtConfigBaseTest):
+
+    def test_config_iommu(self):
+        obj = config.LibvirtConfigGuestIOMMU()
+        obj.model = "intel"
+        obj.interrupt_remapping = True
+        obj.caching_mode = True
+        obj.aw_bits = 48
+        obj.eim = True
+        obj.iotlb = True
+
+        xml = obj.to_xml()
+        self.assertXmlEqual(
+            xml,
+            """
+<iommu model='intel'>
+  <driver intremap='on' caching_mode='on' aw_bits='48' eim='on' iotlb='on'/>
+</iommu>
+            """,
+        )
 
 
 class LibvirtConfigDomainCapsVideoModelsTests(LibvirtConfigBaseTest):
@@ -4006,7 +4244,8 @@ class LibvirtConfigDomainCapsDevicesTests(LibvirtConfigBaseTest):
         obj.parse_str(xml)
         # we only use the video and disk devices today.
         device_types = [config.LibvirtConfigDomainCapsDiskBuses,
-                        config.LibvirtConfigDomainCapsVideoModels]
+                        config.LibvirtConfigDomainCapsVideoModels,
+                        ]
         # so we assert there are only two device types parsed
         self.assertEqual(2, len(obj.devices))
         # we then assert that the parsed devices are of the correct type

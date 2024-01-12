@@ -17,8 +17,8 @@
 
 import copy
 import datetime
+from unittest import mock
 
-import mock
 from oslo_config import cfg
 from oslo_context import fixture as o_fixture
 from oslo_utils.fixture import uuidsentinel as uuids
@@ -79,6 +79,7 @@ class NotificationsTestCase(test.TestCase):
                                 display_name='test_instance',
                                 hostname='test_instance_hostname',
                                 node='test_instance_node',
+                                compute_id=123,
                                 system_metadata={})
         inst._context = self.context
         if params:
@@ -112,7 +113,7 @@ class NotificationsTestCase(test.TestCase):
         # test config disable of just the task state notifications
         self.flags(notify_on_state_change="vm_state", group='notifications')
 
-        # we should not get a notification on task stgate chagne now
+        # we should not get a notification on task state change now
         old = copy.copy(self.instance)
         self.instance.task_state = task_states.SPAWNING
 
@@ -262,9 +263,6 @@ class NotificationsTestCase(test.TestCase):
             self.assertEqual(actual_ip['device_name'], vif['devname'])
             self.assertEqual(actual_ip['version'], expected_ip['version'])
             self.assertEqual(actual_ip['address'], expected_ip['address'])
-
-        bandwidth = payload['bandwidth']
-        self.assertEqual(0, len(bandwidth))
 
     def test_task_update_with_states(self):
         self.flags(notify_on_state_change="vm_and_task_state",

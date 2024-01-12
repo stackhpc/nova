@@ -52,7 +52,9 @@ bdm_new_fields = set(['source_type', 'destination_type',
                      'guest_format', 'device_type', 'disk_bus', 'boot_index',
                      'device_name', 'delete_on_termination', 'snapshot_id',
                      'volume_id', 'volume_size', 'image_id', 'no_device',
-                     'connection_info', 'tag', 'volume_type'])
+                     'connection_info', 'tag', 'volume_type', 'encrypted',
+                     'encryption_secret_uuid', 'encryption_format',
+                     'encryption_options'])
 
 
 bdm_db_only_fields = set(['id', 'instance_uuid', 'attachment_id', 'uuid'])
@@ -612,7 +614,7 @@ def get_bdm_local_disk_num(block_device_mappings):
 
 def get_bdm_image_metadata(context, image_api, volume_api,
                            block_device_mapping, legacy_bdm=True):
-    """Attempt to retrive image metadata from a given block_device_mapping.
+    """Attempt to retrieve image metadata from a given block_device_mapping.
 
     If we are booting from a volume, we need to get the volume details from
     Cinder and make sure we pass the metadata back accordingly.

@@ -12,8 +12,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
 import fixtures as fx
-import mock
 from oslo_utils.fixture import uuidsentinel as uuids
 
 from nova.api.openstack.compute import server_external_events \
@@ -192,7 +193,7 @@ class ServerExternalEventsTestV21(test.NoDBTestCase):
                           self.api.create, self.req, body=body)
 
     def test_create_unknown_events(self):
-        self.event_1['name'] = 'unkown_event'
+        self.event_1['name'] = 'unknown_event'
         body = {'events': self.event_1}
         self.assertRaises(self.invalid_error,
                           self.api.create, self.req, body=body)

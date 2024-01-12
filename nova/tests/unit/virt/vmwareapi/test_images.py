@@ -17,8 +17,8 @@ Test suite for images.
 
 import os
 import tarfile
+from unittest import mock
 
-import mock
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import units
 from oslo_vmware import rw_handles
@@ -117,13 +117,11 @@ class VMwareImagesTestCase(test.NoDBTestCase):
              mock.patch.object(images.IMAGE_API, 'download'),
              mock.patch.object(images, 'image_transfer'),
              mock.patch.object(images, '_build_shadow_vm_config_spec'),
-             mock.patch.object(session, '_call_method'),
              mock.patch.object(vm_util, 'get_vmdk_info')
         ) as (mock_image_api_get,
               mock_image_api_download,
               mock_image_transfer,
               mock_build_shadow_vm_config_spec,
-              mock_call_method,
               mock_get_vmdk_info):
             image_data = {'id': 'fake-id',
                           'disk_format': 'vmdk',
@@ -172,7 +170,7 @@ class VMwareImagesTestCase(test.NoDBTestCase):
                                                         mock_write_handle)
             mock_get_vmdk_info.assert_called_once_with(
                     session, mock.sentinel.vm_ref, 'fake-vm')
-            mock_call_method.assert_called_once_with(
+            session._call_method.assert_called_once_with(
                     session.vim, "UnregisterVM", mock.sentinel.vm_ref)
 
     @mock.patch('oslo_vmware.rw_handles.ImageReadHandle')
@@ -188,13 +186,11 @@ class VMwareImagesTestCase(test.NoDBTestCase):
              mock.patch.object(images.IMAGE_API, 'download'),
              mock.patch.object(images, 'image_transfer'),
              mock.patch.object(images, '_build_shadow_vm_config_spec'),
-             mock.patch.object(session, '_call_method'),
              mock.patch.object(vm_util, 'get_vmdk_info')
         ) as (mock_image_api_get,
               mock_image_api_download,
               mock_image_transfer,
               mock_build_shadow_vm_config_spec,
-              mock_call_method,
               mock_get_vmdk_info):
             image_data = {'id': 'fake-id',
                           'disk_format': 'vmdk',
@@ -220,7 +216,7 @@ class VMwareImagesTestCase(test.NoDBTestCase):
 
             mock_image_transfer.assert_called_once_with(mock_read_handle,
                                                         mock_write_handle)
-            mock_call_method.assert_called_once_with(
+            session._call_method.assert_called_once_with(
                     session.vim, "UnregisterVM", mock.sentinel.vm_ref)
             mock_get_vmdk_info.assert_called_once_with(
                     session, mock.sentinel.vm_ref, 'fake-vm')
@@ -341,7 +337,7 @@ class VMwareImagesTestCase(test.NoDBTestCase):
     def test_image_defaults(self):
         image = images.VMwareImage(image_id='fake-image-id')
 
-        # N.B. We intentially don't use the defined constants here. Amongst
+        # N.B. We intentionally don't use the defined constants here. Amongst
         # other potential failures, we're interested in changes to their
         # values, which would not otherwise be picked up.
         self.assertEqual('otherGuest', image.os_type)

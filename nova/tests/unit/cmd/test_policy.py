@@ -18,9 +18,9 @@
 """
 
 from io import StringIO
+from unittest import mock
 
 import fixtures
-import mock
 
 from nova.cmd import policy
 import nova.conf
@@ -128,20 +128,21 @@ class TestPolicyCheck(test.NoDBTestCase):
         self.assertEqual(set(expected_rules), set(passing_rules))
 
     def test_filter_rules_non_admin(self):
-        context = nova_context.RequestContext()
-        rule_conditions = [base_policies.PROJECT_READER_OR_SYSTEM_READER]
+        context = nova_context.RequestContext(roles=['reader'])
+        rule_conditions = [base_policies.PROJECT_READER_OR_ADMIN]
         expected_rules = [r.name for r in ia_policies.list_rules() if
                           r.check_str in rule_conditions]
         self._check_filter_rules(context, expected_rules=expected_rules)
 
     def test_filter_rules_admin(self):
-        self._check_filter_rules()
+        context = nova_context.RequestContext(roles=['admin'])
+        self._check_filter_rules(context)
 
     def test_filter_rules_instance_non_admin(self):
         db_context = nova_context.RequestContext(user_id='fake-user',
                                                  project_id='fake-project')
         instance = fake_instance.fake_instance_obj(db_context)
-        context = nova_context.RequestContext()
+        context = nova_context.RequestContext(roles=['reader'])
         expected_rules = [r.name for r in ia_policies.list_rules() if
                           r.check_str == base_policies.RULE_ANY]
         self._check_filter_rules(context, instance, expected_rules)
@@ -150,13 +151,15 @@ class TestPolicyCheck(test.NoDBTestCase):
         db_context = nova_context.RequestContext(user_id='fake-user',
                                                  project_id='fake-project')
         instance = fake_instance.fake_instance_obj(db_context)
-        self._check_filter_rules(target=instance)
+        context = nova_context.RequestContext(roles=['admin'])
+        self._check_filter_rules(context, target=instance)
 
     def test_filter_rules_instance_owner(self):
         db_context = nova_context.RequestContext(user_id='fake-user',
-                                                 project_id='fake-project')
+                                                 project_id='fake-project',
+                                                 roles=['reader'])
         instance = fake_instance.fake_instance_obj(db_context)
-        rule_conditions = [base_policies.PROJECT_READER_OR_SYSTEM_READER]
+        rule_conditions = [base_policies.PROJECT_READER_OR_ADMIN]
         expected_rules = [r.name for r in ia_policies.list_rules() if
                           r.check_str in rule_conditions]
         self._check_filter_rules(db_context, instance, expected_rules)

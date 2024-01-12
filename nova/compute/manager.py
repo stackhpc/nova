@@ -31,6 +31,7 @@ import contextlib
 import copy
 import functools
 import inspect
+import math
 import sys
 import time
 import traceback
@@ -83,6 +84,7 @@ from nova.objects import external_event as external_event_obj
 from nova.objects import fields
 from nova.objects import instance as obj_instance
 from nova.objects import migrate_data as migrate_data_obj
+from nova.objects import service as service_obj
 from nova.pci import request as pci_req_module
 from nova.pci import whitelist
 from nova import safe_utils
@@ -95,6 +97,7 @@ from nova.virt import configdrive
 from nova.virt import driver
 from nova.virt import event as virtevent
 from nova.virt import hardware
+import nova.virt.node
 from nova.virt import storage_users
 from nova.virt import virtapi
 from nova.volume import cinder
@@ -402,6 +405,79 @@ class ComputeVirtAPI(virtapi.VirtAPI):
     def _default_error_callback(self, event_name, instance):
         raise exception.NovaException(_('Instance event failed'))
 
+    class _InstanceEvent:
+        EXPECTED = "expected"
+        WAITING = "waiting"
+        RECEIVED = "received"
+        RECEIVED_EARLY = "received early"
+        TIMED_OUT = "timed out"
+        RECEIVED_NOT_PROCESSED = "received but not processed"
+
+        def __init__(self, name: str, event: eventlet.event.Event) -> None:
+            self.name = name
+            self.event = event
+            self.status = self.EXPECTED
+            self.wait_time = None
+
+        def mark_as_received_early(self) -> None:
+            self.status = self.RECEIVED_EARLY
+
+        def is_received_early(self) -> bool:
+            return self.status == self.RECEIVED_EARLY
+
+        def _update_status_no_wait(self):
+            if self.status == self.EXPECTED and self.event.ready():
+                self.status = self.RECEIVED_NOT_PROCESSED
+
+        def wait(self) -> 'objects.InstanceExternalEvent':
+            self.status = self.WAITING
+            try:
+                with timeutils.StopWatch() as sw:
+                    instance_event = self.event.wait()
+            except eventlet.timeout.Timeout:
+                self.status = self.TIMED_OUT
+                self.wait_time = sw.elapsed()
+
+                raise
+
+            self.status = self.RECEIVED
+            self.wait_time = sw.elapsed()
+            return instance_event
+
+        def __str__(self) -> str:
+            self._update_status_no_wait()
+            if self.status == self.EXPECTED:
+                return f"{self.name}: expected but not received"
+            if self.status == self.RECEIVED:
+                return (
+                    f"{self.name}: received after waiting "
+                    f"{self.wait_time:.2f} seconds")
+            if self.status == self.TIMED_OUT:
+                return (
+                    f"{self.name}: timed out after "
+                    f"{self.wait_time:.2f} seconds")
+            return f"{self.name}: {self.status}"
+
+    @staticmethod
+    def _wait_for_instance_events(
+        instance: 'objects.Instance',
+        events: dict,
+        error_callback: ty.Callable,
+    ) -> None:
+        for event_name, event in events.items():
+            if event.is_received_early():
+                continue
+            else:
+                actual_event = event.wait()
+                if actual_event.status == 'completed':
+                    continue
+            # If we get here, we have an event that was not completed,
+            # nor skipped via exit_wait_early(). Decide whether to
+            # keep waiting by calling the error_callback() hook.
+            decision = error_callback(event_name, instance)
+            if decision is False:
+                break
+
     @contextlib.contextmanager
     def wait_for_instance_event(self, instance, event_names, deadline=300,
                                 error_callback=None):
@@ -454,9 +530,10 @@ class ComputeVirtAPI(virtapi.VirtAPI):
             name, tag = event_name
             event_name = objects.InstanceExternalEvent.make_key(name, tag)
             try:
-                events[event_name] = (
+                event = (
                     self._compute.instance_events.prepare_for_instance_event(
                         instance, name, tag))
+                events[event_name] = self._InstanceEvent(event_name, event)
             except exception.NovaException:
                 error_callback(event_name, instance)
                 # NOTE(danms): Don't wait for any of the events. They
@@ -468,23 +545,39 @@ class ComputeVirtAPI(virtapi.VirtAPI):
         except self._exit_early_exc as e:
             early_events = set([objects.InstanceExternalEvent.make_key(n, t)
                                 for n, t in e.events])
-        else:
-            early_events = set([])
 
-        with eventlet.timeout.Timeout(deadline):
-            for event_name, event in events.items():
-                if event_name in early_events:
-                    continue
-                else:
-                    actual_event = event.wait()
-                    if actual_event.status == 'completed':
-                        continue
-                # If we get here, we have an event that was not completed,
-                # nor skipped via exit_wait_early(). Decide whether to
-                # keep waiting by calling the error_callback() hook.
-                decision = error_callback(event_name, instance)
-                if decision is False:
-                    break
+            # If there are expected events that received early, mark them,
+            # so they won't be waited for later
+            for early_event_name in early_events:
+                if early_event_name in events:
+                    events[early_event_name].mark_as_received_early()
+
+        sw = timeutils.StopWatch()
+        sw.start()
+        try:
+            with eventlet.timeout.Timeout(deadline):
+                self._wait_for_instance_events(
+                    instance, events, error_callback)
+        except eventlet.timeout.Timeout:
+            LOG.warning(
+                'Timeout waiting for %(events)s for instance with '
+                'vm_state %(vm_state)s and task_state %(task_state)s. '
+                'Event states are: %(event_states)s',
+                {
+                    'events': list(events.keys()),
+                    'vm_state': instance.vm_state,
+                    'task_state': instance.task_state,
+                    'event_states':
+                        ', '.join([str(event) for event in events.values()]),
+                },
+                instance=instance)
+
+            raise
+
+        LOG.debug('Instance event wait completed in %i seconds for %s',
+                  sw.elapsed(),
+                  ','.join(x[0] for x in event_names),
+                  instance=instance)
 
     def update_compute_provider_status(self, context, rp_uuid, enabled):
         """Used to add/remove the COMPUTE_STATUS_DISABLED trait on the provider
@@ -525,13 +618,18 @@ class ComputeVirtAPI(virtapi.VirtAPI):
 class ComputeManager(manager.Manager):
     """Manages the running instances from creation to destruction."""
 
-    target = messaging.Target(version='6.0')
+    target = messaging.Target(version='6.2')
 
     def __init__(self, compute_driver=None, *args, **kwargs):
         """Load configuration options and connect to the hypervisor."""
         # We want the ComputeManager, ResourceTracker and ComputeVirtAPI all
         # using the same instance of SchedulerReportClient which has the
         # ProviderTree cache for this compute service.
+        # NOTE(danms): We do not use the global placement client
+        # singleton here, because the above-mentioned stack of objects
+        # maintain local state in the client. Thus, keeping our own
+        # private object for that stack avoids any potential conflict
+        # with other users in our process outside of the above.
         self.reportclient = report.SchedulerReportClient()
         self.virtapi = ComputeVirtAPI(self)
         self.network_api = neutron.API()
@@ -577,6 +675,7 @@ class ComputeManager(manager.Manager):
         # NOTE(russellb) Load the driver last.  It may call back into the
         # compute manager via the virtapi, so we want it to be fully
         # initialized before that happens.
+        self.service_ref = None
         self.driver = driver.load_compute_driver(self.virtapi, compute_driver)
         self.rt = resource_tracker.ResourceTracker(
             self.host, self.driver, reportclient=self.reportclient)
@@ -608,6 +707,7 @@ class ComputeManager(manager.Manager):
         # to the database layer.
         instance.host = None
         instance.node = None
+        instance.compute_id = None
         # ResourceTracker._set_instance_host_and_node also sets launched_on
         # to the same value as host and is really only ever used by legacy
         # nova-network code, but we should also null it out to avoid confusion
@@ -1151,6 +1251,20 @@ class ComputeManager(manager.Manager):
                           'updated.', instance=instance)
             self._set_instance_obj_error_state(instance)
             return
+        except exception.PciDeviceNotFoundById:
+            # This is bug 1981813 where the bound port vnic_type has changed
+            # from direct to macvtap. Nova does not support that and it
+            # already printed an ERROR when the change is detected during
+            # _heal_instance_info_cache. Now we print an ERROR again and skip
+            # plugging the vifs but let the service startup continue to init
+            # the other instances
+            LOG.exception(
+                'Virtual interface plugging failed for instance. Probably the '
+                'vnic_type of the bound port has been changed. Nova does not '
+                'support such change.',
+                instance=instance
+            )
+            return
 
         if instance.task_state == task_states.RESIZE_MIGRATING:
             # We crashed during resize/migration, so roll back for safety
@@ -1360,40 +1474,136 @@ class ComputeManager(manager.Manager):
         :return: a dict of ComputeNode objects keyed by the UUID of the given
             node.
         """
-        nodes_by_uuid = {}
         try:
-            node_names = self.driver.get_available_nodes()
+            node_ids = self.driver.get_nodenames_by_uuid()
         except exception.VirtDriverNotReady:
             LOG.warning(
                 "Virt driver is not ready. If this is the first time this "
-                "service is starting on this host, then you can ignore this "
-                "warning.")
+                "service is starting on this host, then you can ignore "
+                "this warning.")
             return {}
 
-        for node_name in node_names:
-            try:
-                node = objects.ComputeNode.get_by_host_and_nodename(
-                    context, self.host, node_name)
-                nodes_by_uuid[node.uuid] = node
-            except exception.ComputeHostNotFound:
-                LOG.warning(
-                    "Compute node %s not found in the database. If this is "
-                    "the first time this service is starting on this host, "
-                    "then you can ignore this warning.", node_name)
-        return nodes_by_uuid
+        nodes = objects.ComputeNodeList.get_all_by_uuids(context,
+                                                         list(node_ids.keys()))
+        if not nodes:
+            # NOTE(danms): This should only happen if the compute_id is
+            # pre-provisioned on a host that has never started.
+            LOG.warning('Compute nodes %s for host %s were not found in the '
+                        'database. If this is the first time this service is '
+                        'starting on this host, then you can ignore this '
+                        'warning.',
+                        list(node_ids.keys()), self.host)
+            return {}
 
-    def init_host(self):
+        for node in nodes:
+            if node.hypervisor_hostname != node_ids.get(node.uuid):
+                raise exception.InvalidConfiguration(
+                    ('My compute node %s has hypervisor_hostname %s '
+                     'but virt driver reports it should be %s. Possible '
+                     'rename detected, refusing to start!') % (
+                         node.uuid, node.hypervisor_hostname,
+                         node_ids.get(node.uuid)))
+
+        return {n.uuid: n for n in nodes}
+
+    def _ensure_existing_node_identity(self, service_ref):
+        """If we are upgrading from an older service version, we need
+        to write our node identity uuid (if not already done) based on
+        nodes assigned to us in the database.
+        """
+        if 'ironic' in CONF.compute_driver.lower():
+            # We do not persist a single local node identity for
+            # ironic
+            return
+
+        if service_ref.version >= service_obj.NODE_IDENTITY_VERSION:
+            # Already new enough, nothing to do here, but make sure that we
+            # have a UUID file already, as this is not our first time starting.
+            if nova.virt.node.read_local_node_uuid() is None:
+                raise exception.InvalidConfiguration(
+                    ('No local node identity found, but this is not our '
+                     'first startup on this host. Refusing to start after '
+                     'potentially having lost that state!'))
+            return
+
+        if nova.virt.node.read_local_node_uuid():
+            # We already have a local node identity, no migration needed
+            return
+
+        context = nova.context.get_admin_context()
+        db_nodes = objects.ComputeNodeList.get_all_by_host(context, self.host)
+        if not db_nodes:
+            # This means we have no nodes in the database (that we
+            # know of) and thus have no need to record an existing
+            # UUID. That is probably strange, so log a warning.
+            raise exception.InvalidConfiguration(
+                ('Upgrading from service version %i but found no '
+                 'nodes in the database for host %s to persist '
+                 'locally; Possible rename detected, '
+                 'refusing to start!') % (
+                        service_ref.version, self.host))
+
+        if len(db_nodes) > 1:
+            # If this happens we can't do the right thing, so raise an
+            # exception to abort host startup
+            LOG.warning('Multiple nodes found in the database for host %s; '
+                        'unable to persist local node identity automatically')
+            raise exception.InvalidConfiguration(
+                'Multiple nodes found in database, manual node uuid '
+                'configuration required')
+
+        nova.virt.node.write_local_node_uuid(db_nodes[0].uuid)
+
+    def _check_for_host_rename(self, nodes_by_uuid):
+        if 'ironic' in CONF.compute_driver.lower():
+            # Ironic (currently) rebalances nodes at various times, and as
+            # such, nodes being discovered as assigned to this host with a
+            # different hostname is not surprising. Skip this check for
+            # ironic.
+            return
+        for node in nodes_by_uuid.values():
+            if node.host != self.host:
+                raise exception.InvalidConfiguration(
+                    'My node %s has host %r but my host is %r; '
+                    'Possible rename detected, refusing to start!' % (
+                        node.uuid, node.host, self.host))
+            LOG.debug('Verified node %s matches my host %s',
+                      node.uuid, self.host)
+
+    def _sanity_check_new_host(self):
+        instances_on_hv = self.driver.list_instance_uuids()
+        if len(instances_on_hv) > 0:
+            # This means we have instances on our hypervisor, but we think
+            # we are a new host (i.e. we created a new service record). That
+            # likely means we're pointed at an empty database or the wrong
+            # cell.
+            raise exception.InvalidConfiguration(
+                'My hypervisor has existing instances, but I appear to be '
+                'a new service in this database. Possible database '
+                'configuration error, refusing to start!')
+
+    def init_host(self, service_ref):
         """Initialization for a standalone compute service."""
 
-        if CONF.pci.passthrough_whitelist:
-            # Simply loading the PCI passthrough whitelist will do a bunch of
+        if service_ref:
+            # If we are an existing service, check to see if we need
+            # to record a locally-persistent node identity because
+            # we have upgraded from a previous version.
+            self._ensure_existing_node_identity(service_ref)
+        else:
+            # If we are a new service (in the database), make sure we have no
+            # instances on our hypervisor as we would expect.
+            self._sanity_check_new_host()
+
+        if CONF.pci.device_spec:
+            # Simply loading the PCI passthrough spec will do a bunch of
             # validation that would otherwise wait until the PciDevTracker is
             # constructed when updating available resources for the compute
             # node(s) in the resource tracker, effectively killing that task.
-            # So load up the whitelist when starting the compute service to
-            # flush any invalid configuration early so we can kill the service
+            # So load up the spec when starting the compute service to
+            # flush any invalid configuration early, so we can kill the service
             # if the configuration is wrong.
-            whitelist.Whitelist(CONF.pci.passthrough_whitelist)
+            whitelist.Whitelist(CONF.pci.device_spec)
 
         nova.conf.neutron.register_dynamic_opts(CONF)
         # Even if only libvirt uses them, make it available for all drivers
@@ -1414,7 +1624,18 @@ class ComputeManager(manager.Manager):
             raise exception.InvalidConfiguration(msg)
 
         self.driver.init_host(host=self.host)
+
+        # NOTE(gibi): At this point the compute_nodes of the resource tracker
+        # has not been populated yet so we cannot rely on the resource tracker
+        # here.
         context = nova.context.get_admin_context()
+        nodes_by_uuid = self._get_nodes(context)
+
+        # NOTE(danms): Check for a possible host rename and abort
+        # startup before we start mucking with instances we think are
+        # ours.
+        self._check_for_host_rename(nodes_by_uuid)
+
         instances = objects.InstanceList.get_by_host(
             context, self.host,
             expected_attrs=['info_cache', 'metadata', 'numa_topology'])
@@ -1424,17 +1645,12 @@ class ComputeManager(manager.Manager):
         self._validate_pinning_configuration(instances)
         self._validate_vtpm_configuration(instances)
 
-        # NOTE(gibi): At this point the compute_nodes of the resource tracker
-        # has not been populated yet so we cannot rely on the resource tracker
-        # here.
         # NOTE(gibi): If ironic and vcenter virt driver slow start time
         # becomes problematic here then we should consider adding a config
         # option or a driver flag to tell us if we should thread
         # _destroy_evacuated_instances and
         # _error_out_instances_whose_build_was_interrupted out in the
         # background on startup
-        nodes_by_uuid = self._get_nodes(context)
-
         try:
             # checking that instance was not already evacuated to other host
             evacuated_instances = self._destroy_evacuated_instances(
@@ -1551,11 +1767,13 @@ class ComputeManager(manager.Manager):
                             instance_uuid=migration.instance_uuid)
         self._waiting_live_migrations.clear()
 
-    def pre_start_hook(self):
+    def pre_start_hook(self, service_ref):
         """After the service is initialized, but before we fully bring
         the service up by listening on RPC queues, make sure to update
         our available resources (and indirectly our available nodes).
         """
+        self.service_ref = service_ref
+        self.rt.set_service_ref(service_ref)
         self.update_available_resource(nova.context.get_admin_context(),
                                        startup=True)
 
@@ -1627,27 +1845,32 @@ class ComputeManager(manager.Manager):
         # hosts.  This is a validation step to make sure that starting the
         # instance here doesn't violate the policy.
         if scheduler_hints is not None:
-            # only go through here if scheduler_hints is provided, even if it
-            # is empty.
+            # only go through here if scheduler_hints is provided,
+            # even if it is empty.
             group_hint = scheduler_hints.get('group')
             if not group_hint:
                 return
             else:
-                # The RequestSpec stores scheduler_hints as key=list pairs so
-                # we need to check the type on the value and pull the single
-                # entry out. The API request schema validates that
+                # The RequestSpec stores scheduler_hints as key=list pairs
+                # so we need to check the type on the value and pull the
+                # single entry out. The API request schema validates that
                 # the 'group' hint is a single value.
                 if isinstance(group_hint, list):
                     group_hint = group_hint[0]
-
-                group = objects.InstanceGroup.get_by_hint(context, group_hint)
+                try:
+                    group = objects.InstanceGroup.get_by_hint(
+                        context, group_hint
+                    )
+                except exception.InstanceGroupNotFound:
+                    return
         else:
             # TODO(ganso): a call to DB can be saved by adding request_spec
             # to rpcapi payload of live_migration, pre_live_migration and
             # check_can_live_migrate_destination
             try:
                 group = objects.InstanceGroup.get_by_instance_uuid(
-                    context, instance.uuid)
+                    context, instance.uuid
+                )
             except exception.InstanceGroupNotFound:
                 return
 
@@ -1668,8 +1891,7 @@ class ComputeManager(manager.Manager):
                 migrations = (
                     objects.MigrationList.get_in_progress_by_host_and_node(
                         context, self.host, nodename))
-                migration_vm_uuids = set([mig['instance_uuid']
-                                          for mig in migrations])
+                migration_vm_uuids = {mig.instance_uuid for mig in migrations}
 
                 total_instances = migration_vm_uuids | ins_on_host
 
@@ -1689,11 +1911,8 @@ class ComputeManager(manager.Manager):
                 else:
                     max_server = 1
                 if len(members_on_host) >= max_server:
-                    msg = _("Anti-affinity instance group policy "
-                            "was violated.")
-                    raise exception.RescheduledException(
-                            instance_uuid=instance.uuid,
-                            reason=msg)
+                    raise exception.GroupAffinityViolation(
+                        instance_uuid=instance.uuid, policy='Anti-affinity')
 
             # NOTE(ganso): The check for affinity below does not work and it
             # can easily be violated because the lock happens in different
@@ -1703,10 +1922,8 @@ class ComputeManager(manager.Manager):
             elif group.policy and 'affinity' == group.policy:
                 group_hosts = group.get_hosts(exclude=[instance.uuid])
                 if group_hosts and self.host not in group_hosts:
-                    msg = _("Affinity instance group policy was violated.")
-                    raise exception.RescheduledException(
-                            instance_uuid=instance.uuid,
-                            reason=msg)
+                    raise exception.GroupAffinityViolation(
+                        instance_uuid=instance.uuid, policy='Affinity')
 
         _do_validation(context, instance, group)
 
@@ -1931,6 +2148,7 @@ class ComputeManager(manager.Manager):
         ephemerals = []
         swap = []
         block_device_mapping = []
+        image = []
 
         for device in block_devices:
             if block_device.new_format_is_ephemeral(device):
@@ -1942,8 +2160,12 @@ class ComputeManager(manager.Manager):
             if driver_block_device.is_block_device_mapping(device):
                 block_device_mapping.append(device)
 
+            if driver_block_device.is_local_image(device):
+                image.append(device)
+
         self._default_device_names_for_instance(instance,
                                                 root_device_name,
+                                                image,
                                                 ephemerals,
                                                 swap,
                                                 block_device_mapping)
@@ -2039,11 +2261,12 @@ class ComputeManager(manager.Manager):
 
     def _notify_about_instance_usage(self, context, instance, event_suffix,
                                      network_info=None, extra_usage_info=None,
-                                     fault=None):
+                                     fault=None, best_effort=False):
         compute_utils.notify_about_instance_usage(
             self.notifier, context, instance, event_suffix,
             network_info=network_info,
-            extra_usage_info=extra_usage_info, fault=fault)
+            extra_usage_info=extra_usage_info, fault=fault,
+            best_effort=best_effort)
 
     def _deallocate_network(self, context, instance,
                             requested_networks=None):
@@ -2141,6 +2364,9 @@ class ComputeManager(manager.Manager):
                         self.reportclient.delete_allocation_for_instance(
                             context, instance.uuid, force=True)
 
+                    if result in (build_results.FAILED_BY_POLICY,
+                                  build_results.RESCHEDULED_BY_POLICY):
+                        return
                     if result in (build_results.FAILED,
                                   build_results.RESCHEDULED):
                         self._build_failed(node)
@@ -2239,6 +2465,8 @@ class ComputeManager(manager.Manager):
                 self._nil_out_instance_obj_host_and_node(instance)
                 self._set_instance_obj_error_state(instance,
                                                    clean_task_state=True)
+                if isinstance(e, exception.RescheduledByPolicyException):
+                    return build_results.FAILED_BY_POLICY
                 return build_results.FAILED
             LOG.debug(e.format_message(), instance=instance)
             # This will be used for logging the exception
@@ -2265,6 +2493,10 @@ class ComputeManager(manager.Manager):
                     injected_files, requested_networks, security_groups,
                     block_device_mapping, request_spec=request_spec,
                     host_lists=[host_list])
+
+            if isinstance(e, exception.RescheduledByPolicyException):
+                return build_results.RESCHEDULED_BY_POLICY
+
             return build_results.RESCHEDULED
         except (exception.InstanceNotFound,
                 exception.UnexpectedDeletingTaskStateError):
@@ -2352,10 +2584,12 @@ class ComputeManager(manager.Manager):
 
         if provider_mapping:
             try:
-                compute_utils\
-                    .update_pci_request_spec_with_allocated_interface_name(
-                        context, self.reportclient,
-                        instance.pci_requests.requests, provider_mapping)
+                compute_utils.update_pci_request_with_placement_allocations(
+                    context,
+                    self.reportclient,
+                    instance.pci_requests.requests,
+                    provider_mapping,
+                )
             except (exception.AmbiguousResourceProviderForPCIRequest,
                     exception.UnexpectedResourceProviderNameForPCIRequest
                     ) as e:
@@ -2482,6 +2716,17 @@ class ComputeManager(manager.Manager):
                     bdms=block_device_mapping)
             raise exception.BuildAbortException(instance_uuid=instance.uuid,
                     reason=e.format_message())
+        except exception.GroupAffinityViolation as e:
+            LOG.exception('Failed to build and run instance',
+                          instance=instance)
+            self._notify_about_instance_usage(context, instance,
+                    'create.error', fault=e)
+            compute_utils.notify_about_instance_create(
+                    context, instance, self.host,
+                    phase=fields.NotificationPhase.ERROR, exception=e,
+                    bdms=block_device_mapping)
+            raise exception.RescheduledByPolicyException(
+                    instance_uuid=instance.uuid, reason=str(e))
         except Exception as e:
             LOG.exception('Failed to build and run instance',
                           instance=instance)
@@ -2617,10 +2862,12 @@ class ComputeManager(manager.Manager):
                     block_device_mapping)
             resources['block_device_info'] = block_device_info
         except (exception.InstanceNotFound,
-                exception.UnexpectedDeletingTaskStateError):
+                exception.UnexpectedDeletingTaskStateError,
+                exception.ComputeResourcesUnavailable):
             with excutils.save_and_reraise_exception():
                 self._build_resources_cleanup(instance, network_info)
         except (exception.UnexpectedTaskStateError,
+                exception.InstanceUnacceptable,
                 exception.OverQuota, exception.InvalidBDM) as e:
             self._build_resources_cleanup(instance, network_info)
             raise exception.BuildAbortException(instance_uuid=instance.uuid,
@@ -2720,7 +2967,7 @@ class ComputeManager(manager.Manager):
         return arqs
 
     def _split_network_arqs(self, arqs, requested_networks):
-        """splif arq request by exra spec from ARQ requested by port.
+        """split arq request by extra spec from ARQ requested by port.
 
         Return ARQ groups tuple:(spec_arqs, port_arqs)
         Each item in the tuple is a dict like:
@@ -2774,7 +3021,7 @@ class ComputeManager(manager.Manager):
                 'Virt driver does not provide unplug_vifs method, so it '
                 'is not possible determine if VIFs should be unplugged.'
             )
-        except exception.NovaException as exc:
+        except Exception as exc:
             # It's possible that the instance never got as far as plugging
             # VIFs, in which case we would see an exception which can be
             # mostly ignored
@@ -2914,6 +3161,7 @@ class ComputeManager(manager.Manager):
             self._try_deallocate_network(context, instance, requested_networks)
 
         timer.restart()
+        connector = None
         for bdm in vol_bdms:
             try:
                 if bdm.attachment_id:
@@ -2922,7 +3170,8 @@ class ComputeManager(manager.Manager):
                 else:
                     # NOTE(vish): actual driver detach done in driver.destroy,
                     #             so just tell cinder that we are done with it.
-                    connector = self.driver.get_volume_connector(instance)
+                    if connector is None:
+                        connector = self.driver.get_volume_connector(instance)
                     self.volume_api.terminate_connection(context,
                                                          bdm.volume_id,
                                                          connector)
@@ -3291,18 +3540,124 @@ class ComputeManager(manager.Manager):
             migration.status = status
             migration.save()
 
+    @staticmethod
+    def _reimage_failed_callback(event_name, instance):
+        msg = ('Cinder reported failure during reimaging '
+               'with %(event)s for instance %(uuid)s')
+        msg_args = {'event': event_name, 'uuid': instance.uuid}
+        LOG.error(msg, msg_args)
+        raise exception.ReimageException(msg % msg_args)
+
+    def _detach_root_volume(self, context, instance, root_bdm):
+        volume_id = root_bdm.volume_id
+        mp = root_bdm.device_name
+        old_connection_info = jsonutils.loads(root_bdm.connection_info)
+        try:
+            self.driver.detach_volume(context, old_connection_info,
+                                      instance, root_bdm.device_name)
+        except exception.DiskNotFound as err:
+            LOG.warning('Ignoring DiskNotFound exception while '
+                        'detaching volume %(volume_id)s from '
+                        '%(mp)s : %(err)s',
+                        {'volume_id': volume_id, 'mp': mp,
+                         'err': err}, instance=instance)
+        except exception.DeviceDetachFailed:
+            with excutils.save_and_reraise_exception():
+                LOG.warning('Guest refused to detach volume %(vol)s',
+                            {'vol': volume_id}, instance=instance)
+                self.volume_api.roll_detaching(context, volume_id)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.exception('Failed to detach volume '
+                              '%(volume_id)s from %(mp)s',
+                              {'volume_id': volume_id, 'mp': mp},
+                              instance=instance)
+                self.volume_api.roll_detaching(context, volume_id)
+
+    def _rebuild_volume_backed_instance(self, context, instance, bdms,
+                                        image_id):
+        # Get root bdm and attachment ID associated to it
+        root_bdm = compute_utils.get_root_bdm(context, instance, bdms)
+        old_attachment_id = root_bdm.attachment_id
+
+        # Create a new attachment and delete the previous attachment
+        # We create a new attachment first to keep the volume in
+        # reserved state after old attachment is deleted and avoid any
+        # races in between the attachment create and delete.
+        attachment_id = None
+        try:
+            attachment_id = self.volume_api.attachment_create(
+                context, root_bdm.volume_id, instance.uuid)['id']
+            self._detach_root_volume(context, instance, root_bdm)
+            root_bdm.attachment_id = attachment_id
+            root_bdm.save()
+            self.volume_api.attachment_delete(context,
+                                              old_attachment_id)
+        except exception.InstanceNotFound:
+            # This means we failed to save the new attachment because
+            # the instance is deleted, so (try to) delete it and abort.
+            try:
+                self.volume_api.attachment_delete(context,
+                                                  attachment_id)
+            except cinder_exception.ClientException:
+                LOG.error('Failed to delete new attachment %s',
+                          attachment_id)
+            msg = _('Failed to rebuild volume backed instance.')
+            raise exception.BuildAbortException(
+                instance_uuid=instance.uuid, reason=msg)
+        except cinder_exception.ClientException:
+            if attachment_id:
+                LOG.error('Failed to delete old attachment %s',
+                          old_attachment_id)
+            else:
+                LOG.error('Failed to create new attachment')
+            msg = _('Failed to rebuild volume backed instance.')
+            raise exception.BuildAbortException(
+                instance_uuid=instance.uuid, reason=msg)
+        events = [('volume-reimaged', root_bdm.volume_id)]
+
+        # Get the image requested for rebuild
+        try:
+            image = self.image_api.get(context, image_id)
+        except exception.ImageNotFound:
+            msg = _('Image %s not found.') % image_id
+            LOG.error(msg)
+            raise exception.BuildAbortException(
+                instance_uuid=instance.uuid, reason=msg)
+        image_size = int(math.ceil(float(image.get('size')) / units.Gi))
+        deadline = CONF.reimage_timeout_per_gb * image_size
+        error_cb = self._reimage_failed_callback
+
+        # Call cinder to perform reimage operation and wait until an
+        # external event is triggered.
+        try:
+            with self.virtapi.wait_for_instance_event(instance, events,
+                                                      deadline=deadline,
+                                                      error_callback=error_cb):
+                self.volume_api.reimage_volume(
+                    context, root_bdm.volume_id, image_id,
+                    reimage_reserved=True)
+
+        except Exception as ex:
+            LOG.error('Failed to rebuild volume backed instance: %s',
+                      str(ex), instance=instance)
+            msg = _('Failed to rebuild volume backed instance.')
+            raise exception.BuildAbortException(
+                instance_uuid=instance.uuid, reason=msg)
+
     def _rebuild_default_impl(
             self, context, instance, image_meta, injected_files,
             admin_password, allocations, bdms, detach_block_devices,
             attach_block_devices, network_info=None, evacuate=False,
             block_device_info=None, preserve_ephemeral=False,
-            accel_uuids=None):
+            accel_uuids=None, reimage_boot_volume=False):
         if preserve_ephemeral:
             # The default code path does not support preserving ephemeral
             # partitions.
             raise exception.PreserveEphemeralNotSupported()
 
         accel_info = []
+        detach_root_bdm = not reimage_boot_volume
         if evacuate:
             if instance.flavor.extra_specs.get('accel:device_profile'):
                 try:
@@ -3314,13 +3669,36 @@ class ComputeManager(manager.Manager):
                     msg = _('Failure getting accelerator resources.')
                     raise exception.BuildAbortException(
                         instance_uuid=instance.uuid, reason=msg)
-            detach_block_devices(context, bdms)
+            detach_block_devices(context, bdms,
+                                 detach_root_bdm=detach_root_bdm)
         else:
             self._power_off_instance(instance, clean_shutdown=True)
-            detach_block_devices(context, bdms)
-            self.driver.destroy(context, instance,
-                                network_info=network_info,
-                                block_device_info=block_device_info)
+            detach_block_devices(context, bdms,
+                                 detach_root_bdm=detach_root_bdm)
+            if reimage_boot_volume:
+                # Previously, the calls reaching here were for image
+                # backed instance rebuild and didn't have a root bdm
+                # so now we need to handle the case for root bdm.
+                # For the root BDM, we are doing attach/detach operations
+                # manually as we want to maintain a 'reserved' state
+                # throughout the reimage process from the cinder side so
+                # we are excluding the root BDM from certain operations
+                # here i.e. deleting it's mapping before the destroy call.
+                block_device_info_copy = copy.deepcopy(block_device_info)
+                root_bdm = compute_utils.get_root_bdm(context, instance, bdms)
+                mapping = block_device_info_copy["block_device_mapping"]
+                # drop root bdm from the mapping
+                mapping = [
+                  bdm for bdm in mapping
+                  if bdm["volume_id"] != root_bdm.volume_id
+                ]
+                self.driver.destroy(context, instance,
+                                    network_info=network_info,
+                                    block_device_info=block_device_info_copy)
+            else:
+                self.driver.destroy(context, instance,
+                    network_info=network_info,
+                    block_device_info=block_device_info)
             try:
                 accel_info = self._get_accel_info(context, instance)
             except Exception as exc:
@@ -3329,6 +3707,12 @@ class ComputeManager(manager.Manager):
                 msg = _('Failure getting accelerator resources.')
                 raise exception.BuildAbortException(
                     instance_uuid=instance.uuid, reason=msg)
+            if reimage_boot_volume:
+                is_volume_backed = compute_utils.is_volume_backed_instance(
+                    context, instance, bdms)
+                if is_volume_backed:
+                    self._rebuild_volume_backed_instance(
+                        context, instance, bdms, image_meta.id)
 
         instance.task_state = task_states.REBUILD_BLOCK_DEVICE_MAPPING
         instance.save(expected_task_state=[task_states.REBUILDING])
@@ -3363,7 +3747,8 @@ class ComputeManager(manager.Manager):
                          injected_files, new_pass, orig_sys_metadata,
                          bdms, recreate, on_shared_storage,
                          preserve_ephemeral, migration,
-                         scheduled_node, limits, request_spec, accel_uuids):
+                         scheduled_node, limits, request_spec, accel_uuids,
+                         reimage_boot_volume=None, target_state=None):
         """Destroy and re-make this instance.
 
         A 'rebuild' effectively purges all existing data from the system and
@@ -3395,6 +3780,11 @@ class ComputeManager(manager.Manager):
                        specified by the user, this will be None
         :param request_spec: a RequestSpec object used to schedule the instance
         :param accel_uuids: a list of cyborg ARQ uuids
+        :param reimage_boot_volume: Boolean to specify whether the user has
+                                    explicitly requested to rebuild a boot
+                                    volume or None if RPC version is <=6.0
+        :param target_state: Set a target state for the evacuated instance or
+                             None if RPC version is <=6.1.
 
         """
         # recreate=True means the instance is being evacuated from a failed
@@ -3438,9 +3828,21 @@ class ComputeManager(manager.Manager):
                 try:
                     compute_node = self._get_compute_info(context, self.host)
                     scheduled_node = compute_node.hypervisor_hostname
-                except exception.ComputeHostNotFound:
+                except exception.ComputeHostNotFound as e:
+                    # This means we were asked to rebuild one of our own
+                    # instances, or another instance as a target of an
+                    # evacuation, but we are unable to find a matching compute
+                    # node.
                     LOG.exception('Failed to get compute_info for %s',
                                   self.host)
+                    self._set_migration_status(migration, 'failed')
+                    self._notify_instance_rebuild_error(context, instance, e,
+                                                        bdms)
+                    raise exception.InstanceFaultRollback(
+                        inner_exception=exception.BuildAbortException(
+                        instance_uuid=instance.uuid,
+                        reason=e.format_message()))
+
             else:
                 scheduled_node = instance.node
 
@@ -3459,7 +3861,8 @@ class ComputeManager(manager.Manager):
                     image_meta, injected_files, new_pass, orig_sys_metadata,
                     bdms, evacuate, on_shared_storage, preserve_ephemeral,
                     migration, request_spec, allocs, rebuild_claim,
-                    scheduled_node, limits, accel_uuids)
+                    scheduled_node, limits, accel_uuids, reimage_boot_volume,
+                    target_state)
             except (exception.ComputeResourcesUnavailable,
                     exception.RescheduledException) as e:
                 if isinstance(e, exception.ComputeResourcesUnavailable):
@@ -3518,7 +3921,8 @@ class ComputeManager(manager.Manager):
             self, context, instance, orig_image_ref, image_meta,
             injected_files, new_pass, orig_sys_metadata, bdms, evacuate,
             on_shared_storage, preserve_ephemeral, migration, request_spec,
-            allocations, rebuild_claim, scheduled_node, limits, accel_uuids):
+            allocations, rebuild_claim, scheduled_node, limits, accel_uuids,
+            reimage_boot_volume, target_state):
         """Helper to avoid deep nesting in the top-level method."""
 
         provider_mapping = None
@@ -3526,10 +3930,12 @@ class ComputeManager(manager.Manager):
             provider_mapping = self._get_request_group_mapping(request_spec)
 
             if provider_mapping:
-                compute_utils.\
-                    update_pci_request_spec_with_allocated_interface_name(
-                        context, self.reportclient,
-                        instance.pci_requests.requests, provider_mapping)
+                compute_utils.update_pci_request_with_placement_allocations(
+                    context,
+                    self.reportclient,
+                    instance.pci_requests.requests,
+                    provider_mapping,
+                )
 
         claim_context = rebuild_claim(
             context, instance, scheduled_node, allocations,
@@ -3540,7 +3946,8 @@ class ComputeManager(manager.Manager):
                 context, instance, orig_image_ref, image_meta, injected_files,
                 new_pass, orig_sys_metadata, bdms, evacuate, on_shared_storage,
                 preserve_ephemeral, migration, request_spec, allocations,
-                provider_mapping, accel_uuids)
+                provider_mapping, accel_uuids, reimage_boot_volume,
+                target_state)
 
     @staticmethod
     def _get_image_name(image_meta):
@@ -3554,10 +3961,18 @@ class ComputeManager(manager.Manager):
             injected_files, new_pass, orig_sys_metadata, bdms, evacuate,
             on_shared_storage, preserve_ephemeral, migration, request_spec,
             allocations, request_group_resource_providers_mapping,
-            accel_uuids):
+            accel_uuids, reimage_boot_volume, target_state):
         orig_vm_state = instance.vm_state
 
         if evacuate:
+            if target_state and orig_vm_state != vm_states.ERROR:
+                # This will ensure that at destination the instance will have
+                # the desired state.
+                if target_state not in vm_states.ALLOW_TARGET_STATES:
+                    raise exception.InstanceEvacuateNotSupportedTargetState(
+                        target_state=target_state)
+                orig_vm_state = target_state
+
             if request_spec:
                 # NOTE(gibi): Do a late check of server group policy as
                 # parallel scheduling could violate such policy. This will
@@ -3659,8 +4074,23 @@ class ComputeManager(manager.Manager):
             self._get_instance_block_device_info(
                     context, instance, bdms=bdms)
 
-        def detach_block_devices(context, bdms):
+        def detach_block_devices(context, bdms, detach_root_bdm=True):
             for bdm in bdms:
+                # Previously, the calls made to this method by rebuild
+                # instance operation were for image backed instances which
+                # assumed we only had attached volumes and no root BDM.
+                # Now we need to handle case for root BDM which we are
+                # doing manually so skipping the attachment create/delete
+                # calls from here.
+                # The detach_root_bdm parameter is only passed while
+                # rebuilding the volume backed instance so we don't have
+                # to worry about other callers as they won't satisfy this
+                # condition.
+                # For evacuate case, we have detach_root_bdm always True
+                # since we don't have reimage_boot_volume parameter in
+                # this case so this will not be executed.
+                if not detach_root_bdm and bdm.is_root:
+                    continue
                 if bdm.is_volume:
                     # NOTE (ildikov): Having the attachment_id set in the BDM
                     # means that it's the new Cinder attach/detach flow
@@ -3696,7 +4126,8 @@ class ComputeManager(manager.Manager):
             network_info=network_info,
             preserve_ephemeral=preserve_ephemeral,
             evacuate=evacuate,
-            accel_uuids=accel_uuids)
+            accel_uuids=accel_uuids,
+            reimage_boot_volume=reimage_boot_volume)
         try:
             with instance.mutated_migration_context():
                 self.driver.rebuild(**kwargs)
@@ -3761,6 +4192,66 @@ class ComputeManager(manager.Manager):
             accel_info = []
         return accel_info
 
+    def _delete_dangling_bdms(self, context, instance, bdms):
+        """Deletes dangling or stale attachments for volume from
+        Nova and Cinder DB so both service DBs can be in sync.
+
+        Retrieves volume attachments from the Nova block_device_mapping
+        table and verifies them with the Cinder volume_attachment table.
+        If attachment is not present in any one of the DBs, delete
+        attachments from the other DB.
+
+        :param context: The nova request context.
+        :param instance: instance object.
+        :param bdms: BlockDeviceMappingList list object.
+        """
+
+        try:
+            cinder_attachments = self.volume_api.attachment_get_all(
+                context, instance.uuid)
+        except (keystone_exception.EndpointNotFound,
+                cinder_exception.ClientException):
+            # if cinder is not deployed we never need to check for
+            # attachments as there cannot be dangling bdms.
+            # if we cannot connect to cinder we cannot check for dangling
+            # bdms so we skip the check. Intermittent connection issues
+            # to cinder should not cause instance reboot to fail.
+            return
+
+        # attachments present in nova DB, ones nova knows about
+        nova_attachments = []
+        bdms_to_delete = []
+        for bdm in bdms.objects:
+            if bdm.volume_id and bdm.source_type == 'volume' and \
+                bdm.destination_type == 'volume':
+                try:
+                    self.volume_api.attachment_get(context, bdm.attachment_id)
+                except exception.VolumeAttachmentNotFound:
+                    LOG.info(
+                        f"Removing stale volume attachment "
+                        f"'{bdm.attachment_id}' from instance for "
+                        f"volume '{bdm.volume_id}'.", instance=instance)
+                    bdm.destroy()
+                    bdms_to_delete.append(bdm)
+                else:
+                    nova_attachments.append(bdm.attachment_id)
+
+        cinder_attachments = [each['id'] for each in cinder_attachments]
+
+        if len(set(cinder_attachments) - set(nova_attachments)):
+            LOG.info(
+                "Removing stale volume attachments of instance from "
+                "Cinder", instance=instance)
+        for each_attach in set(cinder_attachments) - set(nova_attachments):
+            # delete only cinder known attachments, from cinder DB.
+            LOG.debug(
+                f"Removing attachment '{each_attach}'", instance=instance)
+            self.volume_api.attachment_delete(context, each_attach)
+
+        # refresh bdms object
+        for bdm in bdms_to_delete:
+            bdms.objects.remove(bdm)
+
     @wrap_exception()
     @reverts_task_state
     @wrap_instance_event(prefix='compute')
@@ -3790,6 +4281,9 @@ class ComputeManager(manager.Manager):
 
         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
             context, instance.uuid)
+
+        self._delete_dangling_bdms(context, instance, bdms)
+
         block_device_info = self._get_instance_block_device_info(
             context, instance, bdms=bdms)
 
@@ -4697,7 +5191,12 @@ class ComputeManager(manager.Manager):
         """Revert host, node and flavor fields after a resize-revert."""
         self._set_instance_info(instance, instance.old_flavor)
         instance.host = migration.source_compute
-        instance.node = migration.source_node
+        # NOTE(danms): This could fail if we somehow ended up on the wrong
+        # host without the desired node. That's a big problem, so let the
+        # ComputeHostNotFound raise from here.
+        cn = self.rt.get_node_by_name(migration.source_node)
+        instance.node = cn.hypervisor_hostname
+        instance.compute_id = cn.id
         instance.save(expected_task_state=[task_states.RESIZE_REVERTING])
 
     @wrap_exception()
@@ -4803,8 +5302,18 @@ class ComputeManager(manager.Manager):
                   self.host, instance=instance)
         # TODO(mriedem): Calculate provider mappings when we support
         # cross-cell resize/migrate with ports having resource requests.
-        self._finish_revert_resize_network_migrate_finish(
-            ctxt, instance, migration, provider_mappings=None)
+        # NOTE(hanrong): we need to change migration.dest_compute to
+        # source host temporarily.
+        # "network_api.migrate_instance_finish" will setup the network
+        # for the instance on the destination host. For revert resize,
+        # the instance will back to the source host, the setup of the
+        # network for instance should be on the source host. So set
+        # the migration.dest_compute to source host at here.
+        with utils.temporary_mutation(
+            migration, dest_compute=migration.source_compute
+        ):
+            self.network_api.migrate_instance_finish(
+                ctxt, instance, migration, provider_mappings=None)
         network_info = self.network_api.get_instance_nw_info(ctxt, instance)
 
         # Remember that prep_snapshot_based_resize_at_source destroyed the
@@ -4896,50 +5405,6 @@ class ComputeManager(manager.Manager):
             self.compute_rpcapi.finish_revert_resize(context, instance,
                     migration, migration.source_compute, request_spec)
 
-    def _finish_revert_resize_network_migrate_finish(
-            self, context, instance, migration, provider_mappings):
-        """Causes port binding to be updated. In some Neutron or port
-        configurations - see NetworkModel.get_bind_time_events() - we
-        expect the vif-plugged event from Neutron immediately and wait for it.
-        The rest of the time, the event is expected further along in the
-        virt driver, so we don't wait here.
-
-        :param context: The request context.
-        :param instance: The instance undergoing the revert resize.
-        :param migration: The Migration object of the resize being reverted.
-        :param provider_mappings: a dict of list of resource provider uuids
-            keyed by port uuid
-        :raises: eventlet.timeout.Timeout or
-                 exception.VirtualInterfacePlugException.
-        """
-        network_info = instance.get_network_info()
-        events = []
-        deadline = CONF.vif_plugging_timeout
-        if deadline and network_info:
-            events = network_info.get_bind_time_events(migration)
-            if events:
-                LOG.debug('Will wait for bind-time events: %s', events)
-        error_cb = self._neutron_failed_migration_callback
-        try:
-            with self.virtapi.wait_for_instance_event(instance, events,
-                                                      deadline=deadline,
-                                                      error_callback=error_cb):
-                # NOTE(hanrong): we need to change migration.dest_compute to
-                # source host temporarily.
-                # "network_api.migrate_instance_finish" will setup the network
-                # for the instance on the destination host. For revert resize,
-                # the instance will back to the source host, the setup of the
-                # network for instance should be on the source host. So set
-                # the migration.dest_compute to source host at here.
-                with utils.temporary_mutation(
-                        migration, dest_compute=migration.source_compute):
-                    self.network_api.migrate_instance_finish(
-                        context, instance, migration, provider_mappings)
-        except eventlet.timeout.Timeout:
-            with excutils.save_and_reraise_exception():
-                LOG.error('Timeout waiting for Neutron events: %s', events,
-                          instance=instance)
-
     @wrap_exception()
     @reverts_task_state
     @wrap_instance_event(prefix='compute')
@@ -4997,8 +5462,18 @@ class ComputeManager(manager.Manager):
 
             self.network_api.setup_networks_on_host(context, instance,
                                                     migration.source_compute)
-            self._finish_revert_resize_network_migrate_finish(
-                context, instance, migration, provider_mappings)
+            # NOTE(hanrong): we need to change migration.dest_compute to
+            # source host temporarily. "network_api.migrate_instance_finish"
+            # will setup the network for the instance on the destination host.
+            # For revert resize, the instance will back to the source host, the
+            # setup of the network for instance should be on the source host.
+            # So set the migration.dest_compute to source host at here.
+            with utils.temporary_mutation(
+                    migration, dest_compute=migration.source_compute):
+                self.network_api.migrate_instance_finish(context,
+                                                         instance,
+                                                         migration,
+                                                         provider_mappings)
             network_info = self.network_api.get_instance_nw_info(context,
                                                                  instance)
 
@@ -5075,8 +5550,7 @@ class ComputeManager(manager.Manager):
             # the provider mappings. If the instance has ports with
             # resource request then the port update will fail in
             # _update_port_binding_for_instance() called via
-            # _finish_revert_resize_network_migrate_finish() in
-            # finish_revert_resize.
+            # migrate_instance_finish() in finish_revert_resize.
             provider_mappings = None
         return provider_mappings
 
@@ -5161,10 +5635,12 @@ class ComputeManager(manager.Manager):
 
         if provider_mapping:
             try:
-                compute_utils.\
-                    update_pci_request_spec_with_allocated_interface_name(
-                        context, self.reportclient,
-                        instance.pci_requests.requests, provider_mapping)
+                compute_utils.update_pci_request_with_placement_allocations(
+                    context,
+                    self.reportclient,
+                    instance.pci_requests.requests,
+                    provider_mapping,
+                )
             except (exception.AmbiguousResourceProviderForPCIRequest,
                     exception.UnexpectedResourceProviderNameForPCIRequest
                     ) as e:
@@ -5241,7 +5717,7 @@ class ComputeManager(manager.Manager):
         # in case _prep_resize fails.
         instance_state = instance.vm_state
         with self._error_out_instance_on_exception(
-                context, instance, instance_state=instance_state),\
+                context, instance, instance_state=instance_state), \
                 errors_out_migration_ctxt(migration):
 
             self._send_prep_resize_notifications(
@@ -5267,7 +5743,7 @@ class ComputeManager(manager.Manager):
                                   clean_shutdown)
             except exception.BuildAbortException:
                 # NOTE(gibi): We failed
-                # update_pci_request_spec_with_allocated_interface_name so
+                # update_pci_request_with_placement_allocations so
                 # there is no reason to re-schedule. Just revert the allocation
                 # and fail the migration.
                 with excutils.save_and_reraise_exception():
@@ -5398,7 +5874,7 @@ class ComputeManager(manager.Manager):
                   'host (%s).', self.host, instance=instance)
         self._send_prep_resize_notifications(
             ctxt, instance, fields.NotificationPhase.START, flavor)
-        # TODO(mriedem): update_pci_request_spec_with_allocated_interface_name
+        # TODO(mriedem): update_pci_request_with_placement_allocations
         # should be called here if the request spec has request group mappings,
         # e.g. for things like QoS ports with resource requests. Do it outside
         # the try/except so if it raises BuildAbortException we do not attempt
@@ -5635,6 +6111,11 @@ class ComputeManager(manager.Manager):
 
             instance.host = migration.dest_compute
             instance.node = migration.dest_node
+            # NOTE(danms): This could fail if the dest_compute_id was not set
+            # by the sending host *and* migration.dest_node does not point to
+            # a legit node on the dest_compute. Since that would be very bad,
+            # let the ComputeHostNotFound raise from here.
+            instance.compute_id = migration.get_dest_compute_id()
             # NOTE(gibi): as the instance now tracked on the destination we
             # have to make sure that the source compute resource track can
             # track this instance as a migration. For that the resource tracker
@@ -5748,8 +6229,8 @@ class ComputeManager(manager.Manager):
     def _finish_resize(self, context, instance, migration, disk_info,
                        image_meta, bdms, request_spec):
         resize_instance = False  # indicates disks have been resized
-        old_instance_type_id = migration['old_instance_type_id']
-        new_instance_type_id = migration['new_instance_type_id']
+        old_instance_type_id = migration.old_instance_type_id
+        new_instance_type_id = migration.new_instance_type_id
         old_flavor = instance.flavor  # the current flavor is now old
         # NOTE(mriedem): Get the old_vm_state so we know if we should
         # power on the instance. If old_vm_state is not set we need to default
@@ -6020,7 +6501,12 @@ class ComputeManager(manager.Manager):
         # Setting the host/node values will make the ResourceTracker continue
         # to track usage for this instance on this host.
         instance.host = migration.dest_compute
-        instance.node = migration.dest_node
+        # NOTE(danms): This could fail if we somehow ended up on the wrong
+        # host without the desired node. That's a big problem, so let the
+        # ComputeHostNotFound raise from here.
+        cn = self.rt.get_node_by_name(migration.dest_node)
+        instance.compute_id = cn.id
+        instance.node = cn.hypervisor_hostname
         instance.save(expected_task_state=task_states.RESIZE_FINISH)
 
         # Broadcast to all schedulers that the instance is on this host.
@@ -6515,6 +7001,9 @@ class ComputeManager(manager.Manager):
         current_power_state = self._get_power_state(instance)
         network_info = self.network_api.get_instance_nw_info(context, instance)
 
+        ports_id = [vif['id'] for vif in network_info]
+        self.network_api.unbind_ports(context, ports_id, detach=False)
+
         block_device_info = self._get_instance_block_device_info(context,
                                                                  instance,
                                                                  bdms=bdms)
@@ -6540,9 +7029,9 @@ class ComputeManager(manager.Manager):
 
         instance.power_state = current_power_state
         # NOTE(mriedem): The vm_state has to be set before updating the
-        # resource tracker, see vm_states.ALLOW_RESOURCE_REMOVAL. The host/node
-        # values cannot be nulled out until after updating the resource tracker
-        # though.
+        # resource tracker, see vm_states.allow_resource_removal(). The
+        # host/node values cannot be nulled out until after updating the
+        # resource tracker though.
         instance.vm_state = vm_states.SHELVED_OFFLOADED
         instance.task_state = None
         instance.save(expected_task_state=[task_states.SHELVING,
@@ -6645,12 +7134,12 @@ class ComputeManager(manager.Manager):
 
         try:
             if provider_mappings:
-                update = (
-                    compute_utils.
-                        update_pci_request_spec_with_allocated_interface_name)
-                update(
-                    context, self.reportclient, instance.pci_requests.requests,
-                    provider_mappings)
+                compute_utils.update_pci_request_with_placement_allocations(
+                    context,
+                    self.reportclient,
+                    instance.pci_requests.requests,
+                    provider_mappings,
+                )
 
             accel_info = []
             if accel_uuids:
@@ -6683,6 +7172,10 @@ class ComputeManager(manager.Manager):
             with excutils.save_and_reraise_exception(logger=LOG):
                 LOG.exception('Instance failed to spawn',
                               instance=instance)
+                # Set the image_ref back to initial image_ref because instance
+                # object might have been saved with image['id']
+                # https://bugs.launchpad.net/nova/+bug/1934094
+                instance.image_ref = shelved_image_ref
                 # Cleanup allocations created by the scheduler on this host
                 # since we failed to spawn the instance. We do this both if
                 # the instance claim failed with ComputeResourcesUnavailable
@@ -7463,7 +7956,16 @@ class ComputeManager(manager.Manager):
         # NOTE(lyarwood): Update the BDM with the modified new_cinfo and
         # correct volume_id returned by Cinder.
         save_volume_id = comp_ret['save_volume_id']
+
+        # NOTE(lyarwood): Overwrite the possibly stale serial and volume_id in
+        # the connection_info with the volume_id returned from Cinder. This
+        # could be the case during a volume migration where the new_cinfo here
+        # refers to the temporary volume *before* Cinder renames it to the
+        # original volume UUID at the end of the migration.
         new_cinfo['serial'] = save_volume_id
+        new_cinfo['volume_id'] = save_volume_id
+        if 'data' in new_cinfo:
+            new_cinfo['data']['volume_id'] = save_volume_id
         values = {
             'connection_info': jsonutils.dumps(new_cinfo),
             'source_type': 'volume',
@@ -7617,10 +8119,10 @@ class ComputeManager(manager.Manager):
         if not pci_reqs.requests:
             return None
 
-        devices = self.rt.claim_pci_devices(
-            context, pci_reqs, instance.numa_topology)
-
-        if not devices:
+        try:
+            devices = self.rt.claim_pci_devices(
+                context, pci_reqs, instance.numa_topology)
+        except exception.PciDeviceRequestFailed:
             LOG.info('Failed to claim PCI devices during interface attach '
                      'for PCI request %s', pci_reqs, instance=instance)
             raise exception.InterfaceAttachPciClaimFailed(
@@ -7668,7 +8170,7 @@ class ComputeManager(manager.Manager):
         compute_node_uuid = objects.ComputeNode.get_by_nodename(
             context, instance.node).uuid
         # we can have multiple request groups, it would be enough to restrict
-        # only one of them to the compute tree but for symetry we restrict
+        # only one of them to the compute tree but for symmetry we restrict
         # all of them
         for request_group in request_groups:
             request_group.in_tree = compute_node_uuid
@@ -7717,17 +8219,17 @@ class ComputeManager(manager.Manager):
                 instance_uuid=instance.uuid) from e
 
         try:
-            update = (
-                compute_utils.
-                    update_pci_request_spec_with_allocated_interface_name)
-            update(
-                context, self.reportclient, pci_reqs.requests,
-                provider_mappings)
+            compute_utils.update_pci_request_with_placement_allocations(
+                context,
+                self.reportclient,
+                pci_reqs.requests,
+                provider_mappings,
+            )
         except (
             exception.AmbiguousResourceProviderForPCIRequest,
             exception.UnexpectedResourceProviderNameForPCIRequest
         ):
-            # These are programing errors. So we clean up an re-raise to let
+            # These are programming errors. So we clean up an re-raise to let
             # the request fail
             with excutils.save_and_reraise_exception():
                 self.reportclient.remove_resources_from_instance_allocation(
@@ -8052,7 +8554,7 @@ class ComputeManager(manager.Manager):
                 LOG.info('Destination was ready for NUMA live migration, '
                          'but source is either too old, or is set to an '
                          'older upgrade level.', instance=instance)
-            if self.network_api.supports_port_binding_extension(ctxt):
+            if self.network_api.has_port_binding_extension(ctxt):
                 # Create migrate_data vifs if not provided by driver.
                 if 'vifs' not in migrate_data:
                     migrate_data.vifs = (
@@ -8187,7 +8689,7 @@ class ComputeManager(manager.Manager):
             action=fields.NotificationAction.LIVE_MIGRATION_PRE,
             phase=fields.NotificationPhase.START, bdms=bdms)
 
-        connector = self.driver.get_volume_connector(instance)
+        connector = None
         try:
             for bdm in bdms:
                 if bdm.is_volume and bdm.attachment_id is not None:
@@ -8201,6 +8703,8 @@ class ComputeManager(manager.Manager):
                     #
                     # Also note that attachment_update is not needed as we
                     # are providing the connector in the create call.
+                    if connector is None:
+                        connector = self.driver.get_volume_connector(instance)
                     attach_ref = self.volume_api.attachment_create(
                         context, bdm.volume_id, bdm.instance_uuid,
                         connector=connector, mountpoint=bdm.device_name)
@@ -8287,8 +8791,8 @@ class ComputeManager(manager.Manager):
         return migrate_data
 
     @staticmethod
-    def _neutron_failed_migration_callback(event_name, instance):
-        msg = ('Neutron reported failure during migration '
+    def _neutron_failed_live_migration_callback(event_name, instance):
+        msg = ('Neutron reported failure during live migration '
                'with %(event)s for instance %(uuid)s')
         msg_args = {'event': event_name, 'uuid': instance.uuid}
         if CONF.vif_plugging_is_fatal:
@@ -8334,7 +8838,8 @@ class ComputeManager(manager.Manager):
         migrate_data.migration = migration
         self._rollback_live_migration(context, instance, dest,
                                       migrate_data=migrate_data,
-                                      source_bdms=source_bdms)
+                                      source_bdms=source_bdms,
+                                      pre_live_migration=True)
 
     def _do_pre_live_migration_from_source(self, context, dest, instance,
                                            block_migration, migration,
@@ -8384,7 +8889,7 @@ class ComputeManager(manager.Manager):
                 disk = None
 
             deadline = CONF.vif_plugging_timeout
-            error_cb = self._neutron_failed_migration_callback
+            error_cb = self._neutron_failed_live_migration_callback
             # In order to avoid a race with the vif plugging that the virt
             # driver does on the destination host, we register our events
             # to wait for before calling pre_live_migration. Then if the
@@ -8492,8 +8997,9 @@ class ComputeManager(manager.Manager):
         # host attachment. We fetch BDMs before that to retain connection_info
         # and attachment_id relating to the source host for post migration
         # cleanup.
-        post_live_migration = functools.partial(self._post_live_migration,
-                                                source_bdms=source_bdms)
+        post_live_migration = functools.partial(
+            self._post_live_migration_update_host, source_bdms=source_bdms
+            )
         rollback_live_migration = functools.partial(
             self._rollback_live_migration, source_bdms=source_bdms)
 
@@ -8537,7 +9043,8 @@ class ComputeManager(manager.Manager):
         # in order to be able to track and abort it in the future.
         self._waiting_live_migrations[instance.uuid] = (None, None)
         try:
-            future = self._live_migration_executor.submit(
+            future = nova.utils.pass_context(
+                self._live_migration_executor.submit,
                 self._do_live_migration, context, dest, instance,
                 block_migration, migration, migrate_data)
             self._waiting_live_migrations[instance.uuid] = (migration, future)
@@ -8620,15 +9127,41 @@ class ComputeManager(manager.Manager):
             migration, future = (
                 self._waiting_live_migrations.pop(instance.uuid))
             if future and future.cancel():
-                # If we got here, we've successfully aborted the queued
-                # migration and _do_live_migration won't run so we need
-                # to set the migration status to cancelled and send the
-                # notification. If Future.cancel() fails, it means
-                # _do_live_migration is running and the migration status
-                # is preparing, and _do_live_migration() itself will attempt
-                # to pop the queued migration, hit a KeyError, and rollback,
-                # set the migration to cancelled and send the
-                # live.migration.abort.end notification.
+                # If we got here, we've successfully dropped a queued
+                # migration from the queue, so _do_live_migration won't run
+                # and we only need to revert minor changes introduced by Nova
+                # control plane (port bindings, resource allocations and
+                # instance's PCI devices), restore VM's state, set the
+                # migration's status to cancelled and send the notification.
+                # If Future.cancel() fails, it means _do_live_migration is
+                # running and the migration status is preparing, and
+                # _do_live_migration() itself will attempt to pop the queued
+                # migration, hit a KeyError, and rollback, set the migration
+                # to cancelled and send the live.migration.abort.end
+                # notification.
+                self._revert_allocation(context, instance, migration)
+                try:
+                    # This call will delete any inactive destination host
+                    # port bindings.
+                    self.network_api.setup_networks_on_host(
+                        context, instance, host=migration.dest_compute,
+                        teardown=True)
+                except exception.PortBindingDeletionFailed as e:
+                    # Removing the inactive port bindings from the destination
+                    # host is not critical so just log an error but don't fail.
+                    LOG.error(
+                        'Network cleanup failed for destination host %s '
+                        'during live migration rollback. You may need to '
+                        'manually clean up resources in the network service. '
+                        'Error: %s', migration.dest_compute, str(e))
+                except Exception:
+                    with excutils.save_and_reraise_exception():
+                        LOG.exception(
+                            'An error occurred while cleaning up networking '
+                            'during live migration rollback.',
+                            instance=instance)
+                instance.task_state = None
+                instance.save(expected_task_state=[task_states.MIGRATING])
                 self._set_migration_status(migration, 'cancelled')
         except KeyError:
             migration = objects.Migration.get_by_id(context, migration_id)
@@ -8677,7 +9210,7 @@ class ComputeManager(manager.Manager):
             # must be deleted for preparing next block migration
             # must be deleted for preparing next live migration w/o shared
             # storage
-            # vpmem must be cleanped
+            # vpmem must be cleaned
             do_cleanup = not migrate_data.is_shared_instance_path or has_vpmem
             destroy_disks = not migrate_data.is_shared_block_storage
         elif isinstance(migrate_data, migrate_data_obj.HyperVLiveMigrateData):
@@ -8698,7 +9231,7 @@ class ComputeManager(manager.Manager):
             volumes with connection_info set for the source host
         """
         # Detaching volumes.
-        connector = self.driver.get_volume_connector(instance)
+        connector = None
         for bdm in source_bdms:
             if bdm.is_volume:
                 # Detaching volumes is a call to an external API that can fail.
@@ -8718,6 +9251,9 @@ class ComputeManager(manager.Manager):
                         # remove the volume connection without detaching from
                         # hypervisor because the instance is not running
                         # anymore on the current host
+                        if connector is None:
+                            connector = self.driver.get_volume_connector(
+                                instance)
                         self.volume_api.terminate_connection(context,
                                                              bdm.volume_id,
                                                              connector)
@@ -8739,6 +9275,44 @@ class ComputeManager(manager.Manager):
                                   bdm.attachment_id, self.host,
                                   str(e), instance=instance)
 
+    # TODO(sean-k-mooney): add typing
+    def _post_live_migration_update_host(
+        self, ctxt, instance, dest, block_migration=False,
+        migrate_data=None, source_bdms=None
+    ):
+        try:
+            self._post_live_migration(
+                ctxt, instance, dest, block_migration, migrate_data,
+                source_bdms)
+        except Exception:
+            # Restore the instance object
+            compute_node = None
+            node_name = None
+            try:
+                # get node name of compute, where instance will be
+                # running after migration, that is destination host
+                compute_node = self._get_compute_info(ctxt, dest)
+                node_name = compute_node.hypervisor_hostname
+            except exception.ComputeHostNotFound:
+                LOG.exception('Failed to get compute_info for %s', dest)
+
+            # we can never rollback from post live migration and we can only
+            # get here if the instance is running on the dest so we ensure
+            # the instance.host is set correctly and reraise the original
+            # exception unmodified.
+            if instance.host != dest:
+                # apply saves the new fields while drop actually removes the
+                # migration context from the instance, so migration persists.
+                instance.apply_migration_context()
+                instance.drop_migration_context()
+                instance.host = dest
+                instance.task_state = None
+                instance.node = node_name
+                instance.compute_id = compute_node and compute_node.id or None
+                instance.progress = 0
+                instance.save()
+            raise
+
     @wrap_exception()
     @wrap_instance_fault
     def _post_live_migration(self, ctxt, instance, dest,
@@ -8750,7 +9324,7 @@ class ComputeManager(manager.Manager):
         and mainly updating database record.
 
         :param ctxt: security context
-        :param instance: instance dict
+        :param instance: instance object
         :param dest: destination host
         :param block_migration: if true, prepare for block migration
         :param migrate_data: if not None, it is a dict which has data
@@ -8764,40 +9338,51 @@ class ComputeManager(manager.Manager):
         LOG.info('_post_live_migration() is started..',
                  instance=instance)
 
-        # Cleanup source host post live-migration
-        block_device_info = self._get_instance_block_device_info(
-                            ctxt, instance, bdms=source_bdms)
-        self.driver.post_live_migration(ctxt, instance, block_device_info,
-                                        migrate_data)
+        # NOTE(artom) The ordering and exception handling are important here.
+        # We want to immediately activate the port bindings on the destination
+        # host to minimize network downtime. This happens in
+        # migrate_instance_start(). It's also crucial that we call
+        # _post_live_migration_remove_source_vol_connections() to clean up
+        # source volume connections and prevent potential data leaks. We
+        # therefore activate the port bindings in a try block, and, regardless
+        # of any exceptions during that process, clean up volume connections in
+        # a finally block.
+        try:
+            # NOTE(artom) At this point in time we have not bound the ports to
+            # the destination host yet (this happens in
+            # migrate_instance_start() below). Therefore, the "old" source
+            # network info that's still in the instance info cache is safe to
+            # use here, since it'll be used below during
+            # driver.post_live_migration_at_source() to unplug the VIFs on the
+            # source.
+            network_info = instance.get_network_info()
 
-        # Disconnect volumes from this (the source) host.
-        self._post_live_migration_remove_source_vol_connections(
-            ctxt, instance, source_bdms)
+            self._notify_about_instance_usage(ctxt, instance,
+                                              "live_migration._post.start",
+                                              network_info=network_info,
+                                              best_effort=True)
+            compute_utils.notify_about_instance_action(
+                ctxt, instance, self.host,
+                action=fields.NotificationAction.LIVE_MIGRATION_POST,
+                phase=fields.NotificationPhase.START, best_effort=True)
 
-        # NOTE(artom) At this point in time we have not bound the ports to the
-        # destination host yet (this happens in migrate_instance_start()
-        # below). Therefore, the "old" source network info that's still in the
-        # instance info cache is safe to use here, since it'll be used below
-        # during driver.post_live_migration_at_source() to unplug the VIFs on
-        # the source.
-        network_info = instance.get_network_info()
+            migration = objects.Migration(
+                source_compute=self.host, dest_compute=dest,
+            )
+            # For neutron, migrate_instance_start will activate the destination
+            # host port bindings, if there are any created by conductor before
+            # live migration started.
+            self.network_api.migrate_instance_start(ctxt, instance, migration)
+        finally:
+            # Cleanup source host post live-migration
+            block_device_info = self._get_instance_block_device_info(
+                                ctxt, instance, bdms=source_bdms)
+            self.driver.post_live_migration(ctxt, instance, block_device_info,
+                                            migrate_data)
 
-        self._notify_about_instance_usage(ctxt, instance,
-                                          "live_migration._post.start",
-                                          network_info=network_info)
-        compute_utils.notify_about_instance_action(
-            ctxt, instance, self.host,
-            action=fields.NotificationAction.LIVE_MIGRATION_POST,
-            phase=fields.NotificationPhase.START)
-
-        migration = {'source_compute': self.host,
-                     'dest_compute': dest, }
-        # For neutron, migrate_instance_start will activate the destination
-        # host port bindings, if there are any created by conductor before live
-        # migration started.
-        self.network_api.migrate_instance_start(ctxt,
-                                                instance,
-                                                migration)
+            # Disconnect volumes from this (the source) host.
+            self._post_live_migration_remove_source_vol_connections(
+                ctxt, instance, source_bdms)
 
         destroy_vifs = False
         try:
@@ -8959,6 +9544,7 @@ class ComputeManager(manager.Manager):
         finally:
             # Restore instance state and update host
             current_power_state = self._get_power_state(instance)
+            compute_node = None
             node_name = None
             prev_host = instance.host
             try:
@@ -8981,6 +9567,7 @@ class ComputeManager(manager.Manager):
                 instance.power_state = current_power_state
                 instance.task_state = None
                 instance.node = node_name
+                instance.compute_id = compute_node and compute_node.id or None
                 instance.progress = 0
                 instance.save(expected_task_state=task_states.MIGRATING)
 
@@ -9062,7 +9649,8 @@ class ComputeManager(manager.Manager):
     def _rollback_live_migration(self, context, instance,
                                  dest, migrate_data=None,
                                  migration_status='failed',
-                                 source_bdms=None):
+                                 source_bdms=None,
+                                 pre_live_migration=False):
         """Recovers Instance/volume state from migrating -> running.
 
         :param context: security context
@@ -9112,8 +9700,14 @@ class ComputeManager(manager.Manager):
         #                  for nova-network)
         # NOTE(mriedem): This is a no-op for neutron.
         self.network_api.setup_networks_on_host(context, instance, self.host)
-        self.driver.rollback_live_migration_at_source(context, instance,
-                                                      migrate_data)
+
+        # NOTE(erlon): We should make sure that rollback_live_migration_at_src
+        # is not called in the pre_live_migration rollback as that will trigger
+        # the src host to re-attach interfaces which were not detached
+        # previously.
+        if not pre_live_migration:
+            self.driver.rollback_live_migration_at_source(context, instance,
+                                                          migrate_data)
 
         # NOTE(lyarwood): Fetch the current list of BDMs, disconnect any
         # connected volumes from the dest and delete any volume attachments
@@ -9482,7 +10076,7 @@ class ComputeManager(manager.Manager):
         def _set_migration_to_error(migration, reason, **kwargs):
             LOG.warning("Setting migration %(migration_id)s to error: "
                         "%(reason)s",
-                        {'migration_id': migration['id'], 'reason': reason},
+                        {'migration_id': migration.id, 'reason': reason},
                         **kwargs)
             migration.status = 'error'
             migration.save()
@@ -9575,7 +10169,7 @@ class ComputeManager(manager.Manager):
                 if instance.flavor.extra_specs.get('accel:device_profile'):
                     # TODO(brinzhang): After cyborg support batch query ARQs
                     # for more than one instances, we will improve efficiency
-                    # with this implemention.
+                    # with this implementation.
                     accel_uuids = cyclient.get_arq_uuids_for_instance(instance)
                 self.shelve_offload_instance(
                     context, instance, clean_shutdown=False,
@@ -9748,7 +10342,9 @@ class ComputeManager(manager.Manager):
             else:
                 LOG.debug('Triggering sync for uuid %s', uuid)
                 self._syncs_in_progress[uuid] = True
-                self._sync_power_pool.spawn_n(_sync, db_instance)
+                nova.utils.pass_context(self._sync_power_pool.spawn_n,
+                                        _sync,
+                                        db_instance)
 
     def _query_driver_power_state_and_sync(self, context, db_instance):
         if db_instance.task_state is not None:
@@ -10018,6 +10614,27 @@ class ComputeManager(manager.Manager):
             # (e.g. disable the service).
             with excutils.save_and_reraise_exception():
                 LOG.exception("ReshapeNeeded exception is unexpected here!")
+        except exception.PlacementPciException:
+            # If we are at startup and the Placement PCI inventory handling
+            # failed then probably there is a configuration error. Propagate
+            # the error up to kill the service.
+            if startup:
+                raise
+            # If we are not at startup then we can assume that the
+            # configuration was correct at startup so the error is probably
+            # transient. Anyhow we cannot kill the service any more so just
+            # log the error and continue.
+            LOG.exception(
+                "Error updating PCI resources for node %(node)s.",
+                {'node': nodename})
+        except exception.InvalidConfiguration as e:
+            if startup:
+                # If this happens during startup, we need to let it raise to
+                # abort our service startup.
+                raise
+            else:
+                LOG.error("Error updating resources for node %s: %s",
+                          nodename, e)
         except Exception:
             LOG.exception("Error updating resources for node %(node)s.",
                           {'node': nodename})
@@ -10807,6 +11424,18 @@ class ComputeManager(manager.Manager):
             profile['pci_slot'] = pci_dev.address
             profile['pci_vendor_info'] = ':'.join([pci_dev.vendor_id,
                                                    pci_dev.product_id])
+            if profile.get('card_serial_number'):
+                # Assume it is there since Nova makes sure that PCI devices
+                # tagged as remote-managed have a serial in PCI VPD.
+                profile['card_serial_number'] = pci_dev.card_serial_number
+            if profile.get('pf_mac_address'):
+                profile['pf_mac_address'] = pci_dev.sriov_cap['pf_mac_address']
+            if profile.get('vf_num'):
+                profile['vf_num'] = pci_dev.sriov_cap['vf_num']
+
+            if pci_dev.mac_address:
+                profile['device_mac_address'] = pci_dev.mac_address
+
             mig_vif.profile = profile
             LOG.debug("Updating migrate VIF profile for port %(port_id)s:"
                       "%(profile)s", {'port_id': port_id,
@@ -10922,7 +11551,7 @@ class _ComputeV5Proxy(object):
             bdms, recreate, on_shared_storage,
             preserve_ephemeral, migration,
             scheduled_node, limits, request_spec,
-            accel_uuids)
+            accel_uuids, False, None)
 
     # 5.13 support for optional accel_uuids argument
     def shelve_instance(self, context, instance, image_id,

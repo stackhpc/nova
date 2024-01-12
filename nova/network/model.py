@@ -106,6 +106,7 @@ VNIC_TYPE_VIRTIO_FORWARDER = 'virtio-forwarder'
 VNIC_TYPE_VDPA = 'vdpa'
 VNIC_TYPE_ACCELERATOR_DIRECT = 'accelerator-direct'
 VNIC_TYPE_ACCELERATOR_DIRECT_PHYSICAL = 'accelerator-direct-physical'
+VNIC_TYPE_REMOTE_MANAGED = "remote-managed"
 
 # Define list of ports which needs pci request.
 # Note: The macvtap port needs a PCI request as it is a tap interface
@@ -121,19 +122,20 @@ VNIC_TYPE_ACCELERATOR_DIRECT_PHYSICAL = 'accelerator-direct-physical'
 # selected compute node.
 VNIC_TYPES_SRIOV = (
     VNIC_TYPE_DIRECT, VNIC_TYPE_MACVTAP, VNIC_TYPE_DIRECT_PHYSICAL,
-    VNIC_TYPE_VIRTIO_FORWARDER, VNIC_TYPE_VDPA)
+    VNIC_TYPE_VIRTIO_FORWARDER, VNIC_TYPE_VDPA, VNIC_TYPE_REMOTE_MANAGED
+)
 
 # Define list of ports which are passthrough to the guest
 # and need a special treatment on snapshot and suspend/resume
-VNIC_TYPES_DIRECT_PASSTHROUGH = (VNIC_TYPE_DIRECT,
-                                 VNIC_TYPE_DIRECT_PHYSICAL,
-                                 VNIC_TYPE_ACCELERATOR_DIRECT,
-                                 VNIC_TYPE_ACCELERATOR_DIRECT_PHYSICAL)
+VNIC_TYPES_DIRECT_PASSTHROUGH = (
+    VNIC_TYPE_DIRECT, VNIC_TYPE_DIRECT_PHYSICAL,
+    VNIC_TYPE_ACCELERATOR_DIRECT, VNIC_TYPE_ACCELERATOR_DIRECT_PHYSICAL,
+    VNIC_TYPE_REMOTE_MANAGED, VNIC_TYPE_VDPA
+)
 
 # Define list of ports which contains devices managed by cyborg.
 VNIC_TYPES_ACCELERATOR = (
-                          VNIC_TYPE_ACCELERATOR_DIRECT,
-                          VNIC_TYPE_ACCELERATOR_DIRECT_PHYSICAL
+    VNIC_TYPE_ACCELERATOR_DIRECT, VNIC_TYPE_ACCELERATOR_DIRECT_PHYSICAL
 )
 
 # Constants for the 'vif_model' values
@@ -186,6 +188,7 @@ NIC_NAME_LEN = 14
 
 class Model(dict):
     """Defines some necessary structures for most of the network models."""
+
     def __repr__(self):
         return jsonutils.dumps(self)
 
@@ -202,6 +205,7 @@ class Model(dict):
 
 class IP(Model):
     """Represents an IP address in Nova."""
+
     def __init__(self, address=None, type=None, **kwargs):
         super(IP, self).__init__()
 
@@ -242,6 +246,7 @@ class IP(Model):
 
 class FixedIP(IP):
     """Represents a Fixed IP address in Nova."""
+
     def __init__(self, floating_ips=None, **kwargs):
         super(FixedIP, self).__init__(**kwargs)
         self['floating_ips'] = floating_ips or []
@@ -273,6 +278,7 @@ class FixedIP(IP):
 
 class Route(Model):
     """Represents an IP Route in Nova."""
+
     def __init__(self, cidr=None, gateway=None, interface=None, **kwargs):
         super(Route, self).__init__()
 
@@ -292,6 +298,7 @@ class Route(Model):
 
 class Subnet(Model):
     """Represents a Subnet in Nova."""
+
     def __init__(self, cidr=None, dns=None, gateway=None, ips=None,
                  routes=None, **kwargs):
         super(Subnet, self).__init__()
@@ -343,6 +350,7 @@ class Subnet(Model):
 
 class Network(Model):
     """Represents a Network in Nova."""
+
     def __init__(self, id=None, bridge=None, label=None,
                  subnets=None, **kwargs):
         super(Network, self).__init__()
@@ -397,6 +405,7 @@ class VIF8021QbhParams(Model):
 
 class VIF(Model):
     """Represents a Virtual Interface in Nova."""
+
     def __init__(self, id=None, address=None, network=None, type=None,
                  details=None, devname=None, ovs_interfaceid=None,
                  qbh_params=None, qbg_params=None, active=False,
@@ -478,17 +487,6 @@ class VIF(Model):
                     'ips': ips}
         return []
 
-    def has_bind_time_event(self, migration):
-        """Returns whether this VIF's network-vif-plugged external event will
-        be sent by Neutron at "bind-time" - in other words, as soon as the port
-        binding is updated. This is in the context of updating the port binding
-        to a host that already has the instance in a shutoff state - in
-        practice, this means reverting either a cold migration or a
-        non-same-host resize.
-        """
-        return (self.is_hybrid_plug_enabled() and not
-                migration.is_same_host())
-
     @property
     def has_live_migration_plug_time_event(self):
         """Returns whether this VIF's network-vif-plugged external event will
@@ -557,26 +555,12 @@ class NetworkInfo(list):
     def json(self):
         return jsonutils.dumps(self)
 
-    def get_bind_time_events(self, migration):
-        """Returns a list of external events for any VIFs that have
-        "bind-time" events during cold migration.
-        """
-        return [('network-vif-plugged', vif['id'])
-                for vif in self if vif.has_bind_time_event(migration)]
-
     def get_live_migration_plug_time_events(self):
         """Returns a list of external events for any VIFs that have
         "plug-time" events during live migration.
         """
         return [('network-vif-plugged', vif['id'])
                 for vif in self if vif.has_live_migration_plug_time_event]
-
-    def get_plug_time_events(self, migration):
-        """Returns a list of external events for any VIFs that have
-        "plug-time" events during cold migration.
-        """
-        return [('network-vif-plugged', vif['id'])
-                for vif in self if not vif.has_bind_time_event(migration)]
 
     def has_port_with_allocation(self):
         return any(vif.has_allocation() for vif in self)

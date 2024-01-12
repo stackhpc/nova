@@ -13,10 +13,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 import os_resource_classes as orc
 import os_traits as ost
-
 
 from nova import conf
 from nova.db import constants as db_const
@@ -190,7 +190,6 @@ class LibvirtReportNoSevTraitsTests(LibvirtReportTraitsTestBase):
 class LibvirtReportSevTraitsTests(LibvirtReportTraitsTestBase):
     STUB_INIT_HOST = False
 
-    @test.patch_exists(SEV_KERNEL_PARAM_FILE, True)
     @test.patch_open(SEV_KERNEL_PARAM_FILE, "1\n")
     @mock.patch.object(
         fakelibvirt.virConnect, '_domain_capability_features',
@@ -198,7 +197,8 @@ class LibvirtReportSevTraitsTests(LibvirtReportTraitsTestBase):
     def setUp(self):
         super(LibvirtReportSevTraitsTests, self).setUp()
         self.flags(num_memory_encrypted_guests=16, group='libvirt')
-        self.start_compute()
+        with test.patch_exists(SEV_KERNEL_PARAM_FILE, True):
+            self.start_compute()
 
     def test_sev_trait_on_off(self):
         """Test that the compute service reports the SEV trait in the list of

@@ -148,6 +148,12 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
                     reason='dev_type=%s not supported in version %s' % (
                         dev_type, target_version))
 
+    def __repr__(self):
+        return (
+            f'PciDevice(address={self.address}, '
+            f'compute_node_id={self.compute_node_id})'
+        )
+
     def update_device(self, dev_dict):
         """Sync the content from device dictionary to device object.
 
@@ -175,6 +181,9 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
                 # NOTE(ralonsoh): list of parameters currently added to
                 # "extra_info" dict:
                 #     - "capabilities": dict of (strings/list of strings)
+                #     - "parent_ifname": the netdev name of the parent (PF)
+                #        device of a VF
+                #     - "mac_address": the MAC address of the PF
                 extra_info = self.extra_info
                 data = v if isinstance(v, str) else jsonutils.dumps(v)
                 extra_info.update({k: data})
@@ -189,6 +198,7 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
         self.parent_device = None
         self.child_devices = []
 
+    @base.lazy_load_counter
     def obj_load_attr(self, attr):
         if attr in ['extra_info']:
             # NOTE(danms): extra_info used to be defaulted during init,
@@ -206,11 +216,11 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
         return not (self == other)
 
     @classmethod
-    def populate_dev_uuids(cls, context, count):
+    def populate_dev_uuids(cls, context, max_count):
         @db.pick_context_manager_reader
         def get_devs_no_uuid(context):
             return context.session.query(db_models.PciDevice).\
-                    filter_by(uuid=None).limit(count).all()
+                    filter_by(uuid=None).limit(max_count).all()
 
         db_devs = get_devs_no_uuid(context)
 
@@ -346,10 +356,40 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
             # Update PF status to CLAIMED if all of it dependants are free
             # and set their status to UNCLAIMABLE
             vfs_list = self.child_devices
-            if not all([vf.is_available() for vf in vfs_list]):
-                raise exception.PciDeviceVFInvalidStatus(
-                    compute_node_id=self.compute_node_id,
-                    address=self.address)
+            non_free_dependants = [
+                vf for vf in vfs_list if not vf.is_available()]
+            if non_free_dependants:
+                # NOTE(gibi): There should not be any dependent devices that
+                # are UNCLAIMABLE or UNAVAILABLE as the parent is AVAILABLE,
+                # but we got reports in bug 1969496 that this inconsistency
+                # can happen. So check if the only non-free devices are in
+                # state UNCLAIMABLE or UNAVAILABLE then we log a warning but
+                # allow to claim the parent.
+                actual_statuses = {
+                    child.status for child in non_free_dependants}
+                allowed_non_free_statues = {
+                    fields.PciDeviceStatus.UNCLAIMABLE,
+                    fields.PciDeviceStatus.UNAVAILABLE,
+                }
+                if actual_statuses - allowed_non_free_statues == set():
+                    LOG.warning(
+                        "Some child device of parent %s is in an inconsistent "
+                        "state. If you can reproduce this warning then please "
+                        "report a bug at "
+                        "https://bugs.launchpad.net/nova/+filebug with "
+                        "reproduction steps. Inconsistent children with "
+                        "state: %s",
+                        self.address,
+                        ",".join(
+                            "%s - %s" % (child.address, child.status)
+                            for child in non_free_dependants
+                        ),
+                    )
+
+                else:
+                    raise exception.PciDeviceVFInvalidStatus(
+                        compute_node_id=self.compute_node_id,
+                        address=self.address)
             self._bulk_update_status(vfs_list,
                                            fields.PciDeviceStatus.UNCLAIMABLE)
 
@@ -447,11 +487,30 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
             instance.pci_devices.objects.append(copy.copy(self))
 
     def remove(self):
-        if self.status != fields.PciDeviceStatus.AVAILABLE:
+        # We allow removal of a device is if it is unused. It can be unused
+        # either by being in available state or being in a state that shows
+        # that the parent or child device blocks the consumption of this device
+        expected_states = [
+            fields.PciDeviceStatus.AVAILABLE,
+            fields.PciDeviceStatus.UNAVAILABLE,
+            fields.PciDeviceStatus.UNCLAIMABLE,
+        ]
+        if self.status not in expected_states:
             raise exception.PciDeviceInvalidStatus(
                 compute_node_id=self.compute_node_id,
                 address=self.address, status=self.status,
-                hopestatus=[fields.PciDeviceStatus.AVAILABLE])
+                hopestatus=expected_states)
+        # Just to be on the safe side, do not allow removal of device that has
+        # an owner even if the state of the device suggests that it is not
+        # owned.
+        if 'instance_uuid' in self and self.instance_uuid is not None:
+            raise exception.PciDeviceInvalidOwner(
+                compute_node_id=self.compute_node_id,
+                address=self.address,
+                owner=self.instance_uuid,
+                hopeowner=None,
+            )
+
         self.status = fields.PciDeviceStatus.REMOVED
         self.instance_uuid = None
         self.request_id = None
@@ -511,6 +570,32 @@ class PciDevice(base.NovaPersistentObject, base.NovaObject):
     def is_available(self):
         return self.status == fields.PciDeviceStatus.AVAILABLE
 
+    @property
+    def card_serial_number(self):
+        caps_json = self.extra_info.get('capabilities', "{}")
+        caps = jsonutils.loads(caps_json)
+        return caps.get('vpd', {}).get('card_serial_number')
+
+    @property
+    def sriov_cap(self):
+        caps_json = self.extra_info.get('capabilities', '{}')
+        caps = jsonutils.loads(caps_json)
+        return caps.get('sriov', {})
+
+    @property
+    def mac_address(self):
+        """The MAC address of the PF physical device or None if the device is
+        not a PF or if the MAC is not available.
+        """
+        return self.extra_info.get('mac_address')
+
+    @property
+    def network_caps(self):
+        """PCI device network capabilities or empty list if not available"""
+        caps_json = self.extra_info.get('capabilities', '{}')
+        caps = jsonutils.loads(caps_json)
+        return caps.get('network', [])
+
 
 @base.NovaObjectRegistry.register
 class PciDeviceList(base.ObjectListBase, base.NovaObject):
@@ -550,3 +635,6 @@ class PciDeviceList(base.ObjectListBase, base.NovaObject):
                                                            parent_addr)
         return base.obj_make_list(context, cls(context), objects.PciDevice,
                                   db_dev_list)
+
+    def __repr__(self):
+        return f"PciDeviceList(objects={[repr(obj) for obj in self.objects]})"

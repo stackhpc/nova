@@ -1,4 +1,5 @@
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
 #    a copy of the License at
 #
@@ -14,13 +15,14 @@ import collections
 import datetime
 from io import StringIO
 import os.path
+from unittest import mock
 
 import fixtures
-import mock
 from neutronclient.common import exceptions as neutron_client_exc
 import os_resource_classes as orc
+from oslo_db import exception as oslo_db_exc
 from oslo_serialization import jsonutils
-from oslo_utils.fixture import uuidsentinel
+from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
 
 from nova.cmd import manage
@@ -33,7 +35,7 @@ from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional import fixtures as func_fixtures
 from nova.tests.functional import integrated_helpers
-from nova.tests.functional import test_servers_resource_request
+from nova.tests.functional import test_servers_resource_request as test_res_req
 from nova import utils as nova_utils
 
 CONF = config.CONF
@@ -260,11 +262,16 @@ class TestNovaManageVolumeAttachmentRefresh(
 ):
     """Functional tests for 'nova-manage volume_attachment refresh'."""
 
+    # Required for any multiattach volume tests
+    microversion = '2.60'
+
     def setUp(self):
         super().setUp()
         self.tmpdir = self.useFixture(fixtures.TempDir()).path
         self.ctxt = context.get_admin_context()
         self.cli = manage.VolumeAttachmentCommands()
+        self.output = StringIO()
+        self.useFixture(fixtures.MonkeyPatch('sys.stdout', self.output))
         self.flags(my_ip='192.168.1.100')
         self.fake_connector = {
             'ip': '192.168.1.128',
@@ -285,7 +292,7 @@ class TestNovaManageVolumeAttachmentRefresh(
         self.assertEqual('create', actions[5]['action'])
 
     def test_refresh(self):
-        server = self._create_server()
+        server = self._create_server(networks='none')
         volume_id = self.cinder.IMAGE_BACKED_VOL
         self.api.post_server_volume(
             server['id'], {'volumeAttachment': {'volumeId': volume_id}})
@@ -343,7 +350,7 @@ class TestNovaManageVolumeAttachmentRefresh(
         self._assert_instance_actions(server)
 
     def test_refresh_rpcapi_remove_volume_connection_rollback(self):
-        server = self._create_server()
+        server = self._create_server(networks='none')
         volume_id = self.cinder.IMAGE_BACKED_VOL
         self.api.post_server_volume(
             server['id'], {'volumeAttachment': {'volumeId': volume_id}})
@@ -389,7 +396,7 @@ class TestNovaManageVolumeAttachmentRefresh(
         self._assert_instance_actions(server)
 
     def test_refresh_cinder_attachment_update_rollback(self):
-        server = self._create_server()
+        server = self._create_server(networks='none')
         volume_id = self.cinder.IMAGE_BACKED_VOL
         self.api.post_server_volume(
             server['id'], {'volumeAttachment': {'volumeId': volume_id}})
@@ -411,7 +418,7 @@ class TestNovaManageVolumeAttachmentRefresh(
         with (
             mock.patch(
                 'nova.volume.cinder.API.attachment_update',
-                side_effect=test.TestingException)
+                side_effect=test.TestingException, autospec=False)
         ) as (
             mock_attachment_update
         ):
@@ -446,7 +453,7 @@ class TestNovaManageVolumeAttachmentRefresh(
     def test_refresh_pre_cinderv3_without_attachment_id(self):
         """Test the refresh command when the bdm has no attachment_id.
         """
-        server = self._create_server()
+        server = self._create_server(networks='none')
         volume_id = self.cinder.IMAGE_BACKED_VOL
         self.api.post_server_volume(
             server['id'], {'volumeAttachment': {'volumeId': volume_id}})
@@ -487,6 +494,29 @@ class TestNovaManageVolumeAttachmentRefresh(
 
         # Assert that we have actions we expect against the instance
         self._assert_instance_actions(server)
+
+    def test_show_multiattach_volume(self):
+        """Test that the show command doesn't fail for multiattach volumes
+        """
+        volume_id = self.cinder.MULTIATTACH_VOL
+
+        # Launch two instances and attach the same multiattach volume to both
+        server_1 = self._create_server(networks='none')
+        self.api.post_server_volume(
+            server_1['id'], {'volumeAttachment': {'volumeId': volume_id}})
+        self._wait_for_volume_attach(server_1['id'], volume_id)
+
+        server_2 = self._create_server(networks='none')
+        self.api.post_server_volume(
+            server_2['id'], {'volumeAttachment': {'volumeId': volume_id}})
+        self._wait_for_volume_attach(server_2['id'], volume_id)
+
+        result = self.cli.show(
+            volume_id=volume_id, instance_uuid=server_1['id'])
+
+        # Assert that the command completes successfully, this was previously
+        # broken and documented under bug #1945452
+        self.assertEqual(0, result)
 
 
 class TestNovaManagePlacementHealAllocations(
@@ -1063,7 +1093,8 @@ class TestNovaManagePlacementHealAllocations(
 
 
 class TestNovaManagePlacementHealPortAllocations(
-    test_servers_resource_request.PortResourceRequestBasedSchedulingTestBase):
+    test_res_req.PortResourceRequestBasedSchedulingTestBase
+):
 
     def setUp(self):
         super(TestNovaManagePlacementHealPortAllocations, self).setUp()
@@ -1087,15 +1118,17 @@ class TestNovaManagePlacementHealPortAllocations(
         bound_port = self.neutron._ports[port_id]
         bound_port[constants.RESOURCE_REQUEST] = resource_request
 
+    @staticmethod
+    def _get_default_resource_request(port_uuid):
+        return {
+            "resources": {
+                orc.NET_BW_IGR_KILOBIT_PER_SEC: 1000,
+                orc.NET_BW_EGR_KILOBIT_PER_SEC: 1000},
+            "required": ["CUSTOM_PHYSNET2", "CUSTOM_VNIC_TYPE_NORMAL"]
+        }
+
     def _create_server_with_missing_port_alloc(
             self, ports, resource_request=None):
-        if not resource_request:
-            resource_request = {
-                "resources": {
-                    orc.NET_BW_IGR_KILOBIT_PER_SEC: 1000,
-                    orc.NET_BW_EGR_KILOBIT_PER_SEC: 1000},
-                "required": ["CUSTOM_PHYSNET2", "CUSTOM_VNIC_TYPE_NORMAL"]
-            }
 
         server = self._create_server(
             flavor=self.flavor,
@@ -1105,13 +1138,21 @@ class TestNovaManagePlacementHealPortAllocations(
         # This is a hack to simulate that we have a server that is missing
         # allocation for its port
         for port in ports:
-            self._add_resource_request_to_a_bound_port(
-                port['id'], resource_request)
+            if not resource_request:
+                rr = self._get_default_resource_request(port['id'])
+            else:
+                rr = resource_request
+
+            self._add_resource_request_to_a_bound_port(port['id'], rr)
 
         updated_ports = [
             self.neutron.show_port(port['id'])['port'] for port in ports]
 
         return server, updated_ports
+
+    def _get_resource_request(self, port):
+        res_req = port[constants.RESOURCE_REQUEST]
+        return res_req
 
     def _assert_placement_updated(self, server, ports):
         rsp = self.placement.get(
@@ -1137,7 +1178,7 @@ class TestNovaManagePlacementHealPortAllocations(
         # bridge RP
         total_request = collections.defaultdict(int)
         for port in ports:
-            port_request = port[constants.RESOURCE_REQUEST]['resources']
+            port_request = self._get_resource_request(port)['resources']
             for rc, amount in port_request.items():
                 total_request[rc] += amount
         self.assertEqual(total_request, network_allocations)
@@ -1362,83 +1403,64 @@ class TestNovaManagePlacementHealPortAllocations(
             'Successfully created allocations for instance', output)
         self.assertEqual(0, result)
 
-    def test_heal_port_allocation_not_enough_resources_for_port(self):
-        """Test that a port needs allocation but not enough inventory
-        available.
-        """
+    @staticmethod
+    def _get_too_big_resource_request():
         # The port will request too much NET_BW_IGR_KILOBIT_PER_SEC so there is
         # no RP on the host that can provide it.
-        resource_request = {
+        return {
             "resources": {
                 orc.NET_BW_IGR_KILOBIT_PER_SEC: 100000000000,
                 orc.NET_BW_EGR_KILOBIT_PER_SEC: 1000},
             "required": ["CUSTOM_PHYSNET2",
                          "CUSTOM_VNIC_TYPE_NORMAL"]
         }
+
+    def test_heal_port_allocation_not_enough_resources_for_port(self):
+        """Test that a port needs allocation but not enough inventory
+        available.
+        """
         server, ports = self._create_server_with_missing_port_alloc(
-            [self.neutron.port_1], resource_request)
+            [self.neutron.port_1], self._get_too_big_resource_request())
 
         # let's trigger a heal
         result = self.cli.heal_allocations(verbose=True, max_count=2)
 
         self._assert_placement_not_updated(server)
-        # Actually the ports were updated but the update is rolled back when
-        # the placement update failed
         self._assert_ports_not_updated(ports)
 
         output = self.output.getvalue()
         self.assertIn(
-            'Rolling back port update',
-            output)
-        self.assertIn(
-            'Failed to update allocations for consumer',
+            'Placement returned no allocation candidate',
             output)
         self.assertEqual(3, result)
 
-    def test_heal_port_allocation_no_rp_providing_required_traits(self):
-        """Test that a port needs allocation but no rp is providing the
-        required traits.
-        """
-        # The port will request a trait, CUSTOM_PHYSNET_NONEXISTENT that will
-        # not be provided by any RP on this host
-        resource_request = {
-            "resources": {
-                orc.NET_BW_IGR_KILOBIT_PER_SEC: 1000,
-                orc.NET_BW_EGR_KILOBIT_PER_SEC: 1000},
-            "required": ["CUSTOM_PHYSNET_NONEXISTENT",
-                         "CUSTOM_VNIC_TYPE_NORMAL"]
-        }
-        server, ports = self._create_server_with_missing_port_alloc(
-            [self.neutron.port_1], resource_request)
-
-        # let's trigger a heal
-        result = self.cli.heal_allocations(verbose=True, max_count=2)
-
-        self._assert_placement_not_updated(server)
-        self._assert_ports_not_updated(ports)
-
-        self.assertIn(
-            'No matching resource provider is available for healing the port '
-            'allocation',
-            self.output.getvalue())
-        self.assertEqual(3, result)
-
-    def test_heal_port_allocation_ambiguous_rps(self):
-        """Test that there are more than one matching RPs are available on the
-        compute.
-        """
-
-        # The port will request CUSTOM_VNIC_TYPE_DIRECT trait and there are
-        # two RPs that supports such trait.
-        resource_request = {
+    @staticmethod
+    def _get_ambiguous_resource_request():
+        return {
             "resources": {
                 orc.NET_BW_IGR_KILOBIT_PER_SEC: 1000,
                 orc.NET_BW_EGR_KILOBIT_PER_SEC: 1000},
             "required": ["CUSTOM_PHYSNET2",
                          "CUSTOM_VNIC_TYPE_DIRECT"]
         }
+
+    def test_heal_port_allocation_ambiguous_candidates(self):
+        """Test that there are more than one matching set of RPs are available
+        on the compute.
+        """
+        # Add bandwidth inventory for PF3 so that both FP2 and FP3 could
+        # support the port's request making the situation ambiguous
+        inventories = {
+            orc.NET_BW_IGR_KILOBIT_PER_SEC: {"total": 100000},
+            orc.NET_BW_EGR_KILOBIT_PER_SEC: {"total": 100000},
+        }
+        self._set_provider_inventories(
+            self.sriov_dev_rp_per_host[self.compute1_rp_uuid][self.PF3],
+            {"inventories": inventories}
+        )
+
         server, ports = self._create_server_with_missing_port_alloc(
-            [self.neutron.port_1], resource_request)
+            [self.neutron.port_1], self._get_ambiguous_resource_request())
 
         # let's trigger a heal
         result = self.cli.heal_allocations(verbose=True, max_count=2)
@@ -1447,7 +1469,7 @@ class TestNovaManagePlacementHealPortAllocations(
         self._assert_ports_not_updated(ports)
 
         self.assertIn(
-            'More than one matching resource provider',
+            ' Placement returned more than one possible allocation candidates',
             self.output.getvalue())
         self.assertEqual(3, result)
 
@@ -1595,12 +1617,18 @@ class TestNovaManagePlacementHealPortAllocations(
             output)
         self.assertEqual(7, result)
 
-    def _test_heal_port_allocation_placement_unavailable(
-            self, server, ports, error):
+    def test_heal_port_allocation_placement_unavailable_during_a_c(self):
+        server, ports = self._create_server_with_missing_port_alloc(
+            [self.neutron.port_1])
 
-        with mock.patch('nova.cmd.manage.PlacementCommands.'
-                        '_get_rps_in_tree_with_required_traits',
-                        side_effect=error):
+        # Simulate that placement is unavailable during the allocation
+        # candidate query. The safe_connect decorator signals that via
+        # returning None.
+        with mock.patch(
+            'nova.scheduler.client.report.SchedulerReportClient.'
+            'get_allocation_candidates',
+            return_value=None
+        ):
             result = self.cli.heal_allocations(verbose=True, max_count=2)
 
         self._assert_placement_not_updated(server)
@@ -1608,18 +1636,196 @@ class TestNovaManagePlacementHealPortAllocations(
 
         self.assertEqual(3, result)
 
-    def test_heal_port_allocation_placement_unavailable(self):
+    def test_heal_port_allocation_placement_unavailable_during_update(self):
         server, ports = self._create_server_with_missing_port_alloc(
             [self.neutron.port_1])
 
-        for error in [
-            exception.PlacementAPIConnectFailure(),
-            exception.ResourceProviderRetrievalFailed(uuid=uuidsentinel.rp1),
-            exception.ResourceProviderTraitRetrievalFailed(
-                uuid=uuidsentinel.rp1)]:
+        # Simulate that placement is unavailable during updating the
+        # allocation. The retry decorator signals that via returning False
+        with mock.patch(
+            'nova.scheduler.client.report.SchedulerReportClient.'
+            'put_allocations',
+            return_value=False
+        ):
+            result = self.cli.heal_allocations(verbose=True, max_count=2)
 
-            self._test_heal_port_allocation_placement_unavailable(
-                server, ports, error)
+        self._assert_placement_not_updated(server)
+        # Actually there was a port update but that was rolled back when
+        # the allocation update failed
+        self._assert_ports_not_updated(ports)
+
+        output = self.output.getvalue()
+        self.assertIn(
+            'Rolling back port update',
+            output)
+        self.assertEqual(3, result)
+
+
+class TestNovaManagePlacementHealPortAllocationsExtended(
+    TestNovaManagePlacementHealPortAllocations
+):
+    """Run the same tests as in TestNovaManagePlacementHealPortAllocations but
+    with the ExtendedResourceRequestNeutronFixture that automatically
+    translates the resource request in the ports used by these test to the
+    extended format. Note that this will test the extended format handling but
+    only with a single request group per port.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.neutron = self.useFixture(
+            test_res_req.ExtendedResourceRequestNeutronFixture(self))
+
+    def _get_resource_request(self, port):
+        # we assume a single resource request group in this test class
+        res_req = port[constants.RESOURCE_REQUEST][constants.REQUEST_GROUPS]
+        assert len(res_req) == 1
+        return res_req[0]
+
+    def _assert_port_updated(self, port_uuid):
+        updated_port = self.neutron.show_port(port_uuid)['port']
+        binding_profile = updated_port.get('binding:profile', {})
+        self.assertEqual(
+            {port_uuid: self.ovs_bridge_rp_per_host[self.compute1_rp_uuid]},
+            binding_profile['allocation'])
+
+
+class TestNovaManagePlacementHealPortAllocationsMultiGroup(
+    TestNovaManagePlacementHealPortAllocations
+):
+    """Run the same tests as in TestNovaManagePlacementHealPortAllocations but
+    with the MultiGroupResourceRequestNeutronFixture to test with extended
+    resource request with multiple groups.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.neutron = self.useFixture(
+            test_res_req.MultiGroupResourceRequestNeutronFixture(self))
+
+    @staticmethod
+    def _get_default_resource_request(port_uuid):
+        # we need unique uuids per port for multi port tests
+        g1 = getattr(uuids, port_uuid + "group1")
+        g2 = getattr(uuids, port_uuid + "group2")
+        return {
+            "request_groups": [
+                {
+                    "id": g1,
+                    "resources": {
+                        orc.NET_BW_IGR_KILOBIT_PER_SEC: 1000,
+                        orc.NET_BW_EGR_KILOBIT_PER_SEC: 1000},
+                    "required": [
+                        "CUSTOM_PHYSNET2", "CUSTOM_VNIC_TYPE_NORMAL"
+                    ]
+                },
+                {
+                    "id": g2,
+                    "resources": {
+                        orc.NET_PACKET_RATE_KILOPACKET_PER_SEC: 1000
+                    },
+                    "required": ["CUSTOM_VNIC_TYPE_NORMAL"]
+                }
+            ],
+            "same_subtree": [g1, g2],
+        }
+
+    @staticmethod
+    def _get_too_big_resource_request():
+        # The port will request too much NET_BW_IGR_KILOBIT_PER_SEC so there is
+        # no RP on the host that can provide it.
+        return {
+            "request_groups": [
+                {
+                    "id": uuids.g1,
+                    "resources": {
+                        orc.NET_BW_IGR_KILOBIT_PER_SEC: 10000000000000,
+                        orc.NET_BW_EGR_KILOBIT_PER_SEC: 1000},
+                    "required": [
+                        "CUSTOM_PHYSNET2", "CUSTOM_VNIC_TYPE_NORMAL"
+                    ]
+                },
+                {
+                    "id": uuids.g2,
+                    "resources": {
+                        orc.NET_PACKET_RATE_KILOPACKET_PER_SEC: 1000
+                    },
+                    "required": ["CUSTOM_VNIC_TYPE_NORMAL"]
+                }
+            ],
+            "same_subtree": [uuids.g1, uuids.g2],
+        }
+
+    @staticmethod
+    def _get_ambiguous_resource_request():
+        # ambiguity cannot really be simulated with multiple groups as that
+        # would require multiple OVS bridges instead of multiple PFs. So
+        # falling back to a single group in this specific test case.
+        return {
+            "request_groups": [
+                {
+                    "id": uuids.g1,
+                    "resources": {
+                        orc.NET_BW_IGR_KILOBIT_PER_SEC: 1000,
+                        orc.NET_BW_EGR_KILOBIT_PER_SEC: 1000},
+                    "required": [
+                        "CUSTOM_PHYSNET2", "CUSTOM_VNIC_TYPE_DIRECT"
+                    ]
+                },
+            ],
+            "same_subtree": [uuids.g1],
+        }
+
+    def _assert_placement_updated(self, server, ports):
+        rsp = self.placement.get(
+            '/allocations/%s' % server['id'],
+            version=1.28).body
+
+        allocations = rsp['allocations']
+
+        # we expect one allocation for the compute resources, one on the OVS
+        # bridge RP due to bandwidth and one on the OVS agent RP due to packet
+        # rate request
+        self.assertEqual(3, len(allocations))
+        self.assertEqual(
+            self._resources_from_flavor(self.flavor),
+            allocations[self.compute1_rp_uuid]['resources'])
+
+        self.assertEqual(server['tenant_id'], rsp['project_id'])
+        self.assertEqual(server['user_id'], rsp['user_id'])
+
+        ovs_bridge_allocations = allocations[
+            self.ovs_bridge_rp_per_host[self.compute1_rp_uuid]]['resources']
+        ovs_agent_allocations = allocations[
+            self.ovs_agent_rp_per_host[self.compute1_rp_uuid]]['resources']
+
+        total_bandwidth_request = collections.defaultdict(int)
+        total_packet_rate_request = collections.defaultdict(int)
+        for port in ports:
+            res_req = (port.get(constants.RESOURCE_REQUEST) or {})
+            for group in res_req.get(constants.REQUEST_GROUPS):
+                port_request = group['resources']
+                for rc, amount in port_request.items():
+                    if rc == orc.NET_PACKET_RATE_KILOPACKET_PER_SEC:
+                        total_packet_rate_request[rc] += amount
+                    else:
+                        total_bandwidth_request[rc] += amount
+
+        self.assertEqual(total_bandwidth_request, ovs_bridge_allocations)
+        self.assertEqual(total_packet_rate_request, ovs_agent_allocations)
+
+    def _assert_port_updated(self, port_uuid):
+        updated_port = self.neutron.show_port(port_uuid)['port']
+        binding_profile = updated_port.get('binding:profile', {})
+        self.assertEqual(
+            {
+                getattr(uuids, port_uuid + "group1"):
+                    self.ovs_bridge_rp_per_host[self.compute1_rp_uuid],
+                getattr(uuids, port_uuid + "group2"):
+                    self.ovs_agent_rp_per_host[self.compute1_rp_uuid],
+            },
+            binding_profile['allocation']
+        )
 
 
 class TestNovaManagePlacementSyncAggregates(
@@ -1856,71 +2062,6 @@ class TestNovaManagePlacementAudit(
         self.assertIn('Processed 1 allocation.', output)
         self.assertEqual(4, ret)
 
-    # TODO(sbauza): Remove this test once bug #1829479 is fixed
-    def test_audit_orphaned_allocations_from_deleted_compute_evacuate(self):
-        """Evacuate a server and the delete the source node so that it will
-           leave a source allocation that the audit command will find.
-        """
-
-        source_hostname = self.compute1.host
-        dest_hostname = self.compute2.host
-
-        source_rp_uuid = self._get_provider_uuid_by_host(source_hostname)
-        dest_rp_uuid = self._get_provider_uuid_by_host(dest_hostname)
-
-        server = self._boot_and_check_allocations(self.flavor, source_hostname)
-
-        # Stop the service and fake it down
-        self.compute1.stop()
-        source_service_id = self.admin_api.get_services(
-            host=source_hostname, binary='nova-compute')[0]['id']
-        self.admin_api.put_service(source_service_id, {'forced_down': 'true'})
-
-        # evacuate the instance to the target
-        self._evacuate_server(
-            server, {'host': dest_hostname}, expected_host=dest_hostname)
-
-        # Now the instance is gone, we can delete the compute service
-        self.admin_api.api_delete('/os-services/%s' % source_service_id)
-
-        # Since the compute is deleted, we should have in theory a single
-        # allocation against the destination resource provider, but evacuated
-        # instances are not having their allocations deleted. See bug #1829479.
-        # We have two allocations for the same consumer, source and destination
-        self._check_allocation_during_evacuate(
-            self.flavor, server['id'], source_rp_uuid, dest_rp_uuid)
-
-        # Now, run the audit command that will find this orphaned allocation
-        ret = self.cli.audit(verbose=True)
-        output = self.output.getvalue()
-        self.assertIn(
-            'Allocations for consumer UUID %(consumer_uuid)s on '
-            'Resource Provider %(rp_uuid)s can be deleted' %
-            {'consumer_uuid': server['id'],
-             'rp_uuid': source_rp_uuid},
-            output)
-        self.assertIn('Processed 1 allocation.', output)
-        self.assertEqual(3, ret)
-
-        # Now we want to delete the orphaned allocation that is duplicate
-        ret = self.cli.audit(delete=True, verbose=True)
-
-        # We finally should only have the target allocations
-        self.assertFlavorMatchesUsage(dest_rp_uuid, self.flavor)
-        self.assertRequestMatchesUsage({'VCPU': 0,
-                                        'MEMORY_MB': 0,
-                                        'DISK_GB': 0}, source_rp_uuid)
-
-        output = self.output.getvalue()
-        self.assertIn(
-            'Deleted allocations for consumer UUID %(consumer_uuid)s on '
-            'Resource Provider %(rp_uuid)s' %
-            {'consumer_uuid': server['id'],
-             'rp_uuid': source_rp_uuid},
-            output)
-        self.assertIn('Processed 1 allocation.', output)
-        self.assertEqual(4, ret)
-
 
 class TestDBArchiveDeletedRows(integrated_helpers._IntegratedTestBase):
     """Functional tests for the "nova-manage db archive_deleted_rows" CLI."""
@@ -2098,57 +2239,71 @@ class TestDBArchiveDeletedRowsMultiCell(integrated_helpers.InstanceHelperMixin,
 
     def test_archive_deleted_rows(self):
         admin_context = context.get_admin_context(read_deleted='yes')
-        # Boot a server to cell1
-        server_ids = {}
-        server = self._build_server(az='nova:host1')
-        created_server = self.api.post_server({'server': server})
-        self._wait_for_state_change(created_server, 'ACTIVE')
-        server_ids['cell1'] = created_server['id']
-        # Boot a server to cell2
-        server = self._build_server(az='nova:host2')
-        created_server = self.api.post_server({'server': server})
-        self._wait_for_state_change(created_server, 'ACTIVE')
-        server_ids['cell2'] = created_server['id']
-        # Boot a server to cell0 (cause ERROR state prior to schedule)
-        server = self._build_server()
-        # Flavor m1.xlarge cannot be fulfilled
-        server['flavorRef'] = 'http://fake.server/5'
-        created_server = self.api.post_server({'server': server})
-        self._wait_for_state_change(created_server, 'ERROR')
-        server_ids['cell0'] = created_server['id']
+        server_ids_by_cell = collections.defaultdict(list)
+        # Create two servers per cell to make sure archive for table iterates
+        # at least once.
+        for i in range(2):
+            # Boot a server to cell1
+            server = self._build_server(az='nova:host1')
+            created_server = self.api.post_server({'server': server})
+            self._wait_for_state_change(created_server, 'ACTIVE')
+            server_ids_by_cell['cell1'].append(created_server['id'])
+            # Boot a server to cell2
+            server = self._build_server(az='nova:host2')
+            created_server = self.api.post_server({'server': server})
+            self._wait_for_state_change(created_server, 'ACTIVE')
+            server_ids_by_cell['cell2'].append(created_server['id'])
+            # Boot a server to cell0 (cause ERROR state prior to schedule)
+            server = self._build_server()
+            # Flavor m1.xlarge cannot be fulfilled
+            server['flavorRef'] = 'http://fake.server/5'
+            created_server = self.api.post_server({'server': server})
+            self._wait_for_state_change(created_server, 'ERROR')
+            server_ids_by_cell['cell0'].append(created_server['id'])
+
         # Verify all the servers are in the databases
-        for cell_name, server_id in server_ids.items():
-            with context.target_cell(admin_context,
-                                     self.cell_mappings[cell_name]) as cctxt:
-                objects.Instance.get_by_uuid(cctxt, server_id)
+        for cell_name, server_ids in server_ids_by_cell.items():
+            for server_id in server_ids:
+                with context.target_cell(
+                    admin_context,
+                    self.cell_mappings[cell_name]
+                ) as cctxt:
+                    objects.Instance.get_by_uuid(cctxt, server_id)
         # Delete the servers
-        for cell_name in server_ids.keys():
-            self.api.delete_server(server_ids[cell_name])
+        for cell_name, server_ids in server_ids_by_cell.items():
+            for server_id in server_ids:
+                self.api.delete_server(server_id)
         # Verify all the servers are in the databases still (as soft deleted)
-        for cell_name, server_id in server_ids.items():
-            with context.target_cell(admin_context,
-                                     self.cell_mappings[cell_name]) as cctxt:
-                objects.Instance.get_by_uuid(cctxt, server_id)
+        for cell_name, server_ids in server_ids_by_cell.items():
+            for server_id in server_ids:
+                with context.target_cell(
+                    admin_context,
+                    self.cell_mappings[cell_name]
+                ) as cctxt:
+                    objects.Instance.get_by_uuid(cctxt, server_id)
         # Archive the deleted rows
         self.cli.archive_deleted_rows(verbose=True, all_cells=True)
-        # Three instances should have been archived (cell0, cell1, cell2)
+        # 6 instances should have been archived (cell0, cell1, cell2)
         self.assertRegex(self.output.getvalue(),
-                         r"| cell0\.instances.*\| 1.*")
+                         r"\| cell0\.instances\s+\| 2")
         self.assertRegex(self.output.getvalue(),
-                         r"| cell1\.instances.*\| 1.*")
+                         r"\| cell1\.instances\s+\| 2")
         self.assertRegex(self.output.getvalue(),
-                         r"| cell2\.instances.*\| 1.*")
+                         r"\| cell2\.instances\s+\| 2")
         self.assertRegex(self.output.getvalue(),
-                         r"| API_DB\.instance_mappings.*\| 3.*")
+                         r"\| API_DB\.instance_mappings\s+\| 6")
         self.assertRegex(self.output.getvalue(),
-                         r"| API_DB\.request_specs.*\| 3.*")
+                         r"\| API_DB\.request_specs\s+\| 6")
         # Verify all the servers are gone from the cell databases
-        for cell_name, server_id in server_ids.items():
-            with context.target_cell(admin_context,
-                                     self.cell_mappings[cell_name]) as cctxt:
-                self.assertRaises(exception.InstanceNotFound,
-                                  objects.Instance.get_by_uuid,
-                                  cctxt, server_id)
+        for cell_name, server_ids in server_ids_by_cell.items():
+            for server_id in server_ids:
+                with context.target_cell(
+                    admin_context,
+                    self.cell_mappings[cell_name]
+                ) as cctxt:
+                    self.assertRaises(exception.InstanceNotFound,
+                                      objects.Instance.get_by_uuid,
+                                      cctxt, server_id)
 
 
 class TestDBArchiveDeletedRowsMultiCellTaskLog(
@@ -2262,3 +2417,217 @@ class TestDBArchiveDeletedRowsMultiCellTaskLog(
         for cell_name in ('cell1', 'cell2'):
             self.assertRegex(
                 self.output.getvalue(), r'\| %s.task_log\s+\| 2' % cell_name)
+
+
+class TestNovaManageLimits(test.TestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.ctxt = context.get_admin_context()
+        self.cli = manage.LimitsCommands()
+        self.output = StringIO()
+        self.useFixture(fixtures.MonkeyPatch('sys.stdout', self.output))
+        self.ul_api = self.useFixture(nova_fixtures.UnifiedLimitsFixture())
+
+    @mock.patch('nova.quota.QUOTAS.get_defaults')
+    def test_migrate_to_unified_limits_no_db_access(self, mock_get_defaults):
+        mock_get_defaults.side_effect = oslo_db_exc.CantStartEngineError()
+        return_code = self.cli.migrate_to_unified_limits(verbose=True)
+        self.assertEqual(2, return_code)
+
+    @mock.patch('nova.utils.get_sdk_adapter')
+    def test_migrate_to_unified_limits_unexpected_error(self, mock_sdk):
+        # Simulate an error creating limits.
+        mock_sdk.return_value.create_registered_limit.side_effect = (
+            test.TestingException('oops!'))
+        mock_sdk.return_value.create_limit.side_effect = (
+            test.TestingException('oops!'))
+
+        # Create a few project limits.
+        objects.Quotas.create_limit(self.ctxt, uuids.project, 'ram', 8192)
+        objects.Quotas.create_limit(self.ctxt, uuids.project, 'instances', 25)
+        objects.Quotas.create_limit(self.ctxt, uuids.project, 'cores', 22)
+
+        return_code = self.cli.migrate_to_unified_limits(
+            project_id=uuids.project, verbose=True)
+        self.assertEqual(1, return_code)
+
+        # Verify that limit create attempts for other resources were attempted
+        # after an unexpected error.
+        #
+        # There are 10 default limit values in the config options: instances,
+        # cores, ram, metadata_items, injected_files,
+        # injected_file_content_bytes, injected_file_path_length, key_pairs,
+        # server_groups, and server_group_members.
+        #
+        # And there is 1 default limit value automatically generated for PCPU
+        # based on 'cores'.
+        self.assertEqual(
+            11, mock_sdk.return_value.create_registered_limit.call_count)
+
+        # We expect that we attempted to create 4 project limits:
+        # class:MEMORY_MB, servers, and class:VCPU = 3 + special case
+        # class:PCPU = 4.
+        self.assertEqual(4, mock_sdk.return_value.create_limit.call_count)
+
+    def test_migrate_to_unified_limits_already_exists(self):
+        # Create a couple of unified limits to already exist.
+        self.ul_api.create_registered_limit(
+            resource_name='servers', default_limit=8)
+        self.ul_api.create_limit(
+            resource_name='class:VCPU', resource_limit=6,
+            project_id=uuids.project)
+
+        # Create a couple of project limits.
+        objects.Quotas.create_limit(self.ctxt, uuids.project, 'cores', 10)
+        objects.Quotas.create_limit(self.ctxt, uuids.project, 'instances', 25)
+
+        self.cli.migrate_to_unified_limits(
+            project_id=uuids.project, verbose=True)
+
+        # There are 10 default limit values in the config options +
+        # 1 special case for PCPU which will be added based on VCPU = 11.
+        # Because a limit for 'servers' already exists, we should have only
+        # created 10.
+        mock_sdk = self.ul_api.mock_sdk_adapter
+        self.assertEqual(
+            10, mock_sdk.create_registered_limit.call_count)
+
+        # There already exists a project limit for 'class:VCPU', so we should
+        # have created only 2 project limits. One for 'servers' and one for
+        # special case 'class:PCPU' generated from VCPU.
+        self.assertEqual(2, mock_sdk.create_limit.call_count)
+
+    def test_migrate_to_unified_limits(self):
+        # Set some defaults using the config options.
+        self.flags(instances=5, group='quota')
+        self.flags(cores=22, group='quota')
+        self.flags(ram=4096, group='quota')
+        self.flags(metadata_items=64, group='quota')
+        self.flags(injected_files=3, group='quota')
+        self.flags(injected_file_content_bytes=9 * 1024, group='quota')
+        self.flags(injected_file_path_length=250, group='quota')
+        self.flags(key_pairs=50, group='quota')
+        self.flags(server_groups=7, group='quota')
+        self.flags(server_group_members=12, group='quota')
+        # Create a couple of defaults via the 'default' quota class. These take
+        # precedence over the config option values.
+        objects.Quotas.create_class(self.ctxt, 'default', 'cores', 10)
+        objects.Quotas.create_class(self.ctxt, 'default', 'key_pairs', 75)
+        # Create obsolete limits which should not be migrated to unified
+        # limits.
+        objects.Quotas.create_class(self.ctxt, 'default', 'fixed_ips', 8)
+        objects.Quotas.create_class(self.ctxt, 'default', 'floating_ips', 6)
+        objects.Quotas.create_class(self.ctxt, 'default', 'security_groups', 4)
+        objects.Quotas.create_class(
+            self.ctxt, 'default', 'security_group_rules', 14)
+        # Create a couple of project limits.
+        objects.Quotas.create_limit(self.ctxt, uuids.project, 'ram', 8192)
+        objects.Quotas.create_limit(self.ctxt, uuids.project, 'instances', 25)
+
+        # Verify there are no unified limits yet.
+        registered_limits = self.ul_api.registered_limits()
+        self.assertEqual(0, len(registered_limits))
+        limits = self.ul_api.limits(project_id=uuids.project)
+        self.assertEqual(0, len(limits))
+
+        # Verify that --dry-run works to not actually create limits.
+        self.cli.migrate_to_unified_limits(dry_run=True)
+
+        # There should still be no unified limits yet.
+        registered_limits = self.ul_api.registered_limits()
+        self.assertEqual(0, len(registered_limits))
+        limits = self.ul_api.limits(project_id=uuids.project)
+        self.assertEqual(0, len(limits))
+
+        # Migrate the limits.
+        self.cli.migrate_to_unified_limits(
+            project_id=uuids.project, verbose=True)
+
+        # There are 10 default limit values in the config options +
+        # 1 special case for PCPU which will be added based on VCPU = 11.
+        #
+        # There should be 11 registered (default) limits now.
+        expected_registered_limits = {
+            'servers': 5,
+            'class:VCPU': 10,
+            'class:PCPU': 10,
+            'class:MEMORY_MB': 4096,
+            'server_metadata_items': 64,
+            'server_injected_files': 3,
+            'server_injected_file_content_bytes': 9 * 1024,
+            'server_injected_file_path_bytes': 250,
+            'server_key_pairs': 75,
+            'server_groups': 7,
+            'server_group_members': 12,
+        }
+
+        registered_limits = self.ul_api.registered_limits()
+        self.assertEqual(11, len(registered_limits))
+        for rl in registered_limits:
+            self.assertEqual(
+                expected_registered_limits[rl.resource_name], rl.default_limit)
+
+        # And 2 project limits.
+        expected_limits = {
+            'class:MEMORY_MB': 8192,
+            'servers': 25,
+        }
+
+        limits = self.ul_api.limits(project_id=uuids.project)
+        self.assertEqual(2, len(limits))
+        for pl in limits:
+            self.assertEqual(
+                expected_limits[pl.resource_name], pl.resource_limit)
+
+        # Verify there are no project limits for a different project.
+        other_project_limits = self.ul_api.limits(
+            project_id=uuids.otherproject)
+        self.assertEqual(0, len(other_project_limits))
+
+        # Try migrating limits for a specific region.
+        region_registered_limits = self.ul_api.registered_limits(
+            region_id=uuids.region)
+        self.assertEqual(0, len(region_registered_limits))
+
+        self.cli.migrate_to_unified_limits(
+            region_id=uuids.region, verbose=True)
+
+        region_registered_limits = self.ul_api.registered_limits(
+            region_id=uuids.region)
+        self.assertEqual(11, len(region_registered_limits))
+        for rl in region_registered_limits:
+            self.assertEqual(
+                expected_registered_limits[rl.resource_name], rl.default_limit)
+
+        # Try migrating project limits for that region.
+        region_limits = self.ul_api.limits(
+            project_id=uuids.project, region_id=uuids.region)
+        self.assertEqual(0, len(region_limits))
+
+        self.cli.migrate_to_unified_limits(
+            project_id=uuids.project, region_id=uuids.region, verbose=True)
+
+        region_limits = self.ul_api.limits(
+            project_id=uuids.project, region_id=uuids.region)
+        self.assertEqual(2, len(region_limits))
+        for pl in region_limits:
+            self.assertEqual(
+                expected_limits[pl.resource_name], pl.resource_limit)
+
+        # Verify no --verbose outputs nothing, migrate limits for a different
+        # project after clearing stdout.
+        self.output = StringIO()
+        self.assertEqual('', self.output.getvalue())
+
+        # Create a limit for the other project.
+        objects.Quotas.create_limit(self.ctxt, uuids.otherproject, 'ram', 2048)
+
+        self.cli.migrate_to_unified_limits(project_id=uuids.otherproject)
+
+        other_project_limits = self.ul_api.limits(
+            project_id=uuids.otherproject)
+        self.assertEqual(1, len(other_project_limits))
+
+        # Output should still be empty after migrating.
+        self.assertEqual('', self.output.getvalue())

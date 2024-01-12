@@ -17,10 +17,10 @@
 import copy
 import datetime
 import io
+from unittest import mock
 
 import fixtures as fx
 import futurist
-import mock
 from oslo_config import cfg
 from oslo_db import exception as db_exc
 from oslo_log import log as logging
@@ -28,7 +28,7 @@ from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
 from oslo_utils import uuidutils
 from oslotest import output
-import sqlalchemy
+import sqlalchemy as sa
 import testtools
 
 from nova.compute import rpcapi as compute_rpcapi
@@ -51,6 +51,20 @@ CONF = cfg.CONF
 
 class TestLogging(testtools.TestCase):
     def test_default_logging(self):
+        # This test validates that in default logging mode,
+        # we have two logging handlers:
+        # 1 x to display default messages (info, error, warnings...)
+        # 1 x to redirect debug messages to null and so don't display them.
+
+        # However, if OS_DEBUG=True is set in a shell session, then the test is
+        # run and fails. Because, in debug mode, we should have
+        # only one handler to display all messages.
+
+        # Here, we explicitly set OS_DEBUG=0.
+        # So it will ensure we have two handlers whatever
+        # OS_DEBUG value set in the user shell.
+        self.useFixture(fx.EnvironmentVariable('OS_DEBUG', '0'))
+
         stdlog = self.useFixture(fixtures.StandardLogging())
         root = logging.getLogger()
         # there should be a null handler as well at DEBUG
@@ -121,59 +135,64 @@ class TestDatabaseFixture(testtools.TestCase):
     def test_fixture_reset(self):
         # because this sets up reasonable db connection strings
         self.useFixture(fixtures.ConfFixture())
-        self.useFixture(fixtures.Database())
+        db_fixture = fixtures.Database()
+        self.useFixture(db_fixture)
         engine = main_db_api.get_engine()
         conn = engine.connect()
-        result = conn.execute("select * from instance_types")
+        result = conn.execute(sa.text("SELECT * FROM instance_types"))
         rows = result.fetchall()
         self.assertEqual(0, len(rows), "Rows %s" % rows)
 
         # insert a 6th instance type, column 5 below is an int id
         # which has a constraint on it, so if new standard instance
         # types are added you have to bump it.
-        conn.execute("insert into instance_types VALUES "
-                     "(NULL, NULL, NULL, 't1.test', 6, 4096, 2, 0, NULL, '87'"
-                     ", 1.0, 40, 0, 0, 1, 0)")
-        result = conn.execute("select * from instance_types")
+        conn.execute(sa.text(
+            "INSERT INTO instance_types VALUES "
+            "(NULL, NULL, NULL, 't1.test', 6, 4096, 2, 0, NULL, '87'"
+            ", 1.0, 40, 0, 0, 1, 0)"
+        ))
+        result = conn.execute(sa.text("SELECT * FROM instance_types"))
         rows = result.fetchall()
         self.assertEqual(1, len(rows), "Rows %s" % rows)
 
-        # reset by invoking the fixture again
-        #
         # NOTE(sdague): it's important to reestablish the db
         # connection because otherwise we have a reference to the old
         # in mem db.
-        self.useFixture(fixtures.Database())
+        db_fixture.reset()
+        engine = main_db_api.get_engine()
         conn = engine.connect()
-        result = conn.execute("select * from instance_types")
+        result = conn.execute(sa.text("SELECT * FROM instance_types"))
         rows = result.fetchall()
         self.assertEqual(0, len(rows), "Rows %s" % rows)
 
     def test_api_fixture_reset(self):
         # This sets up reasonable db connection strings
         self.useFixture(fixtures.ConfFixture())
-        self.useFixture(fixtures.Database(database='api'))
+        db_fixture = fixtures.Database(database='api')
+        self.useFixture(db_fixture)
         engine = api_db_api.get_engine()
         conn = engine.connect()
-        result = conn.execute("select * from cell_mappings")
+        result = conn.execute(sa.text("SELECT * FROM cell_mappings"))
         rows = result.fetchall()
         self.assertEqual(0, len(rows), "Rows %s" % rows)
 
         uuid = uuidutils.generate_uuid()
-        conn.execute("insert into cell_mappings (uuid, name) VALUES "
-                     "('%s', 'fake-cell')" % (uuid,))
-        result = conn.execute("select * from cell_mappings")
+        conn.execute(
+            sa.text(
+                "INSERT INTO cell_mappings (uuid, name) VALUES (:uuid, :name)"
+            ).bindparams(uuid=uuid, name='fake-cell'),
+        )
+        result = conn.execute(sa.text("SELECT * FROM cell_mappings"))
         rows = result.fetchall()
         self.assertEqual(1, len(rows), "Rows %s" % rows)
 
-        # reset by invoking the fixture again
-        #
         # NOTE(sdague): it's important to reestablish the db
         # connection because otherwise we have a reference to the old
         # in mem db.
-        self.useFixture(fixtures.Database(database='api'))
+        db_fixture.reset()
+        engine = api_db_api.get_engine()
         conn = engine.connect()
-        result = conn.execute("select * from cell_mappings")
+        result = conn.execute(sa.text("SELECT * FROM cell_mappings"))
         rows = result.fetchall()
         self.assertEqual(0, len(rows), "Rows %s" % rows)
 
@@ -202,9 +221,12 @@ class TestDatabaseFixture(testtools.TestCase):
         engine = api_db_api.get_engine()
         conn = engine.connect()
         uuid = uuidutils.generate_uuid()
-        conn.execute("insert into cell_mappings (uuid, name) VALUES "
-                     "('%s', 'fake-cell')" % (uuid,))
-        result = conn.execute("select * from cell_mappings")
+        conn.execute(
+            sa.text(
+                "INSERT INTO cell_mappings (uuid, name) VALUES (:uuid, :name)"
+            ).bindparams(uuid=uuid, name='fake-cell'),
+        )
+        result = conn.execute(sa.text("SELECT * FROM cell_mappings"))
         rows = result.fetchall()
         self.assertEqual(1, len(rows), "Rows %s" % rows)
 
@@ -227,13 +249,13 @@ class TestDefaultFlavorsFixture(testtools.TestCase):
 
         engine = api_db_api.get_engine()
         conn = engine.connect()
-        result = conn.execute("select * from flavors")
+        result = conn.execute(sa.text("SELECT * FROM flavors"))
         rows = result.fetchall()
         self.assertEqual(0, len(rows), "Rows %s" % rows)
 
         self.useFixture(fixtures.DefaultFlavorsFixture())
 
-        result = conn.execute("select * from flavors")
+        result = conn.execute(sa.text("SELECT * FROM flavors"))
         rows = result.fetchall()
         self.assertEqual(6, len(rows), "Rows %s" % rows)
 
@@ -323,7 +345,7 @@ class TestSynchronousThreadPoolExecutorFixture(testtools.TestCase):
 
 class TestBannedDBSchemaOperations(testtools.TestCase):
     def test_column(self):
-        column = sqlalchemy.Column()
+        column = sa.Column()
         with fixtures.BannedDBSchemaOperations(['Column']):
             self.assertRaises(exception.DBNotAllowed,
                               column.drop)
@@ -331,7 +353,7 @@ class TestBannedDBSchemaOperations(testtools.TestCase):
                               column.alter)
 
     def test_table(self):
-        table = sqlalchemy.Table()
+        table = sa.Table("foo", sa.MetaData())
         with fixtures.BannedDBSchemaOperations(['Table']):
             self.assertRaises(exception.DBNotAllowed,
                               table.drop)

@@ -28,13 +28,17 @@ keystone_group = cfg.OptGroup(
 def register_opts(conf):
     conf.register_group(keystone_group)
     confutils.register_ksa_opts(conf, keystone_group.name,
-                                DEFAULT_SERVICE_TYPE, include_auth=False)
+                                DEFAULT_SERVICE_TYPE, include_auth=True)
 
 
 def list_opts():
     return {
         keystone_group: (
             ks_loading.get_session_conf_options() +
+            ks_loading.get_auth_common_conf_options() +
+            ks_loading.get_auth_plugin_conf_options('password') +
+            ks_loading.get_auth_plugin_conf_options('v2password') +
+            ks_loading.get_auth_plugin_conf_options('v3password') +
             confutils.get_ksa_adapter_opts(DEFAULT_SERVICE_TYPE)
         )
     }

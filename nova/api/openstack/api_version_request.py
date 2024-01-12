@@ -235,7 +235,7 @@ REST_API_VERSION_HISTORY = """REST API Version History:
              ``POST /flavors/{flavor_id}/os-extra_specs`` and
              ``PUT /flavors/{flavor_id}/os-extra_specs/{id}`` APIs.
     * 2.87 - Adds support for rescuing boot from volume instances when the
-             compute host reports the COMPUTE_BFV_RESCUE capability trait.
+             compute host reports the COMPUTE_RESCUE_BFV capability trait.
     * 2.88 - Drop statistics-style fields from the ``/os-hypervisors/detail``
              and ``/os-hypervisors/{hypervisor_id}`` APIs, and remove the
              ``/os-hypervisors/statistics`` and
@@ -247,6 +247,14 @@ REST_API_VERSION_HISTORY = """REST API Version History:
              updating or rebuilding an instance. The
              ``OS-EXT-SRV-ATTR:hostname`` attribute is now returned in various
              server responses regardless of policy configuration.
+    * 2.91 - Add support to unshelve instance to a specific host and
+             to pin/unpin AZ.
+    * 2.92 - Drop generation of keypair, add keypair name validation on
+             ``POST /os-keypairs`` and allow including @ and dot (.) characters
+             in keypair name.
+    * 2.93 - Add support for volume backed server rebuild.
+    * 2.94 - Allow FQDN in server hostname.
+    * 2.95 - Evacuate will now stop instance at destination.
 """
 
 # The minimum and maximum versions of the API supported
@@ -255,7 +263,7 @@ REST_API_VERSION_HISTORY = """REST API Version History:
 # Note(cyeoh): This only applies for the v2.1 API once microversions
 # support is fully merged. It does not affect the V2 API.
 _MIN_API_VERSION = '2.1'
-_MAX_API_VERSION = '2.90'
+_MAX_API_VERSION = '2.95'
 DEFAULT_API_VERSION = _MIN_API_VERSION
 
 # Almost all proxy APIs which are related to network, images and baremetal

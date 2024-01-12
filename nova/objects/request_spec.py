@@ -14,12 +14,15 @@
 
 import copy
 import itertools
+import typing as ty
 
 import os_resource_classes as orc
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import versionutils
 
+from nova.compute import pci_placement_translator
+import nova.conf
 from nova.db.api import api as api_db_api
 from nova.db.api import models as api_models
 from nova import exception
@@ -28,6 +31,7 @@ from nova.objects import base
 from nova.objects import fields
 from nova.objects import instance as obj_instance
 
+CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
 
 REQUEST_SPEC_OPTIONAL_ATTRS = ['requested_destination',
@@ -140,6 +144,7 @@ class RequestSpec(base.NovaObject):
             if 'requested_destination' in primitive:
                 del primitive['requested_destination']
 
+    @base.lazy_load_counter
     def obj_load_attr(self, attrname):
         if attrname not in REQUEST_SPEC_OPTIONAL_ATTRS:
             raise exception.ObjectActionError(
@@ -248,9 +253,9 @@ class RequestSpec(base.NovaObject):
 
     def _from_instance_pci_requests(self, pci_requests):
         if isinstance(pci_requests, dict):
-            pci_req_cls = objects.InstancePCIRequests
-            self.pci_requests = pci_req_cls.from_request_spec_instance_props(
-                pci_requests)
+            self.pci_requests = objects.InstancePCIRequests.obj_from_primitive(
+                pci_requests,
+            )
         else:
             self.pci_requests = pci_requests
 
@@ -473,6 +478,113 @@ class RequestSpec(base.NovaObject):
             filt_props['requested_destination'] = self.requested_destination
         return filt_props
 
+    @staticmethod
+    def _rc_from_request(spec: ty.Dict[str, ty.Any]) -> str:
+        return pci_placement_translator.get_resource_class(
+            spec.get("resource_class"),
+            spec.get("vendor_id"),
+            spec.get("product_id"),
+        )
+
+    @staticmethod
+    def _traits_from_request(spec: ty.Dict[str, ty.Any]) -> ty.Set[str]:
+        return pci_placement_translator.get_traits(spec.get("traits", ""))
+
+    def generate_request_groups_from_pci_requests(self):
+        if not CONF.filter_scheduler.pci_in_placement:
+            return False
+
+        for pci_request in self.pci_requests.requests:
+            if pci_request.source == objects.InstancePCIRequest.NEUTRON_PORT:
+                # TODO(gibi): Handle neutron based PCI requests here in a later
+                # cycle.
+                continue
+
+            if len(pci_request.spec) != 1:
+                # We are instantiating InstancePCIRequest objects with spec in
+                # two cases:
+                # 1) when a neutron port is translated to InstancePCIRequest
+                #    object in
+                #    nova.network.neutron.API.create_resource_requests
+                # 2) when the pci_passthrough:alias flavor extra_spec is
+                #    translated to InstancePCIRequest objects in
+                #    nova.pci.request._get_alias_from_config which enforces the
+                #    json schema defined in nova.pci.request.
+                #
+                # In both cases only a single dict is added to the spec list.
+                # If we ever want to add support for multiple specs per request
+                # then we have to solve the issue that each spec can request a
+                # different resource class from placement. The only place in
+                # nova that currently handles multiple specs per request is
+                # nova.pci.utils.pci_device_prop_match() and it considers them
+                # as alternatives. So specs with different resource classes
+                # would mean alternative resource_class requests. This cannot
+                # be expressed today in the allocation_candidate query towards
+                # placement.
+                raise ValueError(
+                    "PCI tracking in placement does not support multiple "
+                    "specs per PCI request"
+                )
+
+            spec = pci_request.spec[0]
+
+            # The goal is to translate InstancePCIRequest to RequestGroup. Each
+            # InstancePCIRequest can be fulfilled from the whole RP tree. And
+            # a flavor based InstancePCIRequest might request more than one
+            # device (if count > 1) and those devices still need to be placed
+            # independently to RPs.  So we could have two options to translate
+            # an InstancePCIRequest object to RequestGroup objects:
+            # 1) put the all the requested resources from every
+            #    InstancePCIRequest to the unsuffixed RequestGroup.
+            # 2) generate a separate RequestGroup for each individual device
+            #    request
+            #
+            # While #1) feels simpler it has a big downside. The unsuffixed
+            # group will have a bulk request group resource provider mapping
+            # returned from placement. So there would be no easy way to later
+            # untangle which InstancePCIRequest is fulfilled by which RP, and
+            # therefore which PCI device should be used to allocate a specific
+            # device on the hypervisor during the PCI claim. Note that there
+            # could be multiple PF RPs providing the same type of resources but
+            # still we need to make sure that if a resource is allocated in
+            # placement from a specific RP (representing a physical device)
+            # then the PCI claim should consume resources from the same
+            # physical device.
+            #
+            # So we need at least a separate RequestGroup per
+            # InstancePCIRequest. However, for a InstancePCIRequest(count=2)
+            # that would mean a RequestGroup(RC:2) which would mean both
+            # resource should come from the same RP in placement. This is
+            # impossible for PF or PCI type requests and over restrictive for
+            # VF type requests. Therefore we need to generate one RequestGroup
+            # per requested device. So for InstancePCIRequest(count=2) we need
+            # to generate two separate RequestGroup(RC:1) objects.
+
+            # NOTE(gibi): If we have count=2 requests then the multiple
+            # RequestGroup split below only works if group_policy is set to
+            # none as group_policy=isolate would prevent allocating two VFs
+            # from the same PF. Fortunately
+            # nova.scheduler.utils.resources_from_request_spec() already
+            # defaults group_policy to none if it is not specified in the
+            # flavor and there are multiple RequestGroups in the RequestSpec.
+
+            for i in range(pci_request.count):
+                rg = objects.RequestGroup(
+                    use_same_provider=True,
+                    # we need to generate a unique ID for each group, so we use
+                    # a counter
+                    requester_id=f"{pci_request.request_id}-{i}",
+                    # as we split count >= 2 requests to independent groups
+                    # each group will have a resource request of one
+                    resources={
+                        self._rc_from_request(spec): 1
+                    },
+                    required_traits=self._traits_from_request(spec),
+                    # TODO(gibi): later we can add support for complex trait
+                    # queries here including forbidden_traits.
+                )
+                self.requested_resources.append(rg)
+
     @classmethod
     def from_components(
         cls, context, instance_uuid, image, flavor,
@@ -539,6 +651,8 @@ class RequestSpec(base.NovaObject):
         if port_resource_requests:
             spec_obj.requested_resources.extend(port_resource_requests)
 
+        spec_obj.generate_request_groups_from_pci_requests()
+
         # NOTE(gibi): later the scheduler adds more request level params but
         # never overrides existing ones so we can initialize them here.
         if request_level_params is None:
@@ -596,6 +710,8 @@ class RequestSpec(base.NovaObject):
     @staticmethod
     def _from_db_object(context, spec, db_spec):
         spec_obj = spec.obj_from_primitive(jsonutils.loads(db_spec['spec']))
+        data_migrated = False
+
         for key in spec.fields:
             # Load these from the db model not the serialized object within,
             # though they should match.
@@ -616,6 +732,13 @@ class RequestSpec(base.NovaObject):
                 # fields. If they are not set, set None.
                 if not spec.obj_attr_is_set(key):
                     setattr(spec, key, None)
+            elif key == "numa_topology":
+                if key in spec_obj:
+                    spec.numa_topology = spec_obj.numa_topology
+                    if spec.numa_topology:
+                        data_migrated = objects.InstanceNUMATopology.\
+                            _migrate_legacy_dedicated_instance_cpuset(
+                                spec.numa_topology)
             elif key in spec_obj:
                 setattr(spec, key, getattr(spec_obj, key))
         spec._context = context
@@ -636,6 +759,10 @@ class RequestSpec(base.NovaObject):
             except exception.InstanceGroupNotFound:
                 # NOTE(danms): Instance group may have been deleted
                 spec.instance_group = None
+                spec.scheduler_hints.pop('group', None)
+
+        if data_migrated:
+            spec.save()
 
         spec.obj_reset_changes()
         return spec

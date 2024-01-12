@@ -31,12 +31,12 @@ LOG = logging.getLogger(__name__)
 
 
 # NOTE(danms): This is the global service version counter
-SERVICE_VERSION = 60
+SERVICE_VERSION = 66
 
 
 # NOTE(danms): This is our SERVICE_VERSION history. The idea is that any
 # time we bump the version, we will put an entry here to record the change,
-# along with any pertinent data. For things that we can programatically
+# along with any pertinent data. For things that we can programmatically
 # detect that need a bump, we put something in _collect_things() below to
 # assemble a dict of things we can check. For example, we pretty much always
 # want to consider the compute RPC API version a thing that requires a service
@@ -213,16 +213,55 @@ SERVICE_VERSION_HISTORY = (
     # Add support for interface attach operation with neutron extended resource
     # request
     {'compute_rpc': '6.0'},
+    # Version 61: Compute RPC v6.0:
+    # Add support for remotely-managed ports (vnic-type 'remote-managed')
+    {'compute_rpc': '6.0'},
+    # Version 62: Compute RPC v6.0:
+    # Add support for VDPA port attach/detach
+    {'compute_rpc': '6.0'},
+    # Version 63: Compute RPC v6.0:
+    # Add support for VDPA hotplug live migration and suspend/resume
+    {'compute_rpc': '6.0'},
+    # Version 64: Compute RPC v6.1:
+    # Add reimage_boot_volume parameter to rebuild_instance()
+    {'compute_rpc': '6.1'},
+    # Version 65: Compute RPC v6.1:
+    # Added stable local node identity
+    {'compute_rpc': '6.1'},
+    # Version 66: Compute RPC v6.2:
+    # Add target_state parameter to rebuild_instance()
+    {'compute_rpc': '6.2'},
 )
 
-# This is used to raise an error at service startup if older than N-1 computes
-# are detected. Update this at the beginning of every release cycle to point to
-# the smallest service version that was added in N-1.
-OLDEST_SUPPORTED_SERVICE_VERSION = 'Xena'
+# This is the version after which we can rely on having a persistent
+# local node identity for single-node systems.
+NODE_IDENTITY_VERSION = 65
+
+# This is used to raise an error at service startup if older than supported
+# computes are detected.
+# NOTE(sbauza) : Please modify it this way :
+#  * At the beginning of a non-SLURP release (eg. 2023.2 Bobcat) (or just after
+#    the previous SLURP release RC1, like 2023.1 Antelope), please bump
+#    OLDEST_SUPPORTED_SERVICE_VERSION to the previous SLURP release (in that
+#    example, Antelope)
+#  * At the beginning of a SLURP release (eg. 2024.1 C) (or just after the
+#    previous non-SLURP release RC1, like 2023.2 Bobcat), please keep the
+#    OLDEST_SUPPORTED_SERVICE_VERSION value using the previous SLURP release
+#    (in that example, Antelope)
+#  * At the end of any release (SLURP or non-SLURP), please modify
+#    SERVICE_VERSION_ALIASES to add a key/value with key being the release name
+#    and value be the latest service version that the release supports (for
+#    example, before Bobcat RC1, please add 'Bobcat': XX where X is the latest
+#    servion version that was added)
+OLDEST_SUPPORTED_SERVICE_VERSION = 'Antelope'
 SERVICE_VERSION_ALIASES = {
     'Victoria': 52,
     'Wallaby': 54,
     'Xena': 57,
+    'Yoga': 61,
+    'Zed': 64,
+    'Antelope': 66,
+    'Bobcat': 66,
 }
 
 
@@ -350,6 +389,7 @@ class Service(base.NovaPersistentObject, base.NovaObject,
 
         return service
 
+    @base.lazy_load_counter
     def obj_load_attr(self, attrname):
         if not self._context:
             raise exception.OrphanedObjectError(method='obj_load_attr',

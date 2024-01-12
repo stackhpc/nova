@@ -81,6 +81,18 @@ hosting the instance. This could even include refreshing different elements of
 the attachment to ensure the latest configuration changes within the
 environment have been applied.
 
+.. note::
+
+    If you encounter any dangling volume attachments in either the Nova or
+    Cinder databases, a ``hard reboot`` of the affected instance can help
+    resolve the issue. During the instance reboot process, Nova performs
+    a synchronization mechanism that verifies the availability of volume
+    attachments in the Cinder database. Any missing or dangling/stale
+    attachments are detected and deleted from both Nova and Cinder during
+    ``hard reboot`` process.
+
+
+
 Checking an existing attachment
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -188,9 +200,9 @@ fetched using the `volume_attachment get_connector` subcommand:
 
 .. note::
 
-    Future work will remove this requirement and incorperate the gathering of
-    the host connector into the main refresh command. Unfortunatley until then
-    it must remain a seperate manual step.
+    Future work will remove this requirement and incorporate the gathering of
+    the host connector into the main refresh command. Unfortunately until then
+    it must remain a separate manual step.
 
 We can then provide this connector to the `volume_attachment refresh`
 subcommand. This command will connect to the compute, disconnect any host

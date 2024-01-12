@@ -27,22 +27,32 @@ config = context.config
 if config.attributes.get('configure_logger', True):
     fileConfig(config.config_file_name)
 
-# add your model's MetaData object here
-# for 'autogenerate' support
-# from myapp import mymodel
-# target_metadata = mymodel.Base.metadata
+# this is the MetaData object for the various models in the main database
 target_metadata = models.BASE.metadata
 
 
 def include_name(name, type_, parent_names):
+    """Determine which tables or columns to skip.
+
+    This is used when we decide to "delete" a table or column. In this
+    instance, we will remove the SQLAlchemy model or field but leave the
+    underlying database table or column in place for a number of releases
+    after. Once we're sure that there is no code running that contains
+    references to the old models, we can then remove the underlying table. In
+    the interim, we must track the discrepancy between models and actual
+    database data here.
+    """
     if type_ == 'table':
-        return not name.startswith('shadow_')
+        # NOTE(stephenfin): We don't have models corresponding to the various
+        # shadow tables. Alembic doesn't like this. Tell Alembic to look the
+        # other way. Good Alembic.
+        if name.startswith('shadow_'):
+            return False
+
+        return name not in models.REMOVED_TABLES
 
     if type_ == 'column':
-        return (parent_names['table_name'], name) not in {
-            ('instances', 'internal_id'),
-            ('instance_extra', 'vpmems'),
-        }
+        return (parent_names['table_name'], name) not in models.REMOVED_COLUMNS
 
     return True
 
@@ -60,6 +70,7 @@ def run_migrations_offline():
     context.configure(
         url=url,
         target_metadata=target_metadata,
+        render_as_batch=True,
         include_name=include_name,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -90,14 +101,21 @@ def run_migrations_online():
             prefix="sqlalchemy.",
             poolclass=pool.NullPool,
         )
+        with connectable.connect() as connection:
+            context.configure(
+                connection=connection,
+                target_metadata=target_metadata,
+                render_as_batch=True,
+                include_name=include_name,
+            )
 
-    # when connectable is already a Connection object, calling connect() gives
-    # us a *branched connection*.
-
-    with connectable.connect() as connection:
+            with context.begin_transaction():
+                context.run_migrations()
+    else:
         context.configure(
-            connection=connection,
+            connection=connectable,
             target_metadata=target_metadata,
+            render_as_batch=True,
             include_name=include_name,
         )
 

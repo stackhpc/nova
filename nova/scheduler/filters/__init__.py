@@ -16,7 +16,11 @@
 """
 Scheduler host filters
 """
+from oslo_log import log as logging
+
 from nova import filters
+
+LOG = logging.getLogger(__name__)
 
 
 class BaseHostFilter(filters.BaseFilter):
@@ -28,6 +32,9 @@ class BaseHostFilter(filters.BaseFilter):
     # other parameters. We care about running policy filters (i.e.
     # ImagePropertiesFilter) but not things that check usage on the
     # existing compute node, etc.
+    # This also means that filters marked with RUN_ON_REBUILD = True cannot
+    # filter on allocation candidates or need to handle the rebuild case
+    # specially.
     RUN_ON_REBUILD = False
 
     def _filter_one(self, obj, spec):
@@ -48,6 +55,43 @@ class BaseHostFilter(filters.BaseFilter):
         Override this in a subclass.
         """
         raise NotImplementedError()
+
+
+class CandidateFilterMixin:
+    """Mixing that helps to implement a Filter that needs to filter host by
+    Placement allocation candidates.
+    """
+
+    def filter_candidates(self, host_state, filter_func):
+        """Checks still viable allocation candidates by the filter_func and
+        keep only those that are passing it.
+
+        :param host_state: HostState object holding the list of still viable
+            allocation candidates
+        :param filter_func: A callable that takes an allocation candidate and
+            returns a True like object if the candidate passed the filter or a
+            False like object if it doesn't.
+        """
+        good_candidates = []
+        for candidate in host_state.allocation_candidates:
+            LOG.debug(
+                f'{self.__class__.__name__} tries allocation candidate: '
+                f'{candidate}',
+            )
+            if filter_func(candidate):
+                LOG.debug(
+                    f'{self.__class__.__name__} accepted allocation '
+                    f'candidate: {candidate}',
+                )
+                good_candidates.append(candidate)
+            else:
+                LOG.debug(
+                    f'{self.__class__.__name__} rejected allocation '
+                    f'candidate: {candidate}',
+                )
+
+        host_state.allocation_candidates = good_candidates
+        return good_candidates
 
 
 class HostFilterHandler(filters.BaseFilterHandler):

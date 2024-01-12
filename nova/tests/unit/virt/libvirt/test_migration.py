@@ -15,9 +15,9 @@
 from collections import deque
 import copy
 import textwrap
+from unittest import mock
 
 from lxml import etree
-import mock
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import units
 
@@ -28,6 +28,7 @@ from nova import objects
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.fixtures import libvirt as fakelibvirt
+from nova.tests.unit.virt.libvirt import test_driver
 from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt import guest as libvirt_guest
 from nova.virt.libvirt import host
@@ -80,15 +81,50 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
         get_volume_config = mock.MagicMock()
         mock_guest.get_xml_desc.return_value = '<domain></domain>'
 
-        migration.get_updated_guest_xml(
-            mock.sentinel.instance, mock_guest, data, get_volume_config)
+        instance = objects.Instance(**test_driver._create_test_instance())
+        migration.get_updated_guest_xml(instance, mock_guest, data,
+                                        get_volume_config)
         mock_graphics.assert_called_once_with(mock.ANY, data)
         mock_serial.assert_called_once_with(mock.ANY, data)
         mock_volume.assert_called_once_with(
-            mock.ANY, data, mock.sentinel.instance, get_volume_config)
+            mock.ANY, data, instance, get_volume_config)
         mock_perf_events_xml.assert_called_once_with(mock.ANY, data)
         mock_memory_backing.assert_called_once_with(mock.ANY, data)
         self.assertEqual(1, mock_tostring.called)
+
+    def test_update_quota_xml(self):
+        old_xml = """<domain>
+                         <name>fake-instance</name>
+                         <cputune>
+                             <shares>42</shares>
+                             <period>1337</period>
+                         </cputune>
+                     </domain>"""
+        instance = objects.Instance(**test_driver._create_test_instance())
+        new_xml = migration._update_quota_xml(instance,
+                                              etree.fromstring(old_xml))
+        new_xml = etree.tostring(new_xml, encoding='unicode')
+        self.assertXmlEqual(
+            """<domain>
+                   <name>fake-instance</name>
+                   <cputune>
+                       <period>1337</period>
+                   </cputune>
+               </domain>""", new_xml)
+
+    def test_update_quota_xml_empty_cputune(self):
+        old_xml = """<domain>
+                         <name>fake-instance</name>
+                         <cputune>
+                             <shares>42</shares>
+                         </cputune>
+                     </domain>"""
+        instance = objects.Instance(**test_driver._create_test_instance())
+        new_xml = migration._update_quota_xml(instance,
+                                              etree.fromstring(old_xml))
+        new_xml = etree.tostring(new_xml, encoding='unicode')
+        self.assertXmlEqual('<domain><name>fake-instance</name></domain>',
+                            new_xml)
 
     def test_update_device_resources_xml_vpmem(self):
         # original xml for vpmems, /dev/dax0.1 and /dev/dax0.2 here
@@ -949,7 +985,48 @@ class UtilityMigrationTestCase(test.NoDBTestCase):
         doc = etree.fromstring(original_xml)
         ex = self.assertRaises(KeyError, migration._update_vif_xml,
                                doc, data, get_vif_config)
-        self.assertIn("CA:FE:DE:AD:BE:EF", str(ex))
+        self.assertIn("ca:fe:de:ad:be:ef", str(ex))
+
+    def test_update_vif_xml_lower_case_mac(self):
+        """Tests that the vif in the migrate data is not found in the existing
+        guest interfaces.
+        """
+        conf = vconfig.LibvirtConfigGuestInterface()
+        conf.net_type = "bridge"
+        conf.source_dev = "qbra188171c-ea"
+        conf.target_dev = "tapa188171c-ea"
+        conf.mac_addr = "DE:AD:BE:EF:CA:FE"
+        conf.model = "virtio"
+        original_xml = """<domain>
+        <uuid>3de6550a-8596-4937-8046-9d862036bca5</uuid>
+        <devices>
+            <interface type="bridge">
+                <mac address="de:ad:be:ef:ca:fe"/>
+                <model type="virtio"/>
+                <source bridge="qbra188171c-ea"/>
+                <target dev="tapa188171c-ea"/>
+                <virtualport type="openvswitch">
+                    <parameters interfaceid="%s"/>
+                </virtualport>
+                <address type='pci' domain='0x0000' bus='0x00' slot='0x04'
+                        function='0x0'/>
+            </interface>
+        </devices>
+        </domain>""" % uuids.ovs
+        expected_xml = """<domain>
+         <uuid>3de6550a-8596-4937-8046-9d862036bca5</uuid>
+         <devices>
+            <interface type="bridge">
+                <mac address="DE:AD:BE:EF:CA:FE"/>
+                <model type="virtio"/>
+                <source bridge="qbra188171c-ea"/>
+                <target dev="tapa188171c-ea"/>
+                <address type='pci' domain='0x0000' bus='0x00' slot='0x04'
+                 function='0x0'/>
+            </interface>
+         </devices>
+        </domain>"""
+        self._test_update_vif_xml(conf, original_xml, expected_xml)
 
 
 class MigrationMonitorTestCase(test.NoDBTestCase):

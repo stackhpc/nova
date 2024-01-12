@@ -21,10 +21,10 @@ import sys
 import traceback
 
 from keystoneauth1 import exceptions as ks_exc
+import microversion_parse
 from oslo_config import cfg
 from oslo_upgradecheck import common_checks
 from oslo_upgradecheck import upgradecheck
-import pkg_resources
 import sqlalchemy as sa
 from sqlalchemy import func as sqlfunc
 
@@ -41,7 +41,6 @@ from nova.objects import cell_mapping as cell_mapping_obj
 # to be registered under nova.objects when called via _check_machine_type_set
 from nova.objects import image_meta as image_meta_obj  # noqa: F401
 from nova.objects import instance as instance_obj  # noqa: F401
-from nova import policy
 from nova import utils
 from nova import version
 from nova.virt.libvirt import machine_type_utils
@@ -87,10 +86,15 @@ class UpgradeCommands(upgradecheck.UpgradeCommands):
         # table, or by only counting compute nodes with a service version of at
         # least 15 which was the highest service version when Newton was
         # released.
-        meta = sa.MetaData(bind=main_db_api.get_engine(context=context))
-        compute_nodes = sa.Table('compute_nodes', meta, autoload=True)
-        return sa.select([sqlfunc.count()]).select_from(compute_nodes).where(
-            compute_nodes.c.deleted == 0).scalar()
+        meta = sa.MetaData()
+        engine = main_db_api.get_engine(context=context)
+        compute_nodes = sa.Table('compute_nodes', meta, autoload_with=engine)
+        with engine.connect() as conn:
+            return conn.execute(
+                sa.select(sqlfunc.count()).select_from(compute_nodes).where(
+                    compute_nodes.c.deleted == 0
+                )
+            ).scalars().first()
 
     def _check_cellsv2(self):
         """Checks to see if cells v2 has been setup.
@@ -104,7 +108,7 @@ class UpgradeCommands(upgradecheck.UpgradeCommands):
         for compute nodes if there are no host mappings on a fresh install.
         """
         meta = sa.MetaData()
-        meta.bind = api_db_api.get_engine()
+        engine = api_db_api.get_engine()
 
         cell_mappings = self._get_cell_mappings()
         count = len(cell_mappings)
@@ -123,9 +127,13 @@ class UpgradeCommands(upgradecheck.UpgradeCommands):
                     'retry.')
             return upgradecheck.Result(upgradecheck.Code.FAILURE, msg)
 
-        host_mappings = sa.Table('host_mappings', meta, autoload=True)
-        count = sa.select([sqlfunc.count()]).select_from(host_mappings)\
-            .scalar()
+        host_mappings = sa.Table('host_mappings', meta, autoload_with=engine)
+
+        with engine.connect() as conn:
+            count = conn.execute(
+                sa.select(sqlfunc.count()).select_from(host_mappings)
+            ).scalars().first()
+
         if count == 0:
             # This may be a fresh install in which case there may not be any
             # compute_nodes in the cell database if the nova-compute service
@@ -166,9 +174,9 @@ class UpgradeCommands(upgradecheck.UpgradeCommands):
         try:
             # TODO(efried): Use ksa's version filtering in _placement_get
             versions = self._placement_get("/")
-            max_version = pkg_resources.parse_version(
+            max_version = microversion_parse.parse_version_string(
                 versions["versions"][0]["max_version"])
-            needs_version = pkg_resources.parse_version(
+            needs_version = microversion_parse.parse_version_string(
                 MIN_PLACEMENT_MICROVERSION)
             if max_version < needs_version:
                 msg = (_('Placement API version %(needed)s needed, '
@@ -240,77 +248,13 @@ class UpgradeCommands(upgradecheck.UpgradeCommands):
                 str(ex))
         return upgradecheck.Result(upgradecheck.Code.SUCCESS)
 
-    def _check_policy(self):
-        """Checks to see if policy file is overwritten with the new
-        defaults.
-        """
-        msg = _("Your policy file contains rules which examine token scope, "
-                "which may be due to generation with the new defaults. "
-                "If that is done intentionally to migrate to the new rule "
-                "format, then you are required to enable the flag "
-                "'oslo_policy.enforce_scope=True' and educate end users on "
-                "how to request scoped tokens from Keystone. Another easy "
-                "and recommended way for you to achieve the same is via two "
-                "flags, 'oslo_policy.enforce_scope=True' and "
-                "'oslo_policy.enforce_new_defaults=True' and avoid "
-                "overwriting the file. Please refer to this document to "
-                "know the complete migration steps: "
-                "https://docs.openstack.org/nova/latest/configuration"
-                "/policy-concepts.html. If you did not intend to migrate "
-                "to new defaults in this upgrade, then with your current "
-                "policy file the scope checking rule will fail. A possible "
-                "reason for such a policy file is that you generated it with "
-                "'oslopolicy-sample-generator' in json format. "
-                "Three ways to fix this until you are ready to migrate to "
-                "scoped policies: 1. Generate the policy file with "
-                "'oslopolicy-sample-generator' in yaml format, keep "
-                "the generated content commented out, and update "
-                "the generated policy.yaml location in "
-                "``oslo_policy.policy_file``. "
-                "2. Use a pre-existing sample config file from the Train "
-                "release. 3. Use an empty or non-existent file to take all "
-                "the defaults.")
-        rule = "system_admin_api"
-        rule_new_default = "role:admin and system_scope:all"
-        status = upgradecheck.Result(upgradecheck.Code.SUCCESS)
-        # NOTE(gmann): Initialise the policy if it not initialized.
-        # We need policy enforcer with all the rules loaded to check
-        # their value with defaults.
-        try:
-            if policy._ENFORCER is None:
-                policy.init(suppress_deprecation_warnings=True)
-
-            # For safer side, recheck that the enforcer is available before
-            # upgrade checks. If something is wrong on oslo side and enforcer
-            # is still not available the return warning to avoid any false
-            # result.
-            if policy._ENFORCER is not None:
-                current_rule = str(policy._ENFORCER.rules[rule]).strip("()")
-                if (current_rule == rule_new_default and
-                    not CONF.oslo_policy.enforce_scope):
-                    status = upgradecheck.Result(upgradecheck.Code.WARNING,
-                                                 msg)
-            else:
-                status = upgradecheck.Result(
-                    upgradecheck.Code.WARNING,
-                    _('Policy is not initialized to check the policy rules'))
-        except Exception as ex:
-            status = upgradecheck.Result(
-                upgradecheck.Code.WARNING,
-                _('Unable to perform policy checks due to error: %s') %
-                str(ex))
-        # reset the policy state so that it can be initialized from fresh if
-        # operator changes policy file after running this upgrade checks.
-        policy.reset()
-        return status
-
     def _check_old_computes(self):
         # warn if there are computes in the system older than the previous
         # major release
         try:
             utils.raise_if_old_compute()
         except exception.TooOldComputeService as e:
-            return upgradecheck.Result(upgradecheck.Code.WARNING, str(e))
+            return upgradecheck.Result(upgradecheck.Code.FAILURE, str(e))
 
         return upgradecheck.Result(upgradecheck.Code.SUCCESS)
 
@@ -322,9 +266,18 @@ Instances found without hw_machine_type set. This warning can be ignored if
 your environment does not contain libvirt based compute hosts.
 Use the `nova-manage machine_type list_unset` command to list these instances.
 For more details see the following:
-https://docs.openstack.org/latest/nova/admin/hw_machine_type.html"""))
+https://docs.openstack.org/nova/latest/admin/hw-machine-type.html"""))
             return upgradecheck.Result(upgradecheck.Code.WARNING, msg)
 
+        return upgradecheck.Result(upgradecheck.Code.SUCCESS)
+
+    def _check_service_user_token(self):
+        if not CONF.service_user.send_service_user_token:
+            msg = (_("""
+Service user token configuration is required for all Nova services.
+For more details see the following:
+https://docs.openstack.org/nova/latest/admin/configuration/service-user-token.html"""))  # noqa
+            return upgradecheck.Result(upgradecheck.Code.FAILURE, msg)
         return upgradecheck.Result(upgradecheck.Code.SUCCESS)
 
     # The format of the check functions is to return an upgradecheck.Result
@@ -341,8 +294,6 @@ https://docs.openstack.org/latest/nova/admin/hw_machine_type.html"""))
         (_('Placement API'), _check_placement),
         # Added in Train
         (_('Cinder API'), _check_cinder),
-        # Added in Ussuri
-        (_('Policy Scope-based Defaults'), _check_policy),
         # Added in Victoria
         (
             _('Policy File JSON to YAML Migration'),
@@ -352,6 +303,8 @@ https://docs.openstack.org/latest/nova/admin/hw_machine_type.html"""))
         (_('Older than N-1 computes'), _check_old_computes),
         # Added in Wallaby
         (_('hw_machine_type unset'), _check_machine_type_set),
+        # Added in Bobcat
+        (_('Service User Token Configuration'), _check_service_user_token),
     )
 
 

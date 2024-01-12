@@ -24,7 +24,7 @@ from nova.network import neutron
 from nova import objects
 from nova.scheduler.client import report
 from nova.scheduler import utils
-
+from nova.virt import hardware
 
 CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
@@ -142,8 +142,6 @@ def map_az_to_placement_aggregate(ctxt, request_spec):
     This will modify request_spec to request hosts in an aggregate that
     matches the desired AZ of the user's request.
     """
-    if not CONF.scheduler.query_placement_for_availability_zone:
-        return False
 
     az_hint = request_spec.availability_zone
     if not az_hint:
@@ -212,6 +210,9 @@ def transform_image_metadata(ctxt, request_spec):
         'hw_disk_bus': 'COMPUTE_STORAGE_BUS',
         'hw_video_model': 'COMPUTE_GRAPHICS_MODEL',
         'hw_vif_model': 'COMPUTE_NET_VIF_MODEL',
+        'hw_architecture': 'HW_ARCH',
+        'hw_emulation_architecture': 'COMPUTE_ARCH',
+        'hw_viommu_model': 'COMPUTE_VIOMMU',
     }
 
     trait_names = []
@@ -271,6 +272,22 @@ def accelerators_filter(ctxt, request_spec):
 
 
 @trace_request_filter
+def packed_virtqueue_filter(ctxt, request_spec):
+    """Allow only compute nodes with Packed virtqueue.
+
+    This filter retains only nodes whose compute manager published the
+    COMPUTE_NET_VIRTIO_PACKED trait, thus indicates virtqueue packed feature.
+    """
+    trait_name = os_traits.COMPUTE_NET_VIRTIO_PACKED
+    if (hardware.get_packed_virtqueue_constraint(request_spec.flavor,
+                                                 request_spec.image)):
+        request_spec.root_required.add(trait_name)
+        LOG.debug('virtqueue_filter request filter added required '
+                  'trait %s', trait_name)
+    return True
+
+
+@trace_request_filter
 def routed_networks_filter(
     ctxt: nova_context.RequestContext,
     request_spec: 'objects.RequestSpec'
@@ -309,7 +326,7 @@ def routed_networks_filter(
 
     # Get the clients we need
     network_api = neutron.API()
-    report_api = report.SchedulerReportClient()
+    report_api = report.report_client_singleton()
 
     for requested_network in requested_networks:
         network_id = None
@@ -365,6 +382,68 @@ def routed_networks_filter(
     return True
 
 
+@trace_request_filter
+def remote_managed_ports_filter(
+    context: nova_context.RequestContext,
+    request_spec: 'objects.RequestSpec',
+) -> bool:
+    """Filter out hosts without remote managed port support (driver or hw).
+
+    If a request spec contains VNIC_TYPE_REMOTE_MANAGED ports then a
+    remote-managed port trait (COMPUTE_REMOTE_MANAGED_PORTS) is added to
+    the request in order to pre-filter hosts that do not use compute
+    drivers supporting remote managed ports and the ones that do not have
+    the device pools providing remote-managed ports (actual device
+    availability besides a pool presence check is done at the time of
+    PciPassthroughFilter execution).
+    """
+    if request_spec.requested_networks:
+        network_api = neutron.API()
+        for request_net in request_spec.requested_networks:
+            if request_net.port_id and network_api.is_remote_managed_port(
+                context, request_net.port_id):
+                request_spec.root_required.add(
+                    os_traits.COMPUTE_REMOTE_MANAGED_PORTS)
+                LOG.debug('remote_managed_ports_filter request filter added '
+                          f'trait {os_traits.COMPUTE_REMOTE_MANAGED_PORTS}')
+    return True
+
+
+@trace_request_filter
+def ephemeral_encryption_filter(
+    ctxt: nova_context.RequestContext,
+    request_spec: 'objects.RequestSpec'
+) -> bool:
+    """Pre-filter resource provides by ephemeral encryption support
+
+    This filter will only retain compute node resource providers that support
+    ephemeral storage encryption when the associated image properties or flavor
+    extra specs are present within the request spec.
+    """
+    # Skip if ephemeral encryption isn't requested in the flavor or image
+    if not hardware.get_ephemeral_encryption_constraint(
+            request_spec.flavor, request_spec.image):
+        LOG.debug("ephemeral_encryption_filter skipped")
+        return False
+
+    # Always add the feature trait regardless of the format being provided
+    request_spec.root_required.add(os_traits.COMPUTE_EPHEMERAL_ENCRYPTION)
+    LOG.debug("ephemeral_encryption_filter added trait "
+              "COMPUTE_EPHEMERAL_ENCRYPTION")
+
+    # Try to find the format in the flavor or image and add as a trait
+    eph_format = hardware.get_ephemeral_encryption_format(
+        request_spec.flavor, request_spec.image)
+    if eph_format:
+        # We don't need to validate the trait here because the earlier call to
+        # get_ephemeral_encryption_format will raise if it is not valid
+        trait_name = f"COMPUTE_EPHEMERAL_ENCRYPTION_{eph_format.upper()}"
+        request_spec.root_required.add(trait_name)
+        LOG.debug(f"ephemeral_encryption_filter added trait {trait_name}")
+
+    return True
+
+
 ALL_REQUEST_FILTERS = [
     require_tenant_aggregate,
     map_az_to_placement_aggregate,
@@ -373,7 +452,10 @@ ALL_REQUEST_FILTERS = [
     isolate_aggregates,
     transform_image_metadata,
     accelerators_filter,
+    packed_virtqueue_filter,
     routed_networks_filter,
+    remote_managed_ports_filter,
+    ephemeral_encryption_filter,
 ]
 
 

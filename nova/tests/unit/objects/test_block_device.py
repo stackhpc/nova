@@ -12,7 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from oslo_utils.fixture import uuidsentinel as uuids
 
 from nova import context
@@ -250,6 +251,14 @@ class _TestBlockDeviceMappingObject(object):
                                          destination_type='local')
         self.assertFalse(bdm.is_volume)
 
+    def test_is_local(self):
+        self.assertTrue(
+            objects.BlockDeviceMapping(
+                context=self.context, destination_type='local').is_local)
+        self.assertFalse(
+            objects.BlockDeviceMapping(
+                context=self.context, destination_type='volume').is_local)
+
     def test_obj_load_attr_not_instance(self):
         """Tests that lazy-loading something other than the instance field
         results in an error.
@@ -274,6 +283,11 @@ class _TestBlockDeviceMappingObject(object):
         self.assertEqual(mock_inst_get_by_uuid.return_value, bdm.instance)
         mock_inst_get_by_uuid.assert_called_once_with(
             self.context, bdm.instance_uuid)
+
+    def test_obj_load_attr_encrypted(self):
+        bdm = objects.BlockDeviceMapping(self.context, **self.fake_bdm())
+        del bdm.encrypted
+        self.assertEqual(bdm.fields['encrypted'].default, bdm.encrypted)
 
     def test_obj_make_compatible_pre_1_17(self):
         values = {'source_type': 'volume', 'volume_id': 'fake-vol-id',

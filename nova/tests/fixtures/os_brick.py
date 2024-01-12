@@ -10,8 +10,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
 import fixtures
-import mock
 
 from os_brick.initiator import connector as brick_connector
 
@@ -35,7 +36,7 @@ def get_connector_properties(
 
 
 class ISCSIConnector(object):
-    """Mimick the iSCSI connector."""
+    """Mimic the iSCSI connector."""
 
     def __init__(
         self, root_helper, driver=None, execute=None, use_multipath=False,

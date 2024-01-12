@@ -20,8 +20,10 @@ Scheduler Service
 """
 
 import collections
+import copy
 import random
 
+from keystoneauth1 import exceptions as ks_exc
 from oslo_log import log as logging
 import oslo_messaging as messaging
 from oslo_serialization import jsonutils
@@ -66,9 +68,41 @@ class SchedulerManager(manager.Manager):
         self.host_manager = host_manager.HostManager()
         self.servicegroup_api = servicegroup.API()
         self.notifier = rpc.get_notifier('scheduler')
-        self.placement_client = report.SchedulerReportClient()
+        self._placement_client = None
+
+        try:
+            # Test our placement client during initialization
+            self.placement_client
+        except (ks_exc.EndpointNotFound,
+                ks_exc.DiscoveryFailure,
+                ks_exc.RequestTimeout,
+                ks_exc.GatewayTimeout,
+                ks_exc.ConnectFailure) as e:
+            # Non-fatal, likely transient (although not definitely);
+            # continue startup but log the warning so that when things
+            # fail later, it will be clear why we can not do certain
+            # things.
+            LOG.warning('Unable to initialize placement client (%s); '
+                        'Continuing with startup, but scheduling '
+                        'will not be possible.', e)
+        except (ks_exc.MissingAuthPlugin,
+                ks_exc.Unauthorized) as e:
+            # This is almost definitely fatal mis-configuration. The
+            # Unauthorized error might be transient, but it is
+            # probably reasonable to consider it fatal.
+            LOG.error('Fatal error initializing placement client; '
+                      'config is incorrect or incomplete: %s', e)
+            raise
+        except Exception as e:
+            # Unknown/unexpected errors here are fatal
+            LOG.error('Fatal error initializing placement client: %s', e)
+            raise
 
         super().__init__(service_name='scheduler', *args, **kwargs)
+
+    @property
+    def placement_client(self):
+        return report.report_client_singleton()
 
     @periodic_task.periodic_task(
         spacing=CONF.scheduler.discover_hosts_in_cells_interval,
@@ -299,11 +333,28 @@ class SchedulerManager(manager.Manager):
         # host, we virtually consume resources on it so subsequent
         # selections can adjust accordingly.
 
+        def hosts_with_alloc_reqs(hosts_gen):
+            """Extend the HostState objects returned by the generator with
+            the allocation requests of that host
+            """
+            for host in hosts_gen:
+                host.allocation_candidates = copy.deepcopy(
+                    alloc_reqs_by_rp_uuid[host.uuid])
+                yield host
+
         # Note: remember, we are using a generator-iterator here. So only
         # traverse this list once. This can bite you if the hosts
         # are being scanned in a filter or weighing function.
         hosts = self._get_all_host_states(
             elevated, spec_obj, provider_summaries)
+
+        # alloc_reqs_by_rp_uuid is None during rebuild, so this mean we cannot
+        # run filters that are using allocation candidates during rebuild
+        if alloc_reqs_by_rp_uuid is not None:
+            # wrap the generator to extend the HostState objects with the
+            # allocation requests for that given host. This is needed to
+            # support scheduler filters filtering on allocation candidates.
+            hosts = hosts_with_alloc_reqs(hosts)
 
         # NOTE(sbauza): The RequestSpec.num_instances field contains the number
         # of instances created when the RequestSpec was used to first boot some
@@ -332,6 +383,13 @@ class SchedulerManager(manager.Manager):
             # the older dict format representing HostState objects.
             # TODO(stephenfin): Remove this when we bump scheduler the RPC API
             # version to 5.0
+            # NOTE(gibi): We cannot remove this branch as it is actively used
+            # when nova calls the scheduler during rebuild (not evacuate) to
+            # check if the current host is still good for the new image used
+            # for the rebuild. In this case placement cannot be used to
+            # generate candidates as that would require space on the current
+            # compute for double allocation. So no allocation candidates for
+            # rebuild and therefore alloc_reqs_by_rp_uuid is None
             return self._legacy_find_hosts(
                 context, num_instances, spec_obj, hosts, num_alts,
                 instance_uuids=instance_uuids)
@@ -344,6 +402,9 @@ class SchedulerManager(manager.Manager):
 
         # The list of hosts that have been selected (and claimed).
         claimed_hosts = []
+
+        # The allocation request allocated on the given claimed host
+        claimed_alloc_reqs = []
 
         for num, instance_uuid in enumerate(instance_uuids):
             # In a multi-create request, the first request spec from the list
@@ -371,21 +432,20 @@ class SchedulerManager(manager.Manager):
             # resource provider UUID
             claimed_host = None
             for host in hosts:
-                cn_uuid = host.uuid
-                if cn_uuid not in alloc_reqs_by_rp_uuid:
-                    msg = ("A host state with uuid = '%s' that did not have a "
-                           "matching allocation_request was encountered while "
-                           "scheduling. This host was skipped.")
-                    LOG.debug(msg, cn_uuid)
+                if not host.allocation_candidates:
+                    LOG.debug(
+                        "The nova scheduler removed every allocation candidate"
+                        "for host %s so this host was skipped.",
+                        host
+                    )
                     continue
 
-                alloc_reqs = alloc_reqs_by_rp_uuid[cn_uuid]
                 # TODO(jaypipes): Loop through all allocation_requests instead
                 # of just trying the first one. For now, since we'll likely
                 # want to order the allocation_requests in the future based on
                 # information in the provider summaries, we'll just try to
                 # claim resources using the first allocation_request
-                alloc_req = alloc_reqs[0]
+                alloc_req = host.allocation_candidates[0]
                 if utils.claim_resources(
                     elevated, self.placement_client, spec_obj, instance_uuid,
                     alloc_req,
@@ -405,6 +465,15 @@ class SchedulerManager(manager.Manager):
 
             claimed_instance_uuids.append(instance_uuid)
             claimed_hosts.append(claimed_host)
+            claimed_alloc_reqs.append(alloc_req)
+
+            # update the provider mapping in the request spec based
+            # on the allocated candidate as the _consume_selected_host depends
+            # on this information to temporally consume PCI devices tracked in
+            # placement
+            for request_group in spec_obj.requested_resources:
+                request_group.provider_uuids = alloc_req[
+                    'mappings'][request_group.requester_id]
 
             # Now consume the resources so the filter/weights will change for
             # the next instance.
@@ -416,11 +485,19 @@ class SchedulerManager(manager.Manager):
         self._ensure_sufficient_hosts(
             context, claimed_hosts, num_instances, claimed_instance_uuids)
 
-        # We have selected and claimed hosts for each instance. Now we need to
-        # find alternates for each host.
+        # We have selected and claimed hosts for each instance along with a
+        # claimed allocation request. Now we need to find alternates for each
+        # host.
         return self._get_alternate_hosts(
-            claimed_hosts, spec_obj, hosts, num, num_alts,
-            alloc_reqs_by_rp_uuid, allocation_request_version)
+            claimed_hosts,
+            spec_obj,
+            hosts,
+            num,
+            num_alts,
+            alloc_reqs_by_rp_uuid,
+            allocation_request_version,
+            claimed_alloc_reqs,
+        )
 
     def _ensure_sufficient_hosts(
         self, context, hosts, required_count, claimed_uuids=None,
@@ -532,7 +609,21 @@ class SchedulerManager(manager.Manager):
     def _get_alternate_hosts(
         self, selected_hosts, spec_obj, hosts, index, num_alts,
         alloc_reqs_by_rp_uuid=None, allocation_request_version=None,
+        selected_alloc_reqs=None,
     ):
+        """Generate the main Selection and possible alternate Selection
+        objects for each "instance".
+
+        :param selected_hosts: This is a list of HostState objects. Each
+            HostState represents the main selection for a given instance being
+            scheduled (we can have multiple instances during multi create).
+        :param selected_alloc_reqs: This is a list of allocation requests that
+            are already allocated in placement for the main Selection for each
+            instance. This list is matching with selected_hosts by index. So
+            for the first instance the selected host is selected_host[0] and
+            the already allocated placement candidate is
+            selected_alloc_reqs[0].
+        """
         # We only need to filter/weigh the hosts again if we're dealing with
         # more than one instance and are going to be picking alternates.
         if index > 0 and num_alts > 0:
@@ -546,11 +637,10 @@ class SchedulerManager(manager.Manager):
         # representing the selected host along with alternates from the same
         # cell.
         selections_to_return = []
-        for selected_host in selected_hosts:
+        for i, selected_host in enumerate(selected_hosts):
             # This is the list of hosts for one particular instance.
             if alloc_reqs_by_rp_uuid:
-                selected_alloc_req = alloc_reqs_by_rp_uuid.get(
-                        selected_host.uuid)[0]
+                selected_alloc_req = selected_alloc_reqs[i]
             else:
                 selected_alloc_req = None
 
@@ -571,15 +661,17 @@ class SchedulerManager(manager.Manager):
                 if len(selected_plus_alts) >= num_alts + 1:
                     break
 
+                # TODO(gibi): In theory we could generate alternatives on the
+                # same host if that host has different possible allocation
+                # candidates for the request. But we don't do that today
                 if host.cell_uuid == cell_uuid and host not in selected_hosts:
                     if alloc_reqs_by_rp_uuid is not None:
-                        alt_uuid = host.uuid
-                        if alt_uuid not in alloc_reqs_by_rp_uuid:
+                        if not host.allocation_candidates:
                             msg = ("A host state with uuid = '%s' that did "
-                                   "not have a matching allocation_request "
+                                   "not have any remaining allocation_request "
                                    "was encountered while scheduling. This "
                                    "host was skipped.")
-                            LOG.debug(msg, alt_uuid)
+                            LOG.debug(msg, host.uuid)
                             continue
 
                         # TODO(jaypipes): Loop through all allocation_requests
@@ -588,7 +680,13 @@ class SchedulerManager(manager.Manager):
                         # the future based on information in the provider
                         # summaries, we'll just try to claim resources using
                         # the first allocation_request
-                        alloc_req = alloc_reqs_by_rp_uuid[alt_uuid][0]
+                        # NOTE(gibi): we are using, and re-using, allocation
+                        # candidates for alternatives here. This is OK as
+                        # these candidates are not yet allocated in placement
+                        # and we don't know if an alternate will ever be used.
+                        # To increase our success we could try to use different
+                        # candidate for different alternative though.
+                        alloc_req = host.allocation_candidates[0]
                         alt_selection = objects.Selection.from_host_state(
                             host, alloc_req, allocation_request_version)
                     else:

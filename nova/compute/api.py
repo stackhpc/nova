@@ -22,7 +22,6 @@ networking and storage of VMs, and compute hosts on which they run)."""
 import collections
 import functools
 import re
-import string
 import typing as ty
 
 from castellan import key_manager
@@ -59,6 +58,9 @@ from nova import exception
 from nova import exception_wrapper
 from nova.i18n import _
 from nova.image import glance
+from nova.limit import local as local_limit
+from nova.limit import placement as placement_limits
+from nova.limit import utils as limit_utils
 from nova.network import constants
 from nova.network import model as network_model
 from nova.network import neutron
@@ -73,6 +75,7 @@ from nova.objects import quotas as quotas_obj
 from nova.objects import service as service_obj
 from nova.pci import request as pci_request
 from nova.policies import servers as servers_policies
+from nova.policies import shelve as shelve_policies
 import nova.policy
 from nova import profiler
 from nova import rpc
@@ -114,6 +117,11 @@ SUPPORT_VNIC_TYPE_ACCELERATOR = 57
 MIN_COMPUTE_BOOT_WITH_EXTENDED_RESOURCE_REQUEST = 58
 MIN_COMPUTE_MOVE_WITH_EXTENDED_RESOURCE_REQUEST = 59
 MIN_COMPUTE_INT_ATTACH_WITH_EXTENDED_RES_REQ = 60
+
+SUPPORT_VNIC_TYPE_REMOTE_MANAGED = 61
+MIN_COMPUTE_VDPA_ATTACH_DETACH = 62
+MIN_COMPUTE_VDPA_HOTPLUG_LIVE_MIGRATION = 63
+
 
 # FIXME(danms): Keep a global cache of the cells we find the
 # first time we look. This needs to be refreshed on a timer or
@@ -273,7 +281,7 @@ def reject_vtpm_instances(operation):
     return outer
 
 
-def reject_vdpa_instances(operation):
+def reject_vdpa_instances(operation, until=None):
     """Reject requests to decorated function if instance has vDPA interfaces.
 
     Raise OperationNotSupportedForVDPAInterfaces if operations involves one or
@@ -287,8 +295,18 @@ def reject_vdpa_instances(operation):
                 vif['vnic_type'] == network_model.VNIC_TYPE_VDPA
                 for vif in instance.get_network_info()
             ):
-                raise exception.OperationNotSupportedForVDPAInterface(
-                    instance_uuid=instance.uuid, operation=operation)
+                reject = True
+                if until is not None:
+                    min_ver = objects.service.get_minimum_version_all_cells(
+                        nova_context.get_admin_context(), ['nova-compute']
+                    )
+                    if min_ver >= until:
+                        reject = False
+
+                if reject:
+                    raise exception.OperationNotSupportedForVDPAInterface(
+                        instance_uuid=instance.uuid, operation=operation
+                    )
             return f(self, context, instance, *args, **kw)
         return inner
     return outer
@@ -376,11 +394,12 @@ def block_extended_resource_request(function):
 class API:
     """API for interacting with the compute manager."""
 
+    _sentinel = object()
+
     def __init__(self, image_api=None, network_api=None, volume_api=None):
         self.image_api = image_api or glance.API()
         self.network_api = network_api or neutron.API()
         self.volume_api = volume_api or cinder.API()
-        self._placementclient = None  # Lazy-load on first access.
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
         self.compute_task_api = conductor.ComputeTaskAPI()
         self.servicegroup_api = servicegroup.API()
@@ -398,7 +417,7 @@ class API:
     def _check_injected_file_quota(self, context, injected_files):
         """Enforce quota limits on injected files.
 
-        Raises a QuotaError if any limit is exceeded.
+        Raises a OverQuota if any limit is exceeded.
         """
         if not injected_files:
             return
@@ -407,6 +426,10 @@ class API:
         try:
             objects.Quotas.limit_check(context,
                                        injected_files=len(injected_files))
+            local_limit.enforce_api_limit(local_limit.INJECTED_FILES,
+                                          len(injected_files))
+        except exception.OnsetFileLimitExceeded:
+            raise
         except exception.OverQuota:
             raise exception.OnsetFileLimitExceeded()
 
@@ -422,6 +445,16 @@ class API:
             objects.Quotas.limit_check(context,
                                        injected_file_path_bytes=max_path,
                                        injected_file_content_bytes=max_content)
+            # TODO(johngarbutt) we can simplify the except clause when
+            # the above legacy quota check is removed.
+            local_limit.enforce_api_limit(
+                local_limit.INJECTED_FILES_PATH, max_path)
+            local_limit.enforce_api_limit(
+                local_limit.INJECTED_FILES_CONTENT, max_content)
+        except exception.OnsetFilePathLimitExceeded:
+            raise
+        except exception.OnsetFileContentLimitExceeded:
+            raise
         except exception.OverQuota as exc:
             # Favor path limit over content limit for reporting
             # purposes
@@ -442,6 +475,10 @@ class API:
         num_metadata = len(metadata)
         try:
             objects.Quotas.limit_check(context, metadata_items=num_metadata)
+            local_limit.enforce_api_limit(
+                local_limit.SERVER_METADATA_ITEMS, num_metadata)
+        except exception.MetadataLimitExceeded:
+            raise
         except exception.OverQuota as exc:
             quota_metadata = exc.kwargs['quotas']['metadata_items']
             raise exception.MetadataLimitExceeded(allowed=quota_metadata)
@@ -714,6 +751,9 @@ class API:
         if flavor['memory_mb'] < int(image.get('min_ram') or 0):
             raise exception.FlavorMemoryTooSmall()
 
+        # Verify flavor/image Virtio Packed Ring configuration conflict.
+        hardware.get_packed_virtqueue_constraint(flavor, image)
+
         # Image min_disk is in gb, size is in bytes. For sanity, have them both
         # in bytes.
         image_min_disk = int(image.get('min_disk') or 0) * units.Gi
@@ -838,37 +878,18 @@ class API:
         """
         image_meta = _get_image_meta_obj(image)
 
-        API._validate_flavor_image_mem_encryption(flavor, image_meta)
-
-        # validate PMU extra spec and image metadata
-        flavor_pmu = flavor.extra_specs.get('hw:pmu')
-        image_pmu = image_meta.properties.get('hw_pmu')
-        if (flavor_pmu is not None and image_pmu is not None and
-                image_pmu != strutils.bool_from_string(flavor_pmu)):
-            raise exception.ImagePMUConflict()
-
         # Only validate values of flavor/image so the return results of
         # following 'get' functions are not used.
+        hardware.get_mem_encryption_constraint(flavor, image_meta)
+        hardware.get_pmu_constraint(flavor, image_meta)
         hardware.get_number_of_serial_ports(flavor, image_meta)
         hardware.get_realtime_cpu_constraint(flavor, image_meta)
         hardware.get_cpu_topology_constraints(flavor, image_meta)
+        hardware.get_vif_multiqueue_constraint(flavor, image_meta)
         if validate_numa:
             hardware.numa_get_constraints(flavor, image_meta)
         if validate_pci:
             pci_request.get_pci_requests_from_flavor(flavor)
-
-    @staticmethod
-    def _validate_flavor_image_mem_encryption(flavor, image):
-        """Validate that the flavor and image don't make contradictory
-        requests regarding memory encryption.
-
-        :param flavor: Flavor object
-        :param image: an ImageMeta object
-        :raises: nova.exception.FlavorImageConflict
-        """
-        # This library function will raise the exception for us if
-        # necessary; if not, we can ignore the result returned.
-        hardware.get_mem_encryption_constraint(flavor, image)
 
     def _get_image_defined_bdms(self, flavor, image_meta, root_device_name):
         image_properties = image_meta.get('properties', {})
@@ -1012,9 +1033,25 @@ class API:
                             context,
                             ['nova-compute']))
                     if min_version < SUPPORT_VNIC_TYPE_ACCELERATOR:
-                        msg = ("Port with cyborg profile is not avaliable"
+                        msg = ("Port with cyborg profile is not available"
                             " until upgrade finished.")
                         raise exception.ForbiddenPortsWithAccelerator(msg)
+
+    def _check_vnic_remote_managed_min_version(self, context):
+        min_version = (objects.service.get_minimum_version_all_cells(
+            context, ['nova-compute']))
+        if min_version < SUPPORT_VNIC_TYPE_REMOTE_MANAGED:
+            msg = ("Remote-managed ports are not supported"
+                   " until an upgrade is fully finished.")
+            raise exception.ForbiddenWithRemoteManagedPorts(msg)
+
+    def _check_support_vnic_remote_managed(self, context, requested_networks):
+        if requested_networks:
+            for request_net in requested_networks:
+                if (request_net.port_id and
+                        self.network_api.is_remote_managed_port(
+                            context, request_net.port_id)):
+                    self._check_vnic_remote_managed_min_version(context)
 
     def _validate_and_build_base_options(
         self, context, flavor, boot_meta, image_href, image_id, kernel_id,
@@ -1086,6 +1123,7 @@ class API:
         network_metadata, port_resource_requests, req_lvl_params = result
 
         self._check_support_vnic_accelerator(context, requested_networks)
+        self._check_support_vnic_remote_managed(context, requested_networks)
 
         # Creating servers with ports that have resource requests, like QoS
         # minimum bandwidth rules, is only supported in a requested minimum
@@ -1327,6 +1365,25 @@ class API:
         # Check quotas
         num_instances = compute_utils.check_num_instances_quota(
             context, flavor, min_count, max_count)
+
+        # Find out whether or not we are a BFV instance
+        if block_device_mapping:
+            root = block_device_mapping.root_bdm()
+            is_bfv = bool(root and root.is_volume)
+        else:
+            # If we have no BDMs, we're clearly not BFV
+            is_bfv = False
+
+        # NOTE(johngarbutt) when unified limits not used, this just
+        #   returns num_instances back again
+        # NOTE: If we want to enforce quota on port or cyborg resources in the
+        # future, this enforce call will need to move after we have populated
+        # the RequestSpec with all of the requested resources and use the real
+        # RequestSpec to get the overall resource usage of the instance.
+        num_instances = placement_limits.enforce_num_instances_and_flavor(
+                context, context.project_id, flavor,
+                is_bfv, min_count, num_instances)
+
         security_groups = security_group_api.populate_security_groups(
             security_groups)
         port_resource_requests = base_options.pop('port_resource_requests')
@@ -1369,14 +1426,7 @@ class API:
                     security_groups=security_groups,
                     port_resource_requests=port_resource_requests,
                     request_level_params=req_lvl_params)
-
-                if block_device_mapping:
-                    # Record whether or not we are a BFV instance
-                    root = block_device_mapping.root_bdm()
-                    req_spec.is_bfv = bool(root and root.is_volume)
-                else:
-                    # If we have no BDMs, we're clearly not BFV
-                    req_spec.is_bfv = False
+                req_spec.is_bfv = is_bfv
 
                 # NOTE(danms): We need to record num_instances on the request
                 # spec as this is how the conductor knows how many were in this
@@ -1451,10 +1501,15 @@ class API:
                             objects.Quotas.check_deltas(
                                 context, {'server_group_members': 1},
                                 instance_group, context.user_id)
+                            local_limit.enforce_db_limit(
+                                context, local_limit.SERVER_GROUP_MEMBERS,
+                                entity_scope=instance_group.uuid, delta=1)
+                        except exception.GroupMemberLimitExceeded:
+                            raise
                         except exception.OverQuota:
                             msg = _("Quota exceeded, too many servers in "
                                     "group")
-                            raise exception.QuotaError(msg)
+                            raise exception.OverQuota(msg)
 
                     members = objects.InstanceGroup.add_members(
                         context, instance_group.uuid, [instance.uuid])
@@ -1469,12 +1524,25 @@ class API:
                             objects.Quotas.check_deltas(
                                 context, {'server_group_members': 0},
                                 instance_group, context.user_id)
+                            # TODO(johngarbutt): decide if we need this check
+                            # The quota rechecking of limits is really just to
+                            # protect against denial of service attacks that
+                            # aim to fill up the database. Its usefulness could
+                            # be debated.
+                            local_limit.enforce_db_limit(
+                                context, local_limit.SERVER_GROUP_MEMBERS,
+                                entity_scope=instance_group.uuid, delta=0)
+                        except exception.GroupMemberLimitExceeded:
+                            with excutils.save_and_reraise_exception():
+                                objects.InstanceGroup._remove_members_in_db(
+                                    context, instance_group.id,
+                                    [instance.uuid])
                         except exception.OverQuota:
                             objects.InstanceGroup._remove_members_in_db(
                                 context, instance_group.id, [instance.uuid])
                             msg = _("Quota exceeded, too many servers in "
                                     "group")
-                            raise exception.QuotaError(msg)
+                            raise exception.OverQuota(msg)
                     # list of members added to servers group in this iteration
                     # is needed to check quota of server group during add next
                     # instance
@@ -1528,6 +1596,42 @@ class API:
             return
 
         return objects.InstanceGroup.get_by_uuid(context, group_hint)
+
+    def _update_ephemeral_encryption_bdms(
+        self,
+        flavor: 'objects.Flavor',
+        image_meta_dict: ty.Dict[str, ty.Any],
+        block_device_mapping: 'objects.BlockDeviceMappingList',
+    ) -> None:
+        """Update local BlockDeviceMappings when ephemeral encryption requested
+
+        Enable ephemeral encryption in all local BlockDeviceMappings
+        when requested in the flavor or image. Also optionally set the format
+        and options if also provided.
+
+        :param flavor: The instance flavor for the request
+        :param image_meta_dict: The image metadata for the request
+        :block_device_mapping: The current block_device_mapping for the request
+        """
+        image_meta = _get_image_meta_obj(image_meta_dict)
+        if not hardware.get_ephemeral_encryption_constraint(
+                flavor, image_meta):
+            return
+
+        # NOTE(lyarwood): Attempt to find the format in the flavor and image,
+        # if one isn't found then the compute will need to provide and save a
+        # default format during a the initial build.
+        eph_format = hardware.get_ephemeral_encryption_format(
+            flavor, image_meta)
+
+        # NOTE(lyarwood): The term ephemeral is overloaded in the codebase,
+        # what it actually means in the context of ephemeral encryption is
+        # anything local to the compute host so use the is_local property.
+        # TODO(lyarwood): Add .get_local_devices() to BlockDeviceMappingList
+        for bdm in [b for b in block_device_mapping if b.is_local]:
+            bdm.encrypted = True
+            if eph_format:
+                bdm.encryption_format = eph_format
 
     def _create_instance(self, context, flavor,
                image_href, kernel_id, ramdisk_id,
@@ -1606,9 +1710,16 @@ class API:
                       'max_net_count': max_net_count})
             max_count = max_net_count
 
+        # _check_and_transform_bdm transforms block_device_mapping from API
+        # bdms (dicts) to a BlockDeviceMappingList.
         block_device_mapping = self._check_and_transform_bdm(context,
             base_options, flavor, boot_meta, min_count, max_count,
             block_device_mapping, legacy_bdm)
+
+        # Update any local BlockDeviceMapping objects if ephemeral encryption
+        # has been requested though flavor extra specs or image properties
+        self._update_ephemeral_encryption_bdms(
+            flavor, boot_meta, block_device_mapping)
 
         # We can't do this check earlier because we need bdms from all sources
         # to have been merged in order to get the root bdm.
@@ -2281,6 +2392,12 @@ class API:
         # Normal delete should be attempted.
         may_have_ports_or_volumes = compute_utils.may_have_ports_or_volumes(
             instance)
+
+        # Save a copy of the instance UUID early, in case
+        # _lookup_instance returns instance = None, to pass to
+        # _local_delete_cleanup if needed.
+        instance_uuid = instance.uuid
+
         if not instance.host and not may_have_ports_or_volumes:
             try:
                 if self._delete_while_booting(context, instance):
@@ -2294,10 +2411,6 @@ class API:
                 # full Instance or None if not found. If not found then it's
                 # acceptable to skip the rest of the delete processing.
 
-                # Save a copy of the instance UUID early, in case
-                # _lookup_instance returns instance = None, to pass to
-                # _local_delete_cleanup if needed.
-                instance_uuid = instance.uuid
                 cell, instance = self._lookup_instance(context, instance.uuid)
                 if cell and instance:
                     try:
@@ -2438,6 +2551,8 @@ class API:
                           instance=instance)
                 with nova_context.target_cell(context, cell) as cctxt:
                     self._local_delete(cctxt, instance, bdms, delete_type, cb)
+                    self._record_action_start(context, instance,
+                                              instance_actions.DELETE)
 
         except exception.InstanceNotFound:
             # NOTE(comstud): Race condition. Instance already gone.
@@ -2521,9 +2636,7 @@ class API:
 
     @property
     def placementclient(self):
-        if self._placementclient is None:
-            self._placementclient = report.SchedulerReportClient()
-        return self._placementclient
+        return report.report_client_singleton()
 
     def _local_delete(self, context, instance, bdms, delete_type, cb):
         if instance.vm_state == vm_states.SHELVED_OFFLOADED:
@@ -2621,6 +2734,9 @@ class API:
         project_id, user_id = quotas_obj.ids_from_instance(context, instance)
         compute_utils.check_num_instances_quota(context, flavor, 1, 1,
                 project_id=project_id, user_id=user_id)
+        is_bfv = compute_utils.is_volume_backed_instance(context, instance)
+        placement_limits.enforce_num_instances_and_flavor(context, project_id,
+                                                         flavor, is_bfv, 1, 1)
 
         self._record_action_start(context, instance, instance_actions.RESTORE)
 
@@ -2802,9 +2918,11 @@ class API:
                 # spec has been archived is being queried.
                 raise exception.InstanceNotFound(instance_id=uuid)
         else:
+            if isinstance(result[cell_uuid], exception.NovaException):
+                LOG.exception(result[cell_uuid])
             raise exception.NovaException(
-                _("Cell %s is not responding and hence instance "
-                  "info is not available.") % cell_uuid)
+                _("Cell %s is not responding or returned an exception, "
+                  "hence instance info is not available.") % cell_uuid)
 
     def _get_instance(self, context, instance_uuid, expected_attrs,
                       cell_down_support=False):
@@ -2887,7 +3005,7 @@ class API:
 
         The results will be sorted based on the list of sort keys in the
         'sort_keys' parameter (first value is primary sort key, second value is
-        secondary sort ket, etc.). For each sort key, the associated sort
+        secondary sort key, etc.). For each sort key, the associated sort
         direction is based on the list of sort directions in the 'sort_dirs'
         parameter.
 
@@ -3272,7 +3390,7 @@ class API:
                              "error_msg": str(exc)})
             attr = 'task_state'
             state = task_states.DELETING
-            if type(ex) == exception.InstanceNotFound:
+            if type(ex) is exception.InstanceNotFound:
                 attr = 'vm_state'
                 state = vm_states.DELETED
             raise exception.InstanceInvalidState(attr=attr,
@@ -3477,7 +3595,7 @@ class API:
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
                                     vm_states.ERROR])
     def rebuild(self, context, instance, image_href, admin_password,
-                files_to_inject=None, **kwargs):
+                files_to_inject=None, reimage_boot_volume=False, **kwargs):
         """Rebuild the given instance with the provided attributes."""
         files_to_inject = files_to_inject or []
         metadata = kwargs.get('metadata', {})
@@ -3558,15 +3676,16 @@ class API:
             orig_image_ref = volume_image_metadata.get('image_id')
 
             if orig_image_ref != image_href:
-                # Leave a breadcrumb.
-                LOG.debug('Requested to rebuild instance with a new image %s '
-                          'for a volume-backed server with image %s in its '
-                          'root volume which is not supported.', image_href,
-                          orig_image_ref, instance=instance)
-                msg = _('Unable to rebuild with a different image for a '
-                        'volume-backed server.')
-                raise exception.ImageUnacceptable(
-                    image_id=image_href, reason=msg)
+                if not reimage_boot_volume:
+                    # Leave a breadcrumb.
+                    LOG.debug('Requested to rebuild instance with a new image '
+                              '%s for a volume-backed server with image %s in '
+                              'its root volume which is not supported.',
+                              image_href, orig_image_ref, instance=instance)
+                    msg = _('Unable to rebuild with a different image for a '
+                            'volume-backed server.')
+                    raise exception.ImageUnacceptable(
+                        image_id=image_href, reason=msg)
         else:
             orig_image_ref = instance.image_ref
 
@@ -3681,7 +3800,9 @@ class API:
                 image_ref=image_href, orig_image_ref=orig_image_ref,
                 orig_sys_metadata=orig_sys_metadata, bdms=bdms,
                 preserve_ephemeral=preserve_ephemeral, host=host,
-                request_spec=request_spec)
+                request_spec=request_spec,
+                reimage_boot_volume=reimage_boot_volume,
+                target_state=None)
 
     def _check_volume_status(self, context, bdms):
         """Check whether the status of the volume is "in-use".
@@ -3738,9 +3859,22 @@ class API:
         # TODO(sean-k-mooney): add PCI NUMA affinity policy check.
 
     @staticmethod
-    def _check_quota_for_upsize(context, instance, current_flavor, new_flavor):
+    def _check_quota_for_upsize(context, instance, current_flavor,
+                                new_flavor, is_bfv, is_revert):
         project_id, user_id = quotas_obj.ids_from_instance(context,
                                                            instance)
+        # NOTE(johngarbutt) for resize, check for sum of existing usage
+        # plus the usage from new flavor, as it will be claimed in
+        # placement that way, even if there is no change in flavor
+        # But for revert resize, we are just removing claims in placement
+        # so we can ignore the quota check
+        if not is_revert:
+            placement_limits.enforce_num_instances_and_flavor(context,
+                                                              project_id,
+                                                              new_flavor,
+                                                              is_bfv, 1, 1)
+
+        # Old quota system only looks at the change in size.
         # Deltas will be empty if the resize is not an upsize.
         deltas = compute_utils.upsize_quota_delta(new_flavor,
                                                   current_flavor)
@@ -3782,8 +3916,11 @@ class API:
             elevated, instance.uuid, 'finished')
 
         # If this is a resize down, a revert might go over quota.
+        reqspec = objects.RequestSpec.get_by_instance_uuid(
+            context, instance.uuid)
         self._check_quota_for_upsize(context, instance, instance.flavor,
-                                     instance.old_flavor)
+                                     instance.old_flavor, reqspec.is_bfv,
+                                     is_revert=True)
 
         # The AZ for the server may have changed when it was migrated so while
         # we are in the API and have access to the API DB, update the
@@ -3807,8 +3944,6 @@ class API:
         # the scheduler will be using the wrong values. There's no need to do
         # this if the flavor hasn't changed though and we're migrating rather
         # than resizing.
-        reqspec = objects.RequestSpec.get_by_instance_uuid(
-            context, instance.uuid)
         if reqspec.flavor['id'] != instance.old_flavor['id']:
             reqspec.flavor = instance.old_flavor
             reqspec.numa_topology = hardware.numa_get_constraints(
@@ -3990,7 +4125,7 @@ class API:
             desired destination of the instance during the cold migration
         :param allow_cross_cell_resize: If True, cross-cell resize is allowed
             for this operation and the host could be in a different cell from
-            the one that the instance is currently in. If False, the speciifed
+            the one that the instance is currently in. If False, the specified
             host must be in the same cell as the instance.
         :returns: ComputeNode object of the requested host
         :raises: CannotMigrateToSameHost if the host is the same as the
@@ -4027,9 +4162,6 @@ class API:
     # finally split resize and cold migration into separate code paths
     @block_extended_resource_request
     @block_port_accelerators()
-    # FIXME(sean-k-mooney): Cold migrate and resize to different hosts
-    # probably works but they have not been tested so block them for now
-    @reject_vdpa_instances(instance_actions.RESIZE)
     @block_accelerators()
     @check_instance_lock
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED])
@@ -4110,9 +4242,16 @@ class API:
 
         # ensure there is sufficient headroom for upsizes
         if flavor_id:
+            # Figure out if the instance is volume-backed but only if we didn't
+            # already figure that out above (avoid the extra db hit).
+            if volume_backed is None:
+                # TODO(johngarbutt) should we just use the request spec?
+                volume_backed = compute_utils.is_volume_backed_instance(
+                    context, instance)
             self._check_quota_for_upsize(context, instance,
                                          current_flavor,
-                                         new_flavor)
+                                         new_flavor, volume_backed,
+                                         is_revert=False)
 
         if not same_flavor:
             image = utils.get_image_from_system_metadata(
@@ -4147,6 +4286,19 @@ class API:
         if not same_flavor:
             request_spec.numa_topology = hardware.numa_get_constraints(
                 new_flavor, instance.image_meta)
+            # if the flavor is changed then we need to recalculate the
+            # pci_requests as well because the new flavor might request
+            # different pci_aliases
+            new_pci_requests = pci_request.get_pci_requests_from_flavor(
+                new_flavor)
+            new_pci_requests.instance_uuid = instance.uuid
+            # The neutron based InstancePCIRequest cannot change during resize,
+            # so we just need to copy them from the old request
+            for request in request_spec.pci_requests.requests or []:
+                if request.source == objects.InstancePCIRequest.NEUTRON_PORT:
+                    new_pci_requests.requests.append(request)
+            request_spec.pci_requests = new_pci_requests
+
             # TODO(huaqiang): Remove in Wallaby
             # check nova-compute nodes have been updated to Victoria to resize
             # instance to a new mixed instance from a dedicated or shared
@@ -4248,10 +4400,7 @@ class API:
             allow_same_host = CONF.allow_resize_to_same_host
         return allow_same_host
 
-    # FIXME(sean-k-mooney): Shelve works but unshelve does not due to bug
-    # #1851545, so block it for now
     @block_port_accelerators()
-    @reject_vdpa_instances(instance_actions.SHELVE)
     @reject_vtpm_instances(instance_actions.SHELVE)
     @block_accelerators(until_service=54)
     @check_instance_lock
@@ -4313,31 +4462,45 @@ class API:
             context, instance=instance,
             clean_shutdown=clean_shutdown, accel_uuids=accel_uuids)
 
-    def _validate_unshelve_az(self, context, instance, availability_zone):
-        """Verify the specified availability_zone during unshelve.
-
-        Verifies that the server is shelved offloaded, the AZ exists and
-        if [cinder]/cross_az_attach=False, that any attached volumes are in
-        the same AZ.
-
-        :param context: nova auth RequestContext for the unshelve action
-        :param instance: Instance object for the server being unshelved
-        :param availability_zone: The user-requested availability zone in
-            which to unshelve the server.
-        :raises: UnshelveInstanceInvalidState if the server is not shelved
-            offloaded
-        :raises: InvalidRequest if the requested AZ does not exist
-        :raises: MismatchVolumeAZException if [cinder]/cross_az_attach=False
-            and any attached volumes are not in the requested AZ
+    def _check_offloaded(self, context, instance):
+        """Check if the status of an instance is SHELVE_OFFLOADED,
+        if not raise an exception.
         """
         if instance.vm_state != vm_states.SHELVED_OFFLOADED:
             # NOTE(brinzhang): If the server status is 'SHELVED', it still
-            # belongs to a host, the availability_zone has not changed.
+            # belongs to a host, the availability_zone should not change.
             # Unshelving a shelved offloaded server will go through the
             # scheduler to find a new host.
             raise exception.UnshelveInstanceInvalidState(
                 state=instance.vm_state, instance_uuid=instance.uuid)
 
+    def _ensure_host_in_az(self, context, host, availability_zone):
+        """Ensure the host provided belongs to the availability zone,
+        if not raise an exception.
+        """
+        if availability_zone is not None:
+            host_az = availability_zones.get_host_availability_zone(
+                context,
+                host
+            )
+            if host_az != availability_zone:
+                raise exception.UnshelveHostNotInAZ(
+                    host=host, availability_zone=availability_zone)
+
+    def _validate_unshelve_az(self, context, instance, availability_zone):
+        """Verify the specified availability_zone during unshelve.
+
+        Verifies the AZ exists and if [cinder]/cross_az_attach=False, that
+        any attached volumes are in the same AZ.
+
+        :param context: nova auth RequestContext for the unshelve action
+        :param instance: Instance object for the server being unshelved
+        :param availability_zone: The user-requested availability zone in
+            which to unshelve the server.
+        :raises: InvalidRequest if the requested AZ does not exist
+        :raises: MismatchVolumeAZException if [cinder]/cross_az_attach=False
+            and any attached volumes are not in the requested AZ
+        """
         available_zones = availability_zones.get_availability_zones(
             context, self.host_api, get_only_available=True)
         if availability_zone not in available_zones:
@@ -4363,33 +4526,143 @@ class API:
                             "vol_zone": volume['availability_zone']}
                         raise exception.MismatchVolumeAZException(reason=msg)
 
+    @staticmethod
+    def _check_quota_unshelve_offloaded(
+        context: nova_context.RequestContext,
+        instance: 'objects.Instance',
+        request_spec: 'objects.RequestSpec'
+    ):
+        if not (CONF.quota.count_usage_from_placement or
+                limit_utils.use_unified_limits()):
+            return
+        # TODO(melwitt): This is ugly but we have to do it this way because
+        # instances quota is currently counted from the API database but cores
+        # and ram are counted from placement. That means while an instance is
+        # SHELVED_OFFLOADED, it will still consume instances quota but it will
+        # not consume cores and ram. So we need an instances delta of
+        # 0 but cores and ram deltas from the flavor.
+        # Once instances usage is also being counted from placement, we can
+        # replace this method with a normal check_num_instances_quota() call.
+        vcpus = instance.flavor.vcpus
+        memory_mb = instance.flavor.memory_mb
+        # We are not looking to create a new server, we are unshelving an
+        # existing one.
+        deltas = {'instances': 0, 'cores': vcpus, 'ram': memory_mb}
+
+        objects.Quotas.check_deltas(
+            context,
+            deltas,
+            context.project_id,
+            user_id=context.user_id,
+            check_project_id=instance.project_id,
+            check_user_id=instance.user_id,
+        )
+        # Do the same for unified limits.
+        placement_limits.enforce_num_instances_and_flavor(
+            context, context.project_id, instance.flavor, request_spec.is_bfv,
+            0, 0, delta_updates={'servers': 0})
+
     @block_extended_resource_request
     @check_instance_lock
-    @check_instance_state(vm_state=[vm_states.SHELVED,
-        vm_states.SHELVED_OFFLOADED])
-    def unshelve(self, context, instance, new_az=None):
-        """Restore a shelved instance."""
+    @check_instance_state(
+            vm_state=[vm_states.SHELVED, vm_states.SHELVED_OFFLOADED])
+    def unshelve(
+            self, context, instance, new_az=_sentinel, host=None):
+        """Restore a shelved instance.
+
+        :param context: the nova request context
+        :param instance: nova.objects.instance.Instance object
+        :param new_az: (optional) target AZ.
+                       If None is provided then the current AZ restriction
+                       will be removed from the instance.
+                       If the parameter is not provided then the current
+                       AZ restriction will not be changed.
+        :param host: (optional) a host to target
+        """
+        # Unshelving a shelved offloaded server will go through the
+        # scheduler to pick a new host, so we update the
+        # RequestSpec.availability_zone here. Note that if scheduling
+        # fails the RequestSpec will remain updated, which is not great.
+        # Bug open to track this https://bugs.launchpad.net/nova/+bug/1978573
+
+        az_passed = new_az is not self._sentinel
+
         request_spec = objects.RequestSpec.get_by_instance_uuid(
             context, instance.uuid)
 
-        if new_az:
+        # Check quota before we save any changes to the database, but only if
+        # we are counting quota usage from placement. When an instance is
+        # SHELVED_OFFLOADED, it will not consume cores or ram resources in
+        # placement. This means it is possible that an unshelve would cause the
+        # project/user to go over quota.
+        if instance.vm_state == vm_states.SHELVED_OFFLOADED:
+            self._check_quota_unshelve_offloaded(
+                context, instance, request_spec)
+
+        # We need to check a list of preconditions and validate inputs first
+
+        # Ensure instance is shelve offloaded
+        if az_passed or host:
+            self._check_offloaded(context, instance)
+
+        if az_passed and new_az:
+            # we have to ensure that new AZ is valid
             self._validate_unshelve_az(context, instance, new_az)
-            LOG.debug("Replace the old AZ %(old_az)s in RequestSpec "
-                      "with a new AZ %(new_az)s of the instance.",
-                      {"old_az": request_spec.availability_zone,
-                       "new_az": new_az}, instance=instance)
-            # Unshelving a shelved offloaded server will go through the
-            # scheduler to pick a new host, so we update the
-            # RequestSpec.availability_zone here. Note that if scheduling
-            # fails the RequestSpec will remain updated, which is not great,
-            # but if we want to change that we need to defer updating the
-            # RequestSpec until conductor which probably means RPC changes to
-            # pass the new_az variable to conductor. This is likely low
-            # priority since the RequestSpec.availability_zone on a shelved
-            # offloaded server does not mean much anyway and clearly the user
-            # is trying to put the server in the target AZ.
-            request_spec.availability_zone = new_az
-            request_spec.save()
+        # This will be the AZ of the instance after the unshelve. It can be
+        # None indicating that the instance is not pinned to any AZ after the
+        # unshelve
+        expected_az_after_unshelve = (
+            request_spec.availability_zone
+            if not az_passed else new_az
+        )
+        # host is requested, so we have to see if it exists and does not
+        # contradict with the AZ of the instance
+        if host:
+            # Make sure only admin can unshelve to a specific host.
+            context.can(
+                shelve_policies.POLICY_ROOT % 'unshelve_to_host',
+                target={
+                    'user_id': instance.user_id,
+                    'project_id': instance.project_id
+                }
+            )
+            # Ensure that the requested host exists otherwise raise
+            # a ComputeHostNotFound exception
+            objects.ComputeNode.get_first_node_by_host_for_old_compat(
+                context, host, use_slave=True)
+            # A specific host is requested so we need to make sure that it is
+            # not contradicts with the AZ of the instance
+            self._ensure_host_in_az(
+                context, host, expected_az_after_unshelve)
+
+        if new_az is None:
+            LOG.debug(
+                'Unpin instance from AZ "%(old_az)s".',
+                {'old_az': request_spec.availability_zone},
+                instance=instance
+            )
+
+        LOG.debug(
+            'Unshelving instance with old availability_zone "%(old_az)s" to '
+            'new availability_zone "%(new_az)s" and host "%(host)s".',
+            {
+                'old_az': request_spec.availability_zone,
+                'new_az': '%s' %
+                          new_az if az_passed
+                                 else 'not provided',
+                'host': host,
+             },
+            instance=instance,
+        )
+        # OK every precondition checks out, we just need to tell the scheduler
+        # where to put the instance
+        # We have the expected AZ already calculated. So we just need to
+        # set it in the request_spec to drive the scheduling
+        request_spec.availability_zone = expected_az_after_unshelve
+        # if host is requested we also need to tell the scheduler that
+        if host:
+            request_spec.requested_destination = objects.Destination(host=host)
+        request_spec.save()
 
         instance.task_state = task_states.UNSHELVING
         instance.save(expected_task_state=[None])
@@ -4440,11 +4713,10 @@ class API:
         return self.compute_rpcapi.get_instance_diagnostics(context,
                                                             instance=instance)
 
-    # FIXME(sean-k-mooney): Suspend does not work because we do not unplug
-    # the vDPA devices before calling managed save as we do with SR-IOV
-    # devices
     @block_port_accelerators()
-    @reject_vdpa_instances(instance_actions.SUSPEND)
+    @reject_vdpa_instances(
+        instance_actions.SUSPEND, until=MIN_COMPUTE_VDPA_HOTPLUG_LIVE_MIGRATION
+    )
     @block_accelerators()
     @reject_sev_instances(instance_actions.SUSPEND)
     @check_instance_lock
@@ -4457,6 +4729,9 @@ class API:
         self.compute_rpcapi.suspend_instance(context, instance)
 
     @check_instance_lock
+    @reject_vdpa_instances(
+        instance_actions.RESUME, until=MIN_COMPUTE_VDPA_HOTPLUG_LIVE_MIGRATION
+    )
     @check_instance_state(vm_state=[vm_states.SUSPENDED])
     def resume(self, context, instance):
         """Resume the given instance."""
@@ -4474,6 +4749,7 @@ class API:
                allow_bfv_rescue=False):
         """Rescue the given instance."""
 
+        image_meta = None
         if rescue_image_ref:
             try:
                 image_meta = image_meta_obj.ImageMeta.from_image_ref(
@@ -4494,6 +4770,8 @@ class API:
                             "image properties set")
                 raise exception.UnsupportedRescueImage(
                     image=rescue_image_ref)
+        else:
+            image_meta = instance.image_meta
 
         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
                     context, instance.uuid)
@@ -4501,6 +4779,9 @@ class API:
 
         volume_backed = compute_utils.is_volume_backed_instance(
             context, instance, bdms)
+
+        allow_bfv_rescue &= 'hw_rescue_bus' in image_meta.properties and \
+            'hw_rescue_device' in image_meta.properties
 
         if volume_backed and allow_bfv_rescue:
             cn = objects.ComputeNode.get_by_host_and_nodename(
@@ -4800,10 +5081,24 @@ class API:
         This method is separated to make it possible for cells version
         to override it.
         """
-        volume_bdm = self._create_volume_bdm(
-            context, instance, device, volume, disk_bus=disk_bus,
-            device_type=device_type, tag=tag,
-            delete_on_termination=delete_on_termination)
+        try:
+            volume_bdm = self._create_volume_bdm(
+                context, instance, device, volume, disk_bus=disk_bus,
+                device_type=device_type, tag=tag,
+                delete_on_termination=delete_on_termination)
+        except oslo_exceptions.MessagingTimeout:
+            # The compute node might have already created the attachment but
+            # we never received the answer. In this case it is safe to delete
+            # the attachment as nobody will ever pick it up again.
+            with excutils.save_and_reraise_exception():
+                try:
+                    objects.BlockDeviceMapping.get_by_volume_and_instance(
+                        context, volume['id'], instance.uuid).destroy()
+                    LOG.debug("Delete BDM after compute did not respond to "
+                              f"attachment request for volume {volume['id']}")
+                except exception.VolumeBDMNotFound:
+                    LOG.debug("BDM not found, ignoring removal. "
+                              f"Error attaching volume {volume['id']}")
         try:
             self._check_attach_and_reserve_volume(context, volume, instance,
                                                   volume_bdm,
@@ -5131,9 +5426,14 @@ class API:
                         instance_uuid=instance.uuid)
 
     @check_instance_lock
-    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
-                                    vm_states.STOPPED],
-                          task_state=[None])
+    @reject_vdpa_instances(
+        instance_actions.ATTACH_INTERFACE, until=MIN_COMPUTE_VDPA_ATTACH_DETACH
+    )
+    @check_instance_state(
+        vm_state=[
+            vm_states.ACTIVE, vm_states.PAUSED, vm_states.STOPPED
+        ], task_state=[None]
+    )
     def attach_interface(self, context, instance, network_id, port_id,
                          requested_ip, tag=None):
         """Use hotplug to add an network adapter to an instance."""
@@ -5141,18 +5441,20 @@ class API:
             context, instance, instance_actions.ATTACH_INTERFACE)
 
         if port_id:
-            port = self.network_api.show_port(context, port_id)['port']
-            if port.get('binding:vnic_type', "normal") == "vdpa":
-                # FIXME(sean-k-mooney): Attach works but detach results in a
-                # QEMU error; blocked until this is resolved
-                raise exception.OperationNotSupportedForVDPAInterface(
-                    instance_uuid=instance.uuid,
-                    operation=instance_actions.ATTACH_INTERFACE)
+            # We need to query the port with admin context as
+            # ensure_compute_version_for_resource_request depends on the
+            # port.resource_request field which only returned for admins
+            port = self.network_api.show_port(
+                context.elevated(), port_id)['port']
 
             if port.get('binding:vnic_type', 'normal') in (
                 network_model.VNIC_TYPE_ACCELERATOR_DIRECT,
                 network_model.VNIC_TYPE_ACCELERATOR_DIRECT_PHYSICAL):
                 raise exception.ForbiddenPortsWithAccelerator()
+
+            if port.get('binding:vnic_type',
+                        'normal') == network_model.VNIC_TYPE_REMOTE_MANAGED:
+                self._check_vnic_remote_managed_min_version(context)
 
             self.ensure_compute_version_for_resource_request(
                 context, instance, port)
@@ -5162,37 +5464,23 @@ class API:
             requested_ip=requested_ip, tag=tag)
 
     @check_instance_lock
-    @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.PAUSED,
-                                    vm_states.STOPPED],
-                          task_state=[None])
+    @reject_vdpa_instances(
+        instance_actions.DETACH_INTERFACE, until=MIN_COMPUTE_VDPA_ATTACH_DETACH
+    )
+    @check_instance_state(
+        vm_state=[
+            vm_states.ACTIVE, vm_states.PAUSED, vm_states.STOPPED
+        ], task_state=[None]
+    )
     def detach_interface(self, context, instance, port_id):
         """Detach an network adapter from an instance."""
-
-        # FIXME(sean-k-mooney): Detach currently results in a failure to remove
-        # the interface from the live libvirt domain, so while the networking
-        # is torn down on the host the vDPA device is still attached to the VM.
-        # This is likely a libvirt/qemu bug so block detach until that is
-        # resolved.
         for vif in instance.get_network_info():
             if vif['id'] == port_id:
-                if vif['vnic_type'] == 'vdpa':
-                    raise exception.OperationNotSupportedForVDPAInterface(
-                        instance_uuid=instance.uuid,
-                        operation=instance_actions.DETACH_INTERFACE)
                 if vif['vnic_type'] in (
                     network_model.VNIC_TYPE_ACCELERATOR_DIRECT,
                     network_model.VNIC_TYPE_ACCELERATOR_DIRECT_PHYSICAL):
                     raise exception.ForbiddenPortsWithAccelerator()
                 break
-        else:
-            # NOTE(sean-k-mooney) This should never happen but just in case the
-            # info cache does not have the port we are detaching we can fall
-            # back to neutron.
-            port = self.network_api.show_port(context, port_id)['port']
-            if port.get('binding:vnic_type', 'normal') == 'vdpa':
-                raise exception.OperationNotSupportedForVDPAInterface(
-                    instance_uuid=instance.uuid,
-                    operation=instance_actions.DETACH_INTERFACE)
 
         self._record_action_start(
             context, instance, instance_actions.DETACH_INTERFACE)
@@ -5237,7 +5525,10 @@ class API:
 
     @block_extended_resource_request
     @block_port_accelerators()
-    @reject_vdpa_instances(instance_actions.LIVE_MIGRATION)
+    @reject_vdpa_instances(
+        instance_actions.LIVE_MIGRATION,
+        until=MIN_COMPUTE_VDPA_HOTPLUG_LIVE_MIGRATION
+    )
     @block_accelerators()
     @reject_vtpm_instances(instance_actions.LIVE_MIGRATION)
     @reject_sev_instances(instance_actions.LIVE_MIGRATION)
@@ -5371,14 +5662,12 @@ class API:
 
     @block_extended_resource_request
     @block_port_accelerators()
-    # FIXME(sean-k-mooney): rebuild works but we have not tested evacuate yet
-    @reject_vdpa_instances(instance_actions.EVACUATE)
     @reject_vtpm_instances(instance_actions.EVACUATE)
     @block_accelerators(until_service=SUPPORT_ACCELERATOR_SERVICE_FOR_REBUILD)
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
-                                    vm_states.ERROR])
+                                    vm_states.ERROR], task_state=None)
     def evacuate(self, context, instance, host, on_shared_storage,
-                 admin_password=None, force=None):
+                 admin_password=None, force=None, target_state=None):
         """Running evacuate to target host.
 
         Checking vm compute host state, if the host not in expected_state,
@@ -5389,6 +5678,7 @@ class API:
         :param on_shared_storage: True if instance files on shared storage
         :param admin_password: password to set on rebuilt instance
         :param force: Force the evacuation to the specific host target
+        :param target_state: Set a target state for the evacuated instance
 
         """
         LOG.debug('vm evacuation scheduled', instance=instance)
@@ -5403,7 +5693,7 @@ class API:
             context, instance.uuid)
 
         instance.task_state = task_states.REBUILDING
-        instance.save(expected_task_state=[None])
+        instance.save(expected_task_state=None)
         self._record_action_start(context, instance, instance_actions.EVACUATE)
 
         # NOTE(danms): Create this as a tombstone for the source compute
@@ -5452,7 +5742,7 @@ class API:
                        on_shared_storage=on_shared_storage,
                        host=host,
                        request_spec=request_spec,
-                       )
+                       target_state=target_state)
 
     def get_migrations(self, context, filters):
         """Get all migrations for the given filters."""
@@ -5909,6 +6199,45 @@ class HostAPI:
                                                payload)
         return result
 
+    def _service_get_all_cells(self, context, disabled, set_zones,
+                               cell_down_support):
+        services = []
+        service_dict = nova_context.scatter_gather_all_cells(context,
+            objects.ServiceList.get_all, disabled, set_zones=set_zones)
+
+        cell0_computes = [
+            x for x in
+            service_dict.get(objects.CellMapping.CELL0_UUID, [])
+            if x.binary == 'nova-compute']
+        for cn in cell0_computes:
+            LOG.warning(
+                'Found compute service %(service)s in cell0; '
+                'This should never happen!',
+                {'service': cn.host})
+
+        for cell_uuid, cell_services in service_dict.items():
+            if not nova_context.is_cell_failure_sentinel(cell_services):
+                services.extend(cell_services)
+            elif cell_down_support:
+                unavailable_services = objects.ServiceList()
+                cid = [cm.id for cm in nova_context.CELLS
+                        if cm.uuid == cell_uuid]
+                # We know cid[0] is in the list because we are using the
+                # same list that scatter_gather_all_cells used
+                hms = objects.HostMappingList.get_by_cell_id(context,
+                                                                cid[0])
+                for hm in hms:
+                    unavailable_services.objects.append(objects.Service(
+                        binary='nova-compute', host=hm.host))
+                LOG.warning("Cell %s is not responding and hence only "
+                            "partial results are available from this "
+                            "cell.", cell_uuid)
+                services.extend(unavailable_services)
+            else:
+                LOG.warning("Cell %s is not responding and hence skipped "
+                            "from the results.", cell_uuid)
+        return services
+
     def service_get_all(self, context, filters=None, set_zones=False,
                         all_cells=False, cell_down_support=False):
         """Returns a list of services, optionally filtering the results.
@@ -5933,30 +6262,9 @@ class HostAPI:
         # and we should always iterate over the cells. However, certain
         # callers need the legacy behavior for now.
         if all_cells:
-            services = []
-            service_dict = nova_context.scatter_gather_all_cells(context,
-                objects.ServiceList.get_all, disabled, set_zones=set_zones)
-            for cell_uuid, service in service_dict.items():
-                if not nova_context.is_cell_failure_sentinel(service):
-                    services.extend(service)
-                elif cell_down_support:
-                    unavailable_services = objects.ServiceList()
-                    cid = [cm.id for cm in nova_context.CELLS
-                           if cm.uuid == cell_uuid]
-                    # We know cid[0] is in the list because we are using the
-                    # same list that scatter_gather_all_cells used
-                    hms = objects.HostMappingList.get_by_cell_id(context,
-                                                                 cid[0])
-                    for hm in hms:
-                        unavailable_services.objects.append(objects.Service(
-                            binary='nova-compute', host=hm.host))
-                    LOG.warning("Cell %s is not responding and hence only "
-                                "partial results are available from this "
-                                "cell.", cell_uuid)
-                    services.extend(unavailable_services)
-                else:
-                    LOG.warning("Cell %s is not responding and hence skipped "
-                                "from the results.", cell_uuid)
+            services = self._service_get_all_cells(context, disabled,
+                                                   set_zones,
+                                                   cell_down_support)
         else:
             services = objects.ServiceList.get_all(context, disabled,
                                                    set_zones=set_zones)
@@ -6211,13 +6519,10 @@ class AggregateAPI:
     def __init__(self):
         self.compute_rpcapi = compute_rpcapi.ComputeAPI()
         self.query_client = query.SchedulerQueryClient()
-        self._placement_client = None  # Lazy-load on first access.
 
     @property
     def placement_client(self):
-        if self._placement_client is None:
-            self._placement_client = report.SchedulerReportClient()
-        return self._placement_client
+        return report.report_client_singleton()
 
     @wrap_exception()
     def create_aggregate(self, context, aggregate_name, availability_zone):
@@ -6512,21 +6817,13 @@ class KeypairAPI:
         }
         self.notifier.info(context, 'keypair.%s' % event_suffix, payload)
 
-    def _validate_new_key_pair(self, context, user_id, key_name, key_type):
-        safe_chars = "_- " + string.digits + string.ascii_letters
-        clean_value = "".join(x for x in key_name if x in safe_chars)
-        if clean_value != key_name:
-            raise exception.InvalidKeypair(
-                reason=_("Keypair name contains unsafe characters"))
-
-        try:
-            utils.check_string_length(key_name, min_length=1, max_length=255)
-        except exception.InvalidInput:
-            raise exception.InvalidKeypair(
-                reason=_('Keypair name must be string and between '
-                         '1 and 255 characters long'))
+    def _check_key_pair_quotas(self, context, user_id, key_name, key_type):
         try:
             objects.Quotas.check_deltas(context, {'key_pairs': 1}, user_id)
+            local_limit.enforce_db_limit(context, local_limit.KEY_PAIRS,
+                                         entity_scope=user_id, delta=1)
+        except exception.KeypairLimitExceeded:
+            raise
         except exception.OverQuota:
             raise exception.KeypairLimitExceeded()
 
@@ -6534,7 +6831,7 @@ class KeypairAPI:
     def import_key_pair(self, context, user_id, key_name, public_key,
                         key_type=keypair_obj.KEYPAIR_TYPE_SSH):
         """Import a key pair using an existing public key."""
-        self._validate_new_key_pair(context, user_id, key_name, key_type)
+        self._check_key_pair_quotas(context, user_id, key_name, key_type)
 
         self._notify(context, 'import.start', key_name)
 
@@ -6569,7 +6866,7 @@ class KeypairAPI:
     def create_key_pair(self, context, user_id, key_name,
                         key_type=keypair_obj.KEYPAIR_TYPE_SSH):
         """Create a new key pair."""
-        self._validate_new_key_pair(context, user_id, key_name, key_type)
+        self._check_key_pair_quotas(context, user_id, key_name, key_type)
 
         keypair = objects.KeyPair(context)
         keypair.user_id = user_id
@@ -6599,6 +6896,15 @@ class KeypairAPI:
         if CONF.quota.recheck_quota:
             try:
                 objects.Quotas.check_deltas(context, {'key_pairs': 0}, user_id)
+                # TODO(johngarbutt) do we really need this recheck?
+                # The quota rechecking of limits is really just to protect
+                # against denial of service attacks that aim to fill up the
+                # database. Its usefulness could be debated.
+                local_limit.enforce_db_limit(context, local_limit.KEY_PAIRS,
+                                             entity_scope=user_id, delta=0)
+            except exception.KeypairLimitExceeded:
+                with excutils.save_and_reraise_exception():
+                    keypair.destroy()
             except exception.OverQuota:
                 keypair.destroy()
                 raise exception.KeypairLimitExceeded()

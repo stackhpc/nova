@@ -25,7 +25,7 @@ POLICY_ROOT = 'os_compute_api:os-flavor-manage:%s'
 flavor_manage_policies = [
     policy.DocumentedRuleDefault(
         name=POLICY_ROOT % 'create',
-        check_str=base.SYSTEM_ADMIN,
+        check_str=base.ADMIN,
         description="Create a flavor",
         operations=[
             {
@@ -33,10 +33,10 @@ flavor_manage_policies = [
                 'path': '/flavors'
             }
         ],
-        scope_types=['system']),
+        scope_types=['project']),
     policy.DocumentedRuleDefault(
         name=POLICY_ROOT % 'update',
-        check_str=base.SYSTEM_ADMIN,
+        check_str=base.ADMIN,
         description="Update a flavor",
         operations=[
             {
@@ -44,10 +44,10 @@ flavor_manage_policies = [
                 'path': '/flavors/{flavor_id}'
             }
         ],
-        scope_types=['system']),
+        scope_types=['project']),
     policy.DocumentedRuleDefault(
         name=POLICY_ROOT % 'delete',
-        check_str=base.SYSTEM_ADMIN,
+        check_str=base.ADMIN,
         description="Delete a flavor",
         operations=[
             {
@@ -55,7 +55,7 @@ flavor_manage_policies = [
                 'path': '/flavors/{flavor_id}'
             }
         ],
-        scope_types=['system']),
+        scope_types=['project']),
 ]
 
 

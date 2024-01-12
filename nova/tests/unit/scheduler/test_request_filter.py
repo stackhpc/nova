@@ -10,8 +10,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
 import os_traits as ot
+from unittest import mock
 
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
@@ -31,8 +31,6 @@ class TestRequestFilter(test.NoDBTestCase):
         self.context = nova_context.RequestContext(user_id=uuids.user,
                                                    project_id=uuids.project)
         self.flags(limit_tenants_to_placement_aggregate=True,
-                   group='scheduler')
-        self.flags(query_placement_for_availability_zone=True,
                    group='scheduler')
         self.flags(enable_isolated_aggregate_filtering=True,
                    group='scheduler')
@@ -260,14 +258,6 @@ class TestRequestFilter(test.NoDBTestCase):
         getmd.assert_called_once_with(self.context, key='availability_zone',
                                       value='fooaz')
 
-    @mock.patch('nova.objects.AggregateList.get_by_metadata')
-    def test_map_az_disabled(self, getmd):
-        self.flags(query_placement_for_availability_zone=False,
-                   group='scheduler')
-        reqspec = objects.RequestSpec(availability_zone='fooaz')
-        request_filter.map_az_to_placement_aggregate(self.context, reqspec)
-        getmd.assert_not_called()
-
     @mock.patch('nova.objects.aggregate.AggregateList.'
                 'get_non_matching_by_metadata_keys')
     @mock.patch('nova.objects.AggregateList.get_by_metadata')
@@ -406,13 +396,15 @@ class TestRequestFilter(test.NoDBTestCase):
         self.assertIn('took %.1f seconds', log_lines[1])
 
     @mock.patch.object(request_filter, 'LOG', new=mock.Mock())
-    def test_transform_image_metadata(self):
+    def test_transform_image_metadata_x86(self):
         self.flags(image_metadata_prefilter=True, group='scheduler')
         properties = objects.ImageMetaProps(
             hw_disk_bus=objects.fields.DiskBus.SATA,
             hw_cdrom_bus=objects.fields.DiskBus.IDE,
             hw_video_model=objects.fields.VideoModel.QXL,
-            hw_vif_model=network_model.VIF_MODEL_VIRTIO
+            hw_vif_model=network_model.VIF_MODEL_VIRTIO,
+            hw_architecture=objects.fields.Architecture.X86_64,
+            hw_emulation_architecture=objects.fields.Architecture.AARCH64
         )
         reqspec = objects.RequestSpec(
             image=objects.ImageMeta(properties=properties),
@@ -426,6 +418,36 @@ class TestRequestFilter(test.NoDBTestCase):
             'COMPUTE_NET_VIF_MODEL_VIRTIO',
             'COMPUTE_STORAGE_BUS_IDE',
             'COMPUTE_STORAGE_BUS_SATA',
+            'HW_ARCH_X86_64',
+            'COMPUTE_ARCH_AARCH64',
+        }
+        self.assertEqual(expected, reqspec.root_required)
+
+    @mock.patch.object(request_filter, 'LOG', new=mock.Mock())
+    def test_transform_image_metadata_aarch64(self):
+        self.flags(image_metadata_prefilter=True, group='scheduler')
+        properties = objects.ImageMetaProps(
+            hw_disk_bus=objects.fields.DiskBus.SATA,
+            hw_cdrom_bus=objects.fields.DiskBus.IDE,
+            hw_video_model=objects.fields.VideoModel.QXL,
+            hw_vif_model=network_model.VIF_MODEL_VIRTIO,
+            hw_architecture=objects.fields.Architecture.AARCH64,
+            hw_emulation_architecture=objects.fields.Architecture.X86_64
+        )
+        reqspec = objects.RequestSpec(
+            image=objects.ImageMeta(properties=properties),
+            flavor=objects.Flavor(extra_specs={}),
+        )
+        self.assertTrue(
+            request_filter.transform_image_metadata(None, reqspec)
+        )
+        expected = {
+            'COMPUTE_GRAPHICS_MODEL_QXL',
+            'COMPUTE_NET_VIF_MODEL_VIRTIO',
+            'COMPUTE_STORAGE_BUS_IDE',
+            'COMPUTE_STORAGE_BUS_SATA',
+            'HW_ARCH_AARCH64',
+            'COMPUTE_ARCH_X86_64',
         }
         self.assertEqual(expected, reqspec.root_required)
 
@@ -476,6 +498,41 @@ class TestRequestFilter(test.NoDBTestCase):
 
         # Assert about logging
         mock_log.assert_not_called()
+
+    @mock.patch.object(request_filter, 'LOG')
+    def test_virtio_filter_with_packed_ring_in_flavor(self, mock_log):
+        # First ensure that packed_virtqueue_filter is included
+        self.assertIn(request_filter.packed_virtqueue_filter,
+                      request_filter.ALL_REQUEST_FILTERS)
+
+        es = {'hw:virtio_packed_ring': 'true'}
+        reqspec = objects.RequestSpec(
+            flavor=objects.Flavor(extra_specs=es),
+            image=objects.ImageMeta(properties=objects.ImageMetaProps()))
+        self.assertEqual(set(), reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
+
+        # Request filter puts the trait into the request spec
+        request_filter.packed_virtqueue_filter(self.context, reqspec)
+        self.assertEqual({ot.COMPUTE_NET_VIRTIO_PACKED}, reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
+
+    @mock.patch.object(request_filter, 'LOG')
+    def test_virtio_filter_with_packed_ring_in_image(self, mock_log):
+        # First ensure that packed_virtqueue_filter is included
+        self.assertIn(request_filter.packed_virtqueue_filter,
+                      request_filter.ALL_REQUEST_FILTERS)
+
+        reqspec = objects.RequestSpec(flavor=objects.Flavor(extra_specs={}),
+            image=objects.ImageMeta(
+            properties=objects.ImageMetaProps(hw_virtio_packed_ring=True)))
+        self.assertEqual(set(), reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
+
+        # Request filter puts the trait into the request spec
+        request_filter.packed_virtqueue_filter(self.context, reqspec)
+        self.assertEqual({ot.COMPUTE_NET_VIRTIO_PACKED}, reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
 
     def test_routed_networks_filter_not_enabled(self):
         self.assertIn(request_filter.routed_networks_filter,
@@ -580,3 +637,90 @@ class TestRequestFilter(test.NoDBTestCase):
         mock_get_aggs_network.assert_has_calls([
             mock.call(self.context, mock.ANY, mock.ANY, uuids.net1),
             mock.call(self.context, mock.ANY, mock.ANY, uuids.net2)])
+
+    def test_ephemeral_encryption_filter_no_encryption(self):
+        # First ensure that ephemeral_encryption_filter is included
+        self.assertIn(request_filter.ephemeral_encryption_filter,
+                      request_filter.ALL_REQUEST_FILTERS)
+
+        reqspec = objects.RequestSpec(
+            flavor=objects.Flavor(extra_specs={}),
+            image=objects.ImageMeta(
+                properties=objects.ImageMetaProps()))
+
+        self.assertEqual(set(), reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
+
+        # Assert that the filter returns false and doesn't update the reqspec
+        self.assertFalse(
+            request_filter.ephemeral_encryption_filter(self.context, reqspec))
+        self.assertEqual(set(), reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
+
+    def test_ephemeral_encryption_filter_encryption_disabled(self):
+        # First ensure that ephemeral_encryption_filter is included
+        self.assertIn(request_filter.ephemeral_encryption_filter,
+                      request_filter.ALL_REQUEST_FILTERS)
+
+        reqspec = objects.RequestSpec(
+            flavor=objects.Flavor(extra_specs={}),
+            image=objects.ImageMeta(
+                properties=objects.ImageMetaProps(
+                    hw_ephemeral_encryption=False)))
+        self.assertFalse(
+            request_filter.ephemeral_encryption_filter(
+                self.context, reqspec))
+        self.assertEqual(set(), reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
+
+        reqspec = objects.RequestSpec(
+            flavor=objects.Flavor(extra_specs={
+                'hw:ephemeral_encryption': 'False'}),
+            image=objects.ImageMeta(
+                properties=objects.ImageMetaProps()))
+        self.assertFalse(
+            request_filter.ephemeral_encryption_filter(
+                self.context, reqspec))
+        self.assertEqual(set(), reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
+
+    def test_ephemeral_encryption_filter_encryption_no_format(self):
+        # First ensure that ephemeral_encryption_filter is included
+        self.assertIn(request_filter.ephemeral_encryption_filter,
+                      request_filter.ALL_REQUEST_FILTERS)
+
+        reqspec = objects.RequestSpec(
+            flavor=objects.Flavor(extra_specs={
+                'hw:ephemeral_encryption': 'True'}),
+            image=objects.ImageMeta(
+                properties=objects.ImageMetaProps()))
+        self.assertEqual(set(), reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
+        self.assertTrue(
+            request_filter.ephemeral_encryption_filter(self.context, reqspec))
+        self.assertEqual(
+            {ot.COMPUTE_EPHEMERAL_ENCRYPTION}, reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
+
+    def test_ephemeral_encryption_filter_encryption_and_format(self):
+        # First ensure that ephemeral_encryption_filter is included
+        self.assertIn(request_filter.ephemeral_encryption_filter,
+                      request_filter.ALL_REQUEST_FILTERS)
+
+        reqspec = objects.RequestSpec(
+            flavor=objects.Flavor(
+                extra_specs={
+                    'hw:ephemeral_encryption': 'True',
+                    'hw:ephemeral_encryption_format': 'luks'
+                }),
+            image=objects.ImageMeta(
+                properties=objects.ImageMetaProps()))
+        self.assertEqual(set(), reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)
+        self.assertTrue(
+            request_filter.ephemeral_encryption_filter(self.context, reqspec))
+        self.assertEqual(
+            {ot.COMPUTE_EPHEMERAL_ENCRYPTION,
+             ot.COMPUTE_EPHEMERAL_ENCRYPTION_LUKS},
+            reqspec.root_required)
+        self.assertEqual(set(), reqspec.root_forbidden)

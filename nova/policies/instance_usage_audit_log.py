@@ -36,7 +36,7 @@ DEPRECATED_POLICY = policy.DeprecatedRule(
 instance_usage_audit_log_policies = [
     policy.DocumentedRuleDefault(
         name=BASE_POLICY_NAME % 'list',
-        check_str=base.SYSTEM_READER,
+        check_str=base.ADMIN,
         description="List all usage audits.",
         operations=[
             {
@@ -44,11 +44,11 @@ instance_usage_audit_log_policies = [
                 'path': '/os-instance_usage_audit_log'
             },
         ],
-        scope_types=['system'],
+        scope_types=['project'],
         deprecated_rule=DEPRECATED_POLICY),
     policy.DocumentedRuleDefault(
         name=BASE_POLICY_NAME % 'show',
-        check_str=base.SYSTEM_READER,
+        check_str=base.ADMIN,
         description="List all usage audits occurred before "
         "a specified time for all servers on all compute hosts where "
         "usage auditing is configured",
@@ -59,7 +59,7 @@ instance_usage_audit_log_policies = [
                 'path': '/os-instance_usage_audit_log/{before_timestamp}'
             }
         ],
-        scope_types=['system'],
+        scope_types=['project'],
         deprecated_rule=DEPRECATED_POLICY),
 ]
 

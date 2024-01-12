@@ -13,13 +13,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-import testtools
+from unittest import mock
 
 from oslo_config import cfg
 from oslo_log import log as logging
+import testtools
 
 import nova
+from nova.compute import manager
 from nova.conf import neutron as neutron_conf
 from nova import context as nova_context
 from nova import objects
@@ -344,6 +345,76 @@ class NUMAServersTest(NUMAServersTestBase):
 
         # There shouldn't be any hosts available to satisfy this request
         self._run_build_test(flavor_id, end_status='ERROR')
+
+    def test_create_server_with_mixed_policy_asymmetric_multi_numa(self):
+        """Boot an instance stretched to two NUMA nodes requesting only
+        shared CPUs in one NUMA and only dedicated in the other NUMA node.
+        """
+        #            shared  dedicated
+        # NUMA0 pCPU | 0   | 2 3
+        # NUMA1 pCPU |     | 6 7
+        self.flags(
+            cpu_shared_set='0',
+            cpu_dedicated_set='2,3,6,7',
+            group='compute',
+        )
+        self.flags(vcpu_pin_set=None)
+
+        host_info = fakelibvirt.HostInfo(
+            cpu_nodes=2, cpu_sockets=1, cpu_cores=4, cpu_threads=1)
+        self.start_compute(host_info=host_info, hostname='compute1')
+
+        # sanity check the created host topology object; this is really just a
+        # test of the fakelibvirt module
+        host_numa = objects.NUMATopology.obj_from_db_obj(
+            objects.ComputeNode.get_by_nodename(
+                self.ctxt, 'compute1',
+            ).numa_topology
+        )
+        self.assertEqual(2, len(host_numa.cells))
+        self.assertEqual({0}, host_numa.cells[0].cpuset)
+        self.assertEqual({2, 3}, host_numa.cells[0].pcpuset)
+
+        self.assertEqual(set(), host_numa.cells[1].cpuset)
+        self.assertEqual({6, 7}, host_numa.cells[1].pcpuset)
+
+        # create a flavor with 1 shared and 2 dedicated CPUs stretched to
+        # different NUMA nodes
+        extra_spec = {
+            'hw:cpu_policy': 'mixed',
+            'hw:cpu_dedicated_mask': '^0',
+            'hw:numa_nodes': '2',
+            'hw:numa_cpus.0': '0',
+            'hw:numa_cpus.1': '1,2',
+            'hw:numa_mem.0': '256',
+            'hw:numa_mem.1': '768',
+        }
+        flavor_id = self._create_flavor(
+            vcpu=3, memory_mb=1024, extra_spec=extra_spec)
+        expected_usage = {
+             'DISK_GB': 20, 'MEMORY_MB': 1024, 'PCPU': 2, 'VCPU': 1,
+        }
+        # The only possible solution (ignoring the order of vCPU1,2):
+        # vCPU 0 => pCPU 0, NUMA0, shared
+        # vCPU 1 => pCPU 6, NUMA1, dedicated
+        # vCPU 2 => pCPU 7, NUMA1, dedicated
+        server = self._run_build_test(
+            flavor_id, expected_usage=expected_usage)
+
+        # sanity check the instance topology
+        inst = objects.Instance.get_by_uuid(self.ctxt, server['id'])
+        self.assertEqual(2, len(inst.numa_topology.cells))
+
+        self.assertEqual({0}, inst.numa_topology.cells[0].cpuset)
+        self.assertEqual(set(), inst.numa_topology.cells[0].pcpuset)
+        self.assertIsNone(inst.numa_topology.cells[0].cpu_pinning)
+
+        self.assertEqual(set(), inst.numa_topology.cells[1].cpuset)
+        self.assertEqual({1, 2}, inst.numa_topology.cells[1].pcpuset)
+        self.assertEqual(
+            {6, 7},
+            set(inst.numa_topology.cells[1].cpu_pinning.values())
+        )
 
     def test_create_server_with_dedicated_policy_old_configuration(self):
         """Create a server using the legacy extra spec and configuration.
@@ -730,7 +801,7 @@ class NUMAServersTest(NUMAServersTestBase):
         for host, compute_rp_uuid in self.compute_rp_uuids.items():
             if host == original_host:
                 # the host that had the instance should no longer have
-                # alocations since the resize has been confirmed
+                # allocations since the resize has been confirmed
                 expected_usage = {'VCPU': 0, 'PCPU': 0, 'DISK_GB': 0,
                                   'MEMORY_MB': 0}
             else:
@@ -778,7 +849,7 @@ class NUMAServersTest(NUMAServersTestBase):
             self.assertEqual(2, len(src_numa_topology.cells[0].pinned_cpus))
             self.assertEqual(2, len(dst_numa_topology.cells[0].pinned_cpus))
 
-            # before continuing with the actualy confirm process
+            # before continuing with the actually confirm process
             return orig_confirm(*args, **kwargs)
 
         self.stub_out(
@@ -928,6 +999,103 @@ class NUMAServersTest(NUMAServersTestBase):
 
         self._assert_pinned_cpus(src_host, 2)
         self._assert_pinned_cpus(dst_host, 0)
+
+    def test_resize_dedicated_policy_race_on_dest_bug_1953359(self):
+
+        self.flags(cpu_dedicated_set='0-2', cpu_shared_set=None,
+                   group='compute')
+        self.flags(vcpu_pin_set=None)
+
+        host_info = fakelibvirt.HostInfo(cpu_nodes=1, cpu_sockets=1,
+                                         cpu_cores=2, cpu_threads=1)
+        self.start_compute(host_info=host_info, hostname='compute1')
+
+        extra_spec = {
+            'hw:cpu_policy': 'dedicated',
+        }
+        flavor_id = self._create_flavor(vcpu=1, extra_spec=extra_spec)
+        expected_usage = {'DISK_GB': 20, 'MEMORY_MB': 2048, 'PCPU': 1}
+
+        server = self._run_build_test(flavor_id, expected_usage=expected_usage)
+
+        inst = objects.Instance.get_by_uuid(self.ctxt, server['id'])
+        self.assertEqual(1, len(inst.numa_topology.cells))
+        # assert that the pcpu 0 is used on compute1
+        self.assertEqual({'0': 0}, inst.numa_topology.cells[0].cpu_pinning_raw)
+
+        # start another compute with the same config
+        self.start_compute(host_info=host_info, hostname='compute2')
+
+        # boot another instance but now on compute2 so that it occupies the
+        # pcpu 0 on compute2
+        # NOTE(gibi): _run_build_test cannot be used here as it assumes only
+        # compute1 exists
+        server2 = self._create_server(
+            flavor_id=flavor_id,
+            host='compute2',
+        )
+        inst2 = objects.Instance.get_by_uuid(self.ctxt, server2['id'])
+        self.assertEqual(1, len(inst2.numa_topology.cells))
+        # assert that the pcpu 0 is used
+        self.assertEqual(
+            {'0': 0}, inst2.numa_topology.cells[0].cpu_pinning_raw)
+
+        # migrate the first instance from compute1 to compute2 but stop
+        # migrating at the start of finish_resize. Then start a racing periodic
+        # update_available_resources.
+        orig_finish_resize = manager.ComputeManager.finish_resize
+
+        def fake_finish_resize(*args, **kwargs):
+            # start a racing update_available_resource periodic
+            self._run_periodics()
+            # we expect it that CPU pinning fails on the destination node
+            # as the resource_tracker will use the source node numa_topology
+            # and that does not fit to the dest node as pcpu 0 in the dest
+            # is already occupied.
+            log = self.stdlog.logger.output
+            # The resize_claim correctly calculates that the instance should be
+            # pinned to pcpu id 1 instead of 0
+            self.assertIn(
+                'Computed NUMA topology CPU pinning: usable pCPUs: [[1]], '
+                'vCPUs mapping: [(0, 1)]',
+                log,
+            )
+            # We expect that the periodic not fails as bug 1953359 is fixed.
+            log = self.stdlog.logger.output
+            self.assertIn('Running periodic for compute (compute2)', log)
+            self.assertNotIn('Error updating resources for node compute2', log)
+            self.assertNotIn(
+                'nova.exception.CPUPinningInvalid: CPU set to pin [0] must be '
+                'a subset of free CPU set [1]',
+                log,
+            )
+
+            # now let the resize finishes
+            return orig_finish_resize(*args, **kwargs)
+
+        # TODO(stephenfin): The mock of 'migrate_disk_and_power_off' should
+        # probably be less...dumb
+        with mock.patch('nova.virt.libvirt.driver.LibvirtDriver'
+                        '.migrate_disk_and_power_off', return_value='{}'):
+            with mock.patch(
+                'nova.compute.manager.ComputeManager.finish_resize',
+                new=fake_finish_resize,
+            ):
+                post = {'migrate': None}
+                # this is expected to succeed
+                self.admin_api.post_server_action(server['id'], post)
+
+        server = self._wait_for_state_change(server, 'VERIFY_RESIZE')
+
+        # As bug 1953359 is fixed the revert should succeed too
+        post = {'revertResize': {}}
+        self.admin_api.post_server_action(server['id'], post)
+        self._wait_for_state_change(server, 'ACTIVE')
+        self.assertNotIn(
+            'nova.exception.CPUUnpinningInvalid: CPU set to unpin [1] must be '
+            'a subset of pinned CPU set [0]',
+            self.stdlog.logger.output,
+        )
 
 
 class NUMAServerTestWithCountingQuotaFromPlacement(NUMAServersTest):
@@ -1089,10 +1257,8 @@ class ReshapeForPCPUsTest(NUMAServersTestBase):
         self.flags(cpu_dedicated_set='0-7', group='compute')
         self.flags(vcpu_pin_set=None)
 
-        computes = {}
-        for host, compute in self.computes.items():
-            computes[host] = self.restart_compute_service(compute)
-        self.computes = computes
+        for host in list(self.computes.keys()):
+            self.restart_compute_service(host)
 
         # verify that the inventory, usages and allocation are correct after
         # the reshape

@@ -69,10 +69,16 @@ class ServerExternalEventsController(wsgi.Controller):
     @validation.schema(server_external_events.create, '2.0', '2.50')
     @validation.schema(server_external_events.create_v251, '2.51', '2.75')
     @validation.schema(server_external_events.create_v276, '2.76', '2.81')
-    @validation.schema(server_external_events.create_v282, '2.82')
+    @validation.schema(server_external_events.create_v282, '2.82', '2.92')
+    @validation.schema(server_external_events.create_v293, '2.93')
     def create(self, req, body):
         """Creates a new instance event."""
         context = req.environ['nova.context']
+        # NOTE(gmann) We pass empty target to policy enforcement. This API
+        # is called by neutron which does not have correct project_id where
+        # server belongs to. By passing the empty target, we make sure that
+        # we do not check the requester project_id and allow users with
+        # allowed role to create external event.
         context.can(see_policies.POLICY_ROOT % 'create', target={})
 
         response_events = []

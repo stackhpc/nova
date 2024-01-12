@@ -13,10 +13,10 @@
 # under the License.
 
 import time
+from unittest import mock
 
 import fixtures
 import io
-import mock
 
 from nova import test
 from nova.tests import fixtures as nova_fixtures
@@ -47,6 +47,7 @@ class TestSerialConsoleLiveMigrate(test.TestCase):
            'nova.virt.libvirt.guest.libvirt',
            fakelibvirt))
         self.useFixture(nova_fixtures.LibvirtFixture())
+        self.useFixture(nova_fixtures.CGroupsFixture())
 
         self.admin_api = api_fixture.admin_api
         self.api = api_fixture.api

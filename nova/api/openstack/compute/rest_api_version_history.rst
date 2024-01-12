@@ -1141,7 +1141,7 @@ Validation is only used for recognized extra spec namespaces, currently:
 -------------------------------------
 
 Adds support for rescuing boot from volume instances when the compute host
-reports the ``COMPUTE_BFV_RESCUE`` capability trait.
+reports the ``COMPUTE_RESCUE_BFV`` capability trait.
 
 .. _microversion 2.88:
 
@@ -1191,8 +1191,8 @@ field.
 
 .. _microversion 2.90:
 
-2.90 (Maximum in Xena)
-----------------------
+2.90 (Maximum in Xena and Yoga)
+-------------------------------
 
 The ``POST /servers`` (create server), ``PUT /servers/{id}`` (update server)
 and ``POST /servers/{server_id}/action (rebuild)`` (rebuild server) APIs now
@@ -1202,3 +1202,48 @@ hostname based on the display name.
 
 In addition, the ``OS-EXT-SRV-ATTR:hostname`` field for all server
 responses is now visible to all users. Previously this was an admin-only field.
+
+.. _microversion 2.91:
+
+2.91
+----
+
+Add support to unshelve instance to a specific host.
+
+Add support to pin a server to an availability zone or unpin a server from any availability zone.
+
+.. _microversion 2.92:
+
+2.92
+----
+
+The ``POST /os-keypairs`` API now forbids to generate a keypair and allows new
+safe characters, specifically '@' and '.' (dot character).
+
+.. _microversion 2.93:
+
+2.93 (Maximum in Zed)
+---------------------
+
+Add support for volume backed server rebuild. The end user will provide the
+image with the rebuild command and it will rebuild the volume with the new
+image similar to the result of rebuilding an ephemeral disk.
+
+
+2.94
+----
+
+The ``hostname`` parameter to the ``POST /servers`` (create server), ``PUT
+/servers/{id}`` (update server) and ``POST /servers/{server_id}/action
+(rebuild)`` (rebuild server) APIs is now allowed to be a Fully Qualified Domain
+Name (FQDN).
+
+.. _microversion 2.95:
+
+2.95 (Maximum in 2023.1 Antelope and 2023.2 Bobcat)
+---------------------------------------------------
+
+Any evacuated instances will be now stopped at destination. This
+requires minimum nova release 27.0.0, OpenStack release 2023.1
+Antelope.  Operators can still use previous microversion for older
+behavior.

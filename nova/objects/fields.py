@@ -260,6 +260,14 @@ class BlockDeviceType(BaseNovaEnum):
     ALL = (CDROM, DISK, FLOPPY, FS, LUN)
 
 
+class BlockDeviceEncryptionFormatType(BaseNovaEnum):
+    PLAIN = 'plain'
+    LUKS = 'luks'
+    LUKSv2 = 'luksv2'
+
+    ALL = (PLAIN, LUKS, LUKSv2)
+
+
 class ConfigDrivePolicy(BaseNovaEnum):
     OPTIONAL = "optional"
     MANDATORY = "mandatory"
@@ -606,6 +614,16 @@ class VIFModel(BaseNovaEnum):
         value = value.lower()
         value = VIFModel.LEGACY_VALUES.get(value, value)
         return super(VIFModel, self).coerce(obj, attr, value)
+
+
+class VIOMMUModel(BaseNovaEnum):
+
+    INTEL = 'intel'
+    SMMUV3 = 'smmuv3'
+    VIRTIO = 'virtio'
+    AUTO = 'auto'
+
+    ALL = (INTEL, SMMUV3, VIRTIO, AUTO)
 
 
 class VMMode(BaseNovaEnum):
@@ -1197,6 +1215,10 @@ class BlockDeviceTypeField(BaseEnumField):
     AUTO_TYPE = BlockDeviceType()
 
 
+class BlockDeviceEncryptionFormatTypeField(BaseEnumField):
+    AUTO_TYPE = BlockDeviceEncryptionFormatType()
+
+
 class ConfigDrivePolicyField(BaseEnumField):
     AUTO_TYPE = ConfigDrivePolicy()
 
@@ -1289,6 +1311,10 @@ class VIFModelField(BaseEnumField):
     AUTO_TYPE = VIFModel()
 
 
+class VIOMMUModelField(BaseEnumField):
+    AUTO_TYPE = VIOMMUModel()
+
+
 class VMModeField(BaseEnumField):
     AUTO_TYPE = VMMode()
 
@@ -1351,6 +1377,14 @@ class InstanceTaskStateField(BaseEnumField):
 
 class InstancePowerStateField(BaseEnumField):
     AUTO_TYPE = InstancePowerState()
+
+
+class NetworkModelField(AutoTypedField):
+    AUTO_TYPE = NetworkModel()
+
+
+class NetworkVIFModelField(AutoTypedField):
+    AUTO_TYPE = NetworkVIFModel()
 
 
 class ListOfListsOfStringsField(AutoTypedField):

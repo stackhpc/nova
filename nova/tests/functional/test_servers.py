@@ -17,11 +17,13 @@ import collections
 import copy
 import datetime
 import time
+from unittest import mock
 import zlib
 
+from cinderclient import exceptions as cinder_exception
 from keystoneauth1 import adapter
-import mock
 from oslo_config import cfg
+from oslo_limit import fixture as limit_fixture
 from oslo_log import log as logging
 from oslo_serialization import base64
 from oslo_serialization import jsonutils
@@ -375,6 +377,109 @@ class ServersTest(integrated_helpers._IntegratedTestBase):
 
         # Wait for real deletion
         self._wait_until_deleted(found_server)
+
+    def test_unshelve_offloaded_overquota(self):
+        # Use a quota limit of 3 vcpus.
+        self.flags(cores=3, group='quota')
+
+        # Use flavor that has vcpus = 1.
+        for i in range(0, 3):
+            server = self._create_server(flavor_id=1)
+
+        # We should be at the quota limit now. Shelve an instance and wait for
+        # it to become SHELVED_OFFLOADED.
+        self._shelve_server(server, expected_state='SHELVED_OFFLOADED')
+
+        # Try to boot another instance. It should fail because shelved
+        # offloaded instances still consume quota.
+        ex = self.assertRaises(client.OpenStackApiException,
+                               self._create_server,
+                               flavor_id=1)
+        self.assertEqual(403, ex.response.status_code)
+
+        # Unshelving the instance should also succeed.
+        self._unshelve_server(server)
+
+    def _test_unshelve_offloaded_overquota_placement(self):
+        # Use flavor that has vcpus = 1.
+        for i in range(0, 3):
+            server = self._create_server(flavor_id=1)
+
+        # We should be at the quota limit now. Shelve an instance and wait for
+        # it to become SHELVED_OFFLOADED.
+        self._shelve_server(server, expected_state='SHELVED_OFFLOADED')
+
+        # Try to boot another instance. It should succeed because with
+        # placement, shelved offloaded instances do not consume cores/ram
+        # quota.
+        self._create_server(flavor_id=1)
+
+        # Now try to unshelve the earlier instance. It should fail because it
+        # would put us over quota to have 4 running instances.
+        ex = self.assertRaises(client.OpenStackApiException,
+                               self._unshelve_server,
+                               server)
+        self.assertEqual(403, ex.response.status_code)
+
+    def test_unshelve_offloaded_overquota_placement(self):
+        # Count quota usage from placement.
+        self.flags(count_usage_from_placement=True, group='quota')
+        # Use a quota limit of 3 vcpus.
+        self.flags(cores=3, group='quota')
+        self._test_unshelve_offloaded_overquota_placement()
+
+    def test_unshelve_offloaded_overquota_ul(self):
+        self.flags(driver='nova.quota.UnifiedLimitsDriver', group='quota')
+        limits = {
+            'servers': 5,
+            'class:VCPU': 3,
+            'class:MEMORY_MB': 2048,
+            'class:DISK_GB': 5
+        }
+        self.useFixture(limit_fixture.LimitFixture(limits, {}))
+        self._test_unshelve_offloaded_overquota_placement()
+
+    def test_unshelve_overquota(self):
+        # Test for behavior where the shelved instance is not offloaded.
+        self.flags(shelved_offload_time=3600)
+        # Use a quota limit of 3 vcpus.
+        self.flags(cores=3, group='quota')
+
+        # Use flavor that has vcpus = 1.
+        for i in range(0, 3):
+            server = self._create_server(flavor_id=1)
+
+        # We should be at the quota limit now. Shelve an instance.
+        self._shelve_server(server, expected_state='SHELVED')
+
+        # Try to boot another instance. It should fail because shelved
+        # instances still consume quota.
+        ex = self.assertRaises(client.OpenStackApiException,
+                               self._create_server,
+                               flavor_id=1)
+        self.assertEqual(403, ex.response.status_code)
+
+        # Verify that it's still SHELVED.
+        self._wait_for_state_change(server, 'SHELVED')
+
+        # Unshelving the instance should also succeed.
+        self._unshelve_server(server)
+
+    def test_unshelve_overquota_placement(self):
+        # Count quota usage from placement, should behave the same as legacy.
+        self.flags(count_usage_from_placement=True, group='quota')
+        self.test_unshelve_overquota()
+
+    def test_unshelve_overquota_ul(self):
+        self.flags(driver='nova.quota.UnifiedLimitsDriver', group='quota')
+        limits = {
+            'servers': 5,
+            'class:VCPU': 3,
+            'class:MEMORY_MB': 2048,
+            'class:DISK_GB': 5
+        }
+        self.useFixture(limit_fixture.LimitFixture(limits, {}))
+        self.test_unshelve_overquota_placement()
 
     def test_create_server_with_metadata(self):
         # Creates a server with metadata.
@@ -764,7 +869,7 @@ class ServersTest(integrated_helpers._IntegratedTestBase):
         LOG.info('Attaching volume %s to server %s', volume_id, server_id)
 
         # The fake driver doesn't implement get_device_name_for_instance, so
-        # we'll just raise the exception directly here, instead of simuluating
+        # we'll just raise the exception directly here, instead of simulating
         # an instance with 26 disk devices already attached.
         with mock.patch.object(self.compute.driver,
                                'get_device_name_for_instance') as mock_get:
@@ -981,13 +1086,16 @@ class ServersTestV219(integrated_helpers._IntegratedTestBase):
 
         # Update and rebuild servers with invalid descriptions.
         # These throw 400.
-        server_id = self._create_server(True, "desc")[1]['id']
+        server = self._create_server(True, "desc")[1]
+        server_id = server['id']
         # Invalid unicode with non-printable control char
         self._update_assertRaisesRegex(server_id, u'invalid\u0604string')
         self._rebuild_assertRaisesRegex(server_id, u'invalid\u0604string')
         # Description is longer than 255 chars
         self._update_assertRaisesRegex(server_id, 'x' * 256)
         self._rebuild_assertRaisesRegex(server_id, 'x' * 256)
+
+        self._delete_server(server)
 
 
 class ServerTestV220(integrated_helpers._IntegratedTestBase):
@@ -1032,9 +1140,9 @@ class ServerTestV220(integrated_helpers._IntegratedTestBase):
                          mock.patch.object(volume.cinder.API,
                                         'check_availability_zone'),
                          mock.patch.object(volume.cinder.API,
-                                        'attachment_create'),
+                                        'attachment_create', autospec=False),
                          mock.patch.object(volume.cinder.API,
-                                        'attachment_complete')
+                                        'attachment_complete', autospec=False)
                          ) as (mock_check_vol_attached,
                                mock_check_av_zone, mock_attach_create,
                                mock_attachment_complete):
@@ -1253,9 +1361,7 @@ class ServerTestV269(integrated_helpers._IntegratedTestBase):
     def test_get_servers_detail_filters(self):
         # We get the results only from the up cells, this ignoring the down
         # cells if list_records_by_skipping_down_cells config option is True.
-        api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
-            api_version='v2.1'))
-        self.admin_api = api_fixture.admin_api
+        self.admin_api = self.api_fixture.admin_api
         self.admin_api.microversion = '2.69'
         servers = self.admin_api.get_servers(
             search_opts={'hostname': "cell3-inst0"})
@@ -1263,9 +1369,7 @@ class ServerTestV269(integrated_helpers._IntegratedTestBase):
         self.assertEqual(self.up_cell_insts[2], servers[0]['id'])
 
     def test_get_servers_detail_all_tenants_with_down_cells(self):
-        api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
-            api_version='v2.1'))
-        self.admin_api = api_fixture.admin_api
+        self.admin_api = self.api_fixture.admin_api
         self.admin_api.microversion = '2.69'
         servers = self.admin_api.get_servers(search_opts={'all_tenants': True})
         # 4 servers from the up cells and 4 servers from the down cells
@@ -1518,15 +1622,97 @@ class ServerRebuildTestCase(integrated_helpers._IntegratedTestBase):
                       'volume-backed server', str(resp))
 
 
+class ServerRebuildTestCaseV293(integrated_helpers._IntegratedTestBase):
+    api_major_version = 'v2.1'
+
+    def setUp(self):
+        super(ServerRebuildTestCaseV293, self).setUp()
+        self.cinder = nova_fixtures.CinderFixture(self)
+        self.useFixture(self.cinder)
+
+    def _bfv_server(self):
+        server_req_body = {
+            # There is no imageRef because this is boot from volume.
+            'server': {
+                'flavorRef': '1',  # m1.tiny from DefaultFlavorsFixture,
+                'name': 'test_volume_backed_rebuild_different_image',
+                'networks': [],
+                'block_device_mapping_v2': [{
+                    'boot_index': 0,
+                    'uuid':
+                    nova_fixtures.CinderFixture.IMAGE_BACKED_VOL,
+                    'source_type': 'volume',
+                    'destination_type': 'volume'
+                }]
+            }
+        }
+        server = self.api.post_server(server_req_body)
+        return self._wait_for_state_change(server, 'ACTIVE')
+
+    def _test_rebuild(self, server):
+        self.api.microversion = '2.93'
+        # Now rebuild the server with a different image than was used to create
+        # our fake volume.
+        rebuild_image_ref = self.glance.auto_disk_config_enabled_image['id']
+        rebuild_req_body = {'rebuild': {'imageRef': rebuild_image_ref}}
+
+        with mock.patch.object(self.compute.manager.virtapi,
+                               'wait_for_instance_event'):
+            self.api.api_post('/servers/%s/action' % server['id'],
+                              rebuild_req_body,
+                              check_response_status=[202])
+
+    def test_volume_backed_rebuild_root_v293(self):
+        server = self._bfv_server()
+        self._test_rebuild(server)
+
+    def test_volume_backed_rebuild_root_create_failed(self):
+        server = self._bfv_server()
+        error = cinder_exception.ClientException(code=500)
+        with mock.patch.object(volume.cinder.API, 'attachment_create',
+                               side_effect=error, autospec=False):
+            # We expect this to fail because we are doing cast-as-call
+            self.assertRaises(client.OpenStackApiException,
+                              self._test_rebuild, server)
+            server = self.api.get_server(server['id'])
+            self.assertIn('Failed to rebuild volume backed instance',
+                          server['fault']['message'])
+            self.assertEqual('ERROR', server['status'])
+
+    def test_volume_backed_rebuild_root_instance_deleted(self):
+        server = self._bfv_server()
+        error = exception.InstanceNotFound(instance_id=server['id'])
+        with mock.patch.object(self.compute.manager, '_detach_root_volume',
+                               side_effect=error):
+            # We expect this to fail because we are doing cast-as-call
+            self.assertRaises(client.OpenStackApiException,
+                              self._test_rebuild, server)
+            server = self.api.get_server(server['id'])
+            self.assertIn('Failed to rebuild volume backed instance',
+                          server['fault']['message'])
+            self.assertEqual('ERROR', server['status'])
+
+    def test_volume_backed_rebuild_root_delete_old_failed(self):
+        server = self._bfv_server()
+        error = cinder_exception.ClientException(code=500)
+        with mock.patch.object(volume.cinder.API, 'attachment_delete',
+                               side_effect=error, autospec=False):
+            # We expect this to fail because we are doing cast-as-call
+            self.assertRaises(client.OpenStackApiException,
+                              self._test_rebuild, server)
+            server = self.api.get_server(server['id'])
+            self.assertIn('Failed to rebuild volume backed instance',
+                          server['fault']['message'])
+            self.assertEqual('ERROR', server['status'])
+
+
 class ServersTestV280(integrated_helpers._IntegratedTestBase):
     api_major_version = 'v2.1'
 
     def setUp(self):
         super(ServersTestV280, self).setUp()
-        api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
-            api_version='v2.1'))
-        self.api = api_fixture.api
-        self.admin_api = api_fixture.admin_api
+        self.api = self.api_fixture.api
+        self.admin_api = self.api_fixture.admin_api
 
         self.api.microversion = '2.80'
         self.admin_api.microversion = '2.80'
@@ -1585,9 +1771,8 @@ class ServersTestV280(integrated_helpers._IntegratedTestBase):
 
         project_id_1 = '4906260553374bf0a5d566543b320516'
         project_id_2 = 'c850298c1b6b4796a8f197ac310b2469'
-        new_api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
-            api_version=self.api_major_version, project_id=project_id_1))
-        new_admin_api = new_api_fixture.admin_api
+        new_admin_api = self.api_fixture.alternative_admin_api
+        new_admin_api.project_id = project_id_1
         new_admin_api.microversion = '2.80'
 
         post = {
@@ -1605,6 +1790,8 @@ class ServersTestV280(integrated_helpers._IntegratedTestBase):
         # Get the migration records by not exist project_id
         migrations = new_admin_api.get_migrations(project_id=project_id_2)
         self.assertEqual([], migrations)
+
+        self._delete_server(server)
 
 
 class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
@@ -2001,6 +2188,77 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
         self.assert_hypervisor_usage(
             dest_rp_uuid, self.flavor2, volume_backed=False)
 
+    def test_resize_server_conflict(self):
+
+        # Set appropriate traits for Resource Provider
+        rp_uuid1 = self._get_provider_uuid_by_host(self.compute1.host)
+        self._set_provider_traits(rp_uuid1, ['COMPUTE_NET_VIRTIO_PACKED'])
+
+        # Create image
+        image = self._create_image(metadata={'hw_virtio_packed_ring': 'true'})
+
+        # Create server
+        server = self._build_server(image_uuid=image['id'], networks='none')
+        created_server = self.api.post_server({"server": server})
+        created_server_id = created_server['id']
+        found_server = self._wait_for_state_change(created_server, 'ACTIVE')
+
+        # Create a flavor with conflict in relation to the image configuration
+        flavor_id = self._create_flavor(
+            extra_spec={'hw:virtio_packed_ring': 'false'})
+
+        # Resize server(flavorRef: 1 -> 2)
+        post = {'resize': {"flavorRef": flavor_id}}
+
+        ex = self.assertRaises(client.OpenStackApiException,
+                               self.api.post_server_action,
+                               created_server_id, post)
+
+        # By returning 400, We want to confirm that the RESIZE server
+        # does not cause unexpected behavior.
+        self.assertEqual(400, ex.response.status_code)
+
+        # Verify that the instance is still in the Active state
+        self.assertEqual('ACTIVE', found_server['status'])
+
+        # Cleanup
+        self._delete_server(found_server)
+
+    def test_rebuild_server_conflict(self):
+
+        # Set appropriate traits for Resource Provider
+        rp_uuid1 = self._get_provider_uuid_by_host(self.compute1.host)
+        self._set_provider_traits(rp_uuid1, ['COMPUTE_NET_VIRTIO_PACKED'])
+
+        # Create flavor
+        flavor_id = self._create_flavor(
+            extra_spec={'hw:virtio_packed_ring': 'true'})
+
+        # Create server
+        server = self._build_server(flavor_id=flavor_id, networks='none')
+        created_server = self.api.post_server({"server": server})
+        created_server_id = created_server['id']
+        found_server = self._wait_for_state_change(created_server, 'ACTIVE')
+
+        # Create an image with conflict in relation to the flavor configuration
+        image = self._create_image(metadata={'hw_virtio_packed_ring': 'false'})
+
+        # Now rebuild the server with a different image
+        post = {'rebuild': {'imageRef': image['id']}}
+        ex = self.assertRaises(client.OpenStackApiException,
+                               self.api.post_server_action,
+                               created_server_id, post)
+
+        # By returning 400, We want to confirm that the RESIZE server
+        # does not cause unexpected behavior.
+        self.assertEqual(400, ex.response.status_code)
+
+        # Verify that the instance is still in the Active state
+        self.assertEqual('ACTIVE', found_server['status'])
+
+        # Cleanup
+        self._delete_server(found_server)
+
     def test_evacuate_with_no_compute(self):
         source_hostname = self.compute1.host
         dest_hostname = self.compute2.host
@@ -2182,7 +2440,8 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
         }
 
         server = self._evacuate_server(
-            server, extra_post_args=post, expected_host=dest_hostname)
+            server, extra_post_args=post, expected_host=dest_hostname,
+            expected_state='ACTIVE')
 
         # Run the periodics to show those don't modify allocations.
         self._run_periodics()
@@ -2359,7 +2618,8 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
             # stay ACTIVE and task_state will be set to None.
             server = self._evacuate_server(
                 server, expected_task_state=None,
-                expected_migration_status='failed')
+                expected_migration_status='failed',
+                expected_state='ACTIVE')
 
         # Run the periodics to show those don't modify allocations.
         self._run_periodics()
@@ -2518,6 +2778,57 @@ class ServerMovingTests(integrated_helpers.ProviderUsageBaseTestCase):
                                            source_rp_uuid)
 
         self._delete_and_check_allocations(server)
+
+    def test_shelve_unshelve_to_host(self):
+        source_hostname = self.compute1.host
+        dest_hostname = self.compute2.host
+        source_rp_uuid = self._get_provider_uuid_by_host(source_hostname)
+        dest_rp_uuid = \
+            self._get_provider_uuid_by_host(dest_hostname)
+
+        server = self._boot_then_shelve_and_check_allocations(
+            source_hostname, source_rp_uuid)
+
+        self._shelve_offload_and_check_allocations(server, source_rp_uuid)
+
+        req = {
+            'unshelve': {'host': dest_hostname}
+        }
+
+        self.api.post_server_action(server['id'], req)
+        self._wait_for_server_parameter(
+            server, {'OS-EXT-SRV-ATTR:host': dest_hostname, 'status': 'ACTIVE'}
+        )
+
+        self.assertFlavorMatchesUsage(dest_rp_uuid, self.flavor1)
+
+        # the server has an allocation on only the dest node
+        self.assertFlavorMatchesAllocation(
+                self.flavor1, server['id'], dest_rp_uuid)
+
+        self._delete_and_check_allocations(server)
+
+    def test_shelve_unshelve_to_host_instance_not_offloaded(self):
+        source_hostname = self.compute1.host
+        dest_hostname = self.compute2.host
+        source_rp_uuid = self._get_provider_uuid_by_host(source_hostname)
+
+        server = self._boot_then_shelve_and_check_allocations(
+            source_hostname, source_rp_uuid)
+
+        req = {
+            'unshelve': {'host': dest_hostname}
+        }
+
+        ex = self.assertRaises(
+                client.OpenStackApiException,
+                self.api.post_server_action,
+                server['id'], req
+                )
+        self.assertEqual(409, ex.response.status_code)
+        self.assertIn(
+                "The server status must be SHELVED_OFFLOADED",
+                ex.response.text)
 
     def _shelve_offload_and_check_allocations(self, server, source_rp_uuid):
         req = {
@@ -4546,6 +4857,7 @@ class ServerTestV256SingleCellMultiHostTestCase(ServerTestV256Common):
     """Happy path test where we create a server on one host, migrate it to
     another host of our choosing and ensure it lands there.
     """
+
     def test_migrate_server_to_host_in_same_cell(self):
         server = self._create_server()
         server = self._wait_for_state_change(server, 'ACTIVE')
@@ -5194,7 +5506,8 @@ class ServerMovingTestsWithNestedResourceRequests(
 
         server = self._evacuate_server(
             server, extra_post_args=post, expected_migration_status='error',
-            expected_host=source_hostname)
+            expected_host=source_hostname,
+            expected_state='ACTIVE')
 
         self.assertIn('Unable to move instance %s to host host2. The instance '
                       'has complex allocations on the source host so move '
@@ -5400,7 +5713,8 @@ class ServerMovingTestsFromFlatToNested(
 
         self._evacuate_server(
             server, extra_post_args=post, expected_host='host1',
-            expected_migration_status='error')
+            expected_migration_status='error',
+            expected_state='ACTIVE')
 
         # We expect that the evacuation will fail as force evacuate tries to
         # blindly copy the source allocation to the destination but on the
@@ -6392,3 +6706,41 @@ class PortAndFlavorAccelsServerCreateTest(AcceleratorServerBase):
         binding_profile = neutronapi.get_binding_profile(updated_port)
         self.assertNotIn('arq_uuid', binding_profile)
         self.assertNotIn('pci_slot', binding_profile)
+
+
+class PortBindingShelvedServerTest(integrated_helpers._IntegratedTestBase):
+    """Tests for servers with ports."""
+
+    compute_driver = 'fake.SmallFakeDriver'
+
+    def setUp(self):
+        super(PortBindingShelvedServerTest, self).setUp()
+        self.flavor_id = self._create_flavor(
+            disk=10, ephemeral=20, swap=5 * 1024)
+
+    def test_shelve_offload_with_port(self):
+        # Do not wait before offloading
+        self.flags(shelved_offload_time=0)
+
+        server = self._create_server(
+            flavor_id=self.flavor_id,
+            networks=[{'port': self.neutron.port_1['id']}])
+
+        port = self.neutron.show_port(self.neutron.port_1['id'])['port']
+
+        # Assert that the port is actually associated to the instance
+        self.assertEqual(port['device_id'], server['id'])
+        self.assertEqual(port['binding:host_id'], 'compute')
+        self.assertEqual(port['binding:status'], 'ACTIVE')
+
+        # Do shelve
+        server = self._shelve_server(server, 'SHELVED_OFFLOADED')
+
+        # Retrieve the updated port
+        port = self.neutron.show_port(self.neutron.port_1['id'])['port']
+
+        # Assert that the port is still associated to the instance
+        # but the binding is not on the compute anymore
+        self.assertEqual(port['device_id'], server['id'])
+        self.assertIsNone(port['binding:host_id'])
+        self.assertNotIn('binding:status', port)

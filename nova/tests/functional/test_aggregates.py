@@ -197,14 +197,24 @@ class AggregateRequestFiltersTest(
         agg = self.aggregates[agg]
         self.admin_api.add_host_to_aggregate(agg['id'], host)
 
-    def _boot_server(self, az=None, flavor_id=None, image_id=None,
-                     end_status='ACTIVE'):
+    def _remove_host_from_aggregate(self, agg, host):
+        """Remove a compute host from both nova and placement aggregates.
+
+        :param agg: Name of the nova aggregate
+        :param host: Name of the compute host
+        """
+        agg = self.aggregates[agg]
+        self.admin_api.remove_host_from_aggregate(agg['id'], host)
+
+    def _boot_server(
+        self, az=None, host=None, flavor_id=None, image_id=None,
+        end_status='ACTIVE',
+    ):
         flavor_id = flavor_id or self.flavors[0]['id']
         image_uuid = image_id or '155d900f-4e14-4e4c-a73d-069cbf4541e6'
         server_req = self._build_server(
-            image_uuid=image_uuid,
-            flavor_id=flavor_id,
-            networks='none', az=az)
+            image_uuid=image_uuid, flavor_id=flavor_id,
+            networks='none', az=az, host=host)
 
         created_server = self.api.post_server({'server': server_req})
         server = self._wait_for_state_change(created_server, end_status)
@@ -284,7 +294,7 @@ class AggregateRequestFiltersTest(
 
 class AggregatePostTest(AggregateRequestFiltersTest):
 
-    def test_set_az_for_aggreate_no_instances(self):
+    def test_set_az_for_aggregate_no_instances(self):
         """Should be possible to update AZ for an empty aggregate.
 
         Check you can change the AZ name of an aggregate when it does
@@ -341,6 +351,105 @@ class AggregatePostTest(AggregateRequestFiltersTest):
             '/os-aggregates/%s' %
             self.aggregates['only-host1']['id']).body['aggregate']
         self.assertEqual(az, agg['availability_zone'])
+
+
+class AggregateHostMoveTestCase(AggregateRequestFiltersTest):
+
+    def setUp(self):
+        super().setUp()
+        # keep it separate from the parent class' setup
+        self.host = 'host3'
+        az = 'custom-az'
+        self._start_compute(self.host)
+        self._create_aggregate('ag1-no-az')
+        self._create_aggregate('ag2-no-az')
+        self._create_aggregate('ag3-custom-az')
+        self._set_az_aggregate('ag3-custom-az', az)
+        self._create_aggregate('ag4-custom-az')
+        self._set_az_aggregate('ag4-custom-az', az)
+
+    def test_add_host_with_instances_default_az_doesnt_change(self):
+        # server will be in default AZ
+        self._boot_server(host=self.host)
+
+        # the AZ of the server does not change as the aggregate is also in
+        # the default AZ.
+        self._add_host_to_aggregate('ag1-no-az', self.host)
+
+    def test_add_host_with_instances_custom_az_doesnt_change(self):
+        self._add_host_to_aggregate('ag3-custom-az', self.host)
+        # server will be in custom AZ
+        self._boot_server(host=self.host)
+
+        # as the new aggregate also in the custom-az this does not need the
+        # server to move between AZs, so this is OK.
+        self._add_host_to_aggregate('ag4-custom-az', self.host)
+
+    def test_cannot_add_host_with_instances_default_az_then_custom_az(self):
+        # server will be in default AZ
+        self._boot_server(host=self.host)
+
+        # FIXME(stephenfin): This is bug #1907775, where we should reject the
+        # request to add a host to an aggregate when and instance would need
+        # to move between AZs
+
+        # The server would need to move from default AZ to custom AZ, that
+        # is not OK
+        self._add_host_to_aggregate('ag3-custom-az', self.host)
+
+    def test_add_host_with_instances_custom_az_then_default(self):
+        self._add_host_to_aggregate('ag3-custom-az', self.host)
+        # server will be in custom AZ
+        self._boot_server(host=self.host)
+
+        # The server is still in the custom AZ and that is OK as the host is
+        # also in that AZ even after added to an aggregate without AZ.
+        self._add_host_to_aggregate('ag1-no-az', self.host)
+
+    def test_remove_host_with_instances_default_az_doesnt_change(self):
+        self._add_host_to_aggregate('ag1-no-az', self.host)
+        self._add_host_to_aggregate('ag2-no-az', self.host)
+        # server will be in default AZ
+        self._boot_server(host=self.host)
+
+        # The server still remains in default AZ so no AZ change, this is OK
+        self._remove_host_from_aggregate('ag1-no-az', self.host)
+        # still OK as the host not in any aggregate means instance is in
+        # default AZ.
+        self._remove_host_from_aggregate('ag2-no-az', self.host)
+
+    def test_remove_host_with_instances_custom_az_doesnt_change(self):
+        self._add_host_to_aggregate('ag3-custom-az', self.host)
+        self._add_host_to_aggregate('ag4-custom-az', self.host)
+        # server will be in custom AZ
+        self._boot_server(host=self.host)
+
+        # The server still remains in custom AZ so no AZ change, it is OK.
+        self._remove_host_from_aggregate('ag3-custom-az', self.host)
+
+    def test_cannot_remove_host_with_instances_custom_az_to_default(self):
+        self._add_host_to_aggregate('ag3-custom-az', self.host)
+        # server will be in custom AZ
+        self._boot_server(host=self.host)
+
+        # FIXME(stephenfin): This is bug #1907775, where we should reject the
+        # request to remove a host from the aggregate when there are instances
+        # on said host
+
+        # The server would need to move to the default AZ, that is not OK.
+        self._remove_host_from_aggregate('ag3-custom-az', self.host)
+
+    def test_moving_host_around_az_without_instances(self):
+        # host moving from default to custom AZ
+        self._add_host_to_aggregate('ag3-custom-az', self.host)
+        # host still in custom AZ
+        self._add_host_to_aggregate('ag1-no-az', self.host)
+        # host moves from custom to default AZ
+        self._remove_host_from_aggregate('ag3-custom-az', self.host)
+        # host still in default AZ
+        self._remove_host_from_aggregate('ag1-no-az', self.host)
+        # host still in default AZ
+        self._add_host_to_aggregate('ag1-no-az', self.host)
 
 
 # NOTE: this test case has the same test methods as AggregatePostTest
@@ -433,25 +542,6 @@ class TenantAggregateFilterTest(AggregateRequestFiltersTest):
         for i in range(0, 4):
             server = self._boot_server(end_status='ACTIVE')
             self.assertEqual('host2', self._get_instance_host(server))
-
-
-class AvailabilityZoneFilterTest(AggregateRequestFiltersTest):
-    def setUp(self):
-        # Default to enabling the filter
-        self.flags(query_placement_for_availability_zone=True,
-                   group='scheduler')
-
-        # Use custom weigher to make sure that we have a predictable
-        # scheduling sort order.
-        self.useFixture(nova_fixtures.HostNameWeigherFixture())
-        super(AvailabilityZoneFilterTest, self).setUp()
-
-    def test_filter_with_az(self):
-        self._set_az_aggregate('only-host2', 'myaz')
-        server1 = self._boot_server(az='myaz')
-        server2 = self._boot_server(az='myaz')
-        hosts = [self._get_instance_host(s) for s in (server1, server2)]
-        self.assertEqual(['host2', 'host2'], hosts)
 
 
 class IsolateAggregateFilterTest(AggregateRequestFiltersTest):
@@ -739,8 +829,6 @@ class TestAggregateFiltersTogether(AggregateRequestFiltersTest):
                    group='scheduler')
         self.flags(placement_aggregate_required_for_tenants=True,
                    group='scheduler')
-        self.flags(query_placement_for_availability_zone=True,
-                   group='scheduler')
         self.flags(enable_isolated_aggregate_filtering=True,
                    group='scheduler')
         # setting traits to flavors
@@ -826,11 +914,11 @@ class TestAggregateMultiTenancyIsolationFilter(
 
         # Start nova services.
         self.start_service('conductor')
-        self.admin_api = self.useFixture(
-            nova_fixtures.OSAPIFixture(api_version='v2.1')).admin_api
-        self.api = self.useFixture(
-            nova_fixtures.OSAPIFixture(api_version='v2.1',
-                                       project_id=uuids.non_admin)).api
+        api_fixture = self.useFixture(
+            nova_fixtures.OSAPIFixture(api_version='v2.1'))
+        self.admin_api = api_fixture.admin_api
+        self.api = api_fixture.api
+        self.api.project_id = uuids.non_admin
         # Add the AggregateMultiTenancyIsolation to the list of enabled
         # filters since it is not enabled by default.
         enabled_filters = CONF.filter_scheduler.enabled_filters
@@ -928,15 +1016,15 @@ class AggregateMultiTenancyIsolationColdMigrateTest(
         self.glance = self.useFixture(nova_fixtures.GlanceFixture(self))
         self.useFixture(nova_fixtures.NeutronFixture(self))
         self.useFixture(func_fixtures.PlacementFixture())
-        # Intentionally keep these separate since we want to create the
-        # server with the non-admin user in a different project.
-        admin_api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
+        # Intentionally define different project id for the two client since
+        # we want to create the server with the non-admin user in a different
+        # project.
+        api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
             api_version='v2.1', project_id=uuids.admin_project))
-        self.admin_api = admin_api_fixture.admin_api
+        self.admin_api = api_fixture.admin_api
         self.admin_api.microversion = 'latest'
-        user_api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
-            api_version='v2.1', project_id=uuids.user_project))
-        self.api = user_api_fixture.api
+        self.api = api_fixture.api
+        self.api.project_id = uuids.user_project
         self.api.microversion = 'latest'
 
         self.start_service('conductor')

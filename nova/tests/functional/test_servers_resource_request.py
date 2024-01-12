@@ -14,10 +14,9 @@
 
 import copy
 import logging
-import unittest
+from unittest import mock
 
 from keystoneauth1 import adapter
-import mock
 from neutronclient.common import exceptions as neutron_exception
 import os_resource_classes as orc
 from oslo_config import cfg
@@ -147,12 +146,13 @@ class ExtendedResourceRequestNeutronFixture(ResourceRequestNeutronFixture):
             # port_resource_request_groups.py
             {
                 "updated": "2021-08-02T10:00:00-00:00",
-                "name": constants.RESOURCE_REQUEST_GROUPS_EXTENSION,
+                "name": "Port Resource Request Groups",
                 "links": [],
                 "alias": "port-resource-request-groups",
-                "description":
+                "description": (
                     "Support requesting multiple groups of resources and "
                     "traits from the same RP subtree in resource_request"
+                ),
             }
         )
         return extensions
@@ -459,7 +459,7 @@ class PortResourceRequestBasedSchedulingTestBase(
 
     def _create_sriov_networking_rp_tree(self, hostname, compute_rp_uuid):
         # Create a matching RP tree in placement for the PCI devices added to
-        # the passthrough_whitelist config during setUp() and PCI devices
+        # the device_spec config during setUp() and PCI devices
         # present in the FakeDriverWithPciResources virt driver.
         #
         # * PF1 represents the PCI device 0000:01:00, it will be mapped to
@@ -821,11 +821,6 @@ class NonAdminUnsupportedPortResourceRequestBasedSchedulingTest(
             'os_compute_api:os-evacuate': '@',
         })
 
-    # this is bug 1945310
-    @unittest.expectedFailure
-    def test_interface_attach_with_resource_request_old_compute(self):
-        super().test_interface_attach_with_resource_request_old_compute()
-
 
 class PortResourceRequestBasedSchedulingTest(
         PortResourceRequestBasedSchedulingTestBase):
@@ -1073,7 +1068,7 @@ class PortResourceRequestBasedSchedulingTest(
     def test_interface_attach_sriov_with_qos_pci_update_fails(self):
         # Update the name of the network device RP of PF2 on host2 to something
         # unexpected. This will cause
-        # update_pci_request_spec_with_allocated_interface_name() to raise
+        # update_pci_request_with_placement_allocations() to raise
         # when the sriov interface is attached.
         rsp = self.placement.put(
             '/resource_providers/%s'
@@ -1120,7 +1115,7 @@ class PortResourceRequestBasedSchedulingTest(
     ):
         # Update the name of the network device RP of PF2 on host2 to something
         # unexpected. This will cause
-        # update_pci_request_spec_with_allocated_interface_name() to raise
+        # update_pci_request_with_placement_allocations() to raise
         # when the sriov interface is attached.
         rsp = self.placement.put(
             '/resource_providers/%s'
@@ -1367,7 +1362,7 @@ class PortResourceRequestBasedSchedulingTest(
         does not have resource request can be allocated to PF2 or PF3.
 
         For the detailed compute host config see the FakeDriverWithPciResources
-        class. For the necessary passthrough_whitelist config see the setUp of
+        class. For the necessary device_spec config see the setUp of
         the PortResourceRequestBasedSchedulingTestBase class.
         """
 
@@ -1529,11 +1524,6 @@ class NonAdminPortResourceRequestTests(
             'os_compute_api:os-services:list': '@',
         })
 
-    # this is bug 1945310
-    @unittest.expectedFailure
-    def test_interface_detach_with_port_with_bandwidth_request(self):
-        super().test_interface_detach_with_port_with_bandwidth_request()
-
 
 class ExtendedPortResourceRequestBasedSchedulingTestBase(
         PortResourceRequestBasedSchedulingTestBase):
@@ -1649,6 +1639,7 @@ class MultiGroupResourceRequestBasedSchedulingTest(
     and packet rate resource requests. This also means that the neutron fixture
     simulates the new resource_request format for all ports.
     """
+
     def setUp(self):
         super().setUp()
         self.neutron = self.useFixture(
@@ -1679,11 +1670,6 @@ class NonAdminMultiGroupResReqTests(
             'os_compute_api:os-migrations:index': '@',
             'os_compute_api:os-services:list': '@',
         })
-
-    # this is bug 1945310
-    @unittest.expectedFailure
-    def test_interface_detach_with_port_with_bandwidth_request(self):
-        super().test_interface_detach_with_port_with_bandwidth_request()
 
 
 class ServerMoveWithPortResourceRequestTest(
@@ -1937,7 +1923,7 @@ class ServerMoveWithPortResourceRequestTest(
     def test_migrate_server_with_qos_port_pci_update_fail_not_reschedule(self):
         # Update the name of the network device RP of PF2 on host2 to something
         # unexpected. This will cause
-        # update_pci_request_spec_with_allocated_interface_name() to raise
+        # update_pci_request_with_placement_allocations() to raise
         # when the instance is migrated to the host2.
         rsp = self.placement.put(
             '/resource_providers/%s'
@@ -1957,7 +1943,7 @@ class ServerMoveWithPortResourceRequestTest(
             non_qos_port, qos_port, qos_sriov_port)
 
         # The compute manager on host2 will raise from
-        # update_pci_request_spec_with_allocated_interface_name which will
+        # update_pci_request_with_placement_allocations which will
         # intentionally not trigger a re-schedule even if there is host3 as an
         # alternate.
         self.api.post_server_action(server['id'], {'migrate': None})
@@ -2176,7 +2162,8 @@ class ServerMoveWithPortResourceRequestTest(
             # simply fail and the server remains on the source host
             server = self._evacuate_server(
                 server, expected_host='host1', expected_task_state=None,
-                expected_migration_status='failed')
+                expected_migration_status='failed',
+                expected_state="ACTIVE")
 
         # As evacuation failed the resource allocation should be untouched
         self._check_allocation(
@@ -2200,7 +2187,7 @@ class ServerMoveWithPortResourceRequestTest(
     def test_evacuate_with_qos_port_pci_update_fail(self):
         # Update the name of the network device RP of PF2 on host2 to something
         # unexpected. This will cause
-        # update_pci_request_spec_with_allocated_interface_name() to raise
+        # update_pci_request_with_placement_allocations() to raise
         # when the instance is evacuated to the host2.
         rsp = self.placement.put(
             '/resource_providers/%s'
@@ -2221,7 +2208,7 @@ class ServerMoveWithPortResourceRequestTest(
             self.compute1_service_id, {'forced_down': 'true'})
 
         # The compute manager on host2 will raise from
-        # update_pci_request_spec_with_allocated_interface_name
+        # update_pci_request_with_placement_allocations
         server = self._evacuate_server(
             server, expected_host='host1', expected_state='ERROR',
             expected_task_state=None, expected_migration_status='failed')
@@ -2377,7 +2364,7 @@ class ServerMoveWithPortResourceRequestTest(
     def test_live_migrate_with_qos_port_pci_update_fails(self):
         # Update the name of the network device RP of PF2 on host2 to something
         # unexpected. This will cause
-        # update_pci_request_spec_with_allocated_interface_name() to raise
+        # update_pci_request_with_placement_allocations() to raise
         # when the instance is live migrated to the host2.
         rsp = self.placement.put(
             '/resource_providers/%s'
@@ -2518,7 +2505,7 @@ class ServerMoveWithPortResourceRequestTest(
     def test_unshelve_offloaded_server_with_qos_port_pci_update_fails(self):
         # Update the name of the network device RP of PF2 on host2 to something
         # unexpected. This will cause
-        # update_pci_request_spec_with_allocated_interface_name() to raise
+        # update_pci_request_with_placement_allocations() to raise
         # when the instance is unshelved to the host2.
         rsp = self.placement.put(
             '/resource_providers/%s'
@@ -2551,7 +2538,7 @@ class ServerMoveWithPortResourceRequestTest(
         self.api.post_server_action(server['id'], {'unshelve': None})
 
         # Unshelve fails on host2 due to
-        # update_pci_request_spec_with_allocated_interface_name fails so the
+        # update_pci_request_with_placement_allocations fails so the
         # instance goes back to shelve offloaded state
         self.notifier.wait_for_versioned_notifications(
             'instance.unshelve.start')
@@ -2650,23 +2637,6 @@ class NonAdminServerMoveWithPortResourceRequestTests(
             'os_compute_api:os-instance-actions:list': '@',
         })
 
-    # this is bug 1945310
-    @unittest.expectedFailure
-    def test_live_migrate_with_qos_port(self, host=None):
-        super().test_live_migrate_with_qos_port()
-
-    # this is bug 1945310
-    @unittest.expectedFailure
-    def test_live_migrate_with_qos_port_with_target_host(self):
-        super(
-        ).test_live_migrate_with_qos_port_with_target_host()
-
-    # this is bug 1945310
-    @unittest.expectedFailure
-    def test_live_migrate_with_qos_port_reschedule_success(self):
-        super(
-        ).test_live_migrate_with_qos_port_reschedule_success()
-
 
 class ServerMoveWithMultiGroupResourceRequestBasedSchedulingTest(
     ExtendedPortResourceRequestBasedSchedulingTestBase,
@@ -2716,23 +2686,6 @@ class NonAdminServerMoveWithMultiGroupResReqTests(
             'os_compute_api:os-instance-actions:show': '@',
             'os_compute_api:os-instance-actions:list': '@',
         })
-
-    # this is bug 1945310
-    @unittest.expectedFailure
-    def test_live_migrate_with_qos_port(self, host=None):
-        super().test_live_migrate_with_qos_port()
-
-    # this is bug 1945310
-    @unittest.expectedFailure
-    def test_live_migrate_with_qos_port_with_target_host(self):
-        super(
-        ).test_live_migrate_with_qos_port_with_target_host()
-
-    # this is bug 1945310
-    @unittest.expectedFailure
-    def test_live_migrate_with_qos_port_reschedule_success(self):
-        super(
-        ).test_live_migrate_with_qos_port_reschedule_success()
 
 
 class LiveMigrateAbortWithPortResourceRequestTest(
@@ -3022,10 +2975,12 @@ class ExtendedResourceRequestOldCompute(
     hasn't been upgraded to a version that support extended resource request.
     So nova rejects the operations due to the old compute.
     """
+
     def setUp(self):
         super().setUp()
         self.neutron = self.useFixture(
             ExtendedResourceRequestNeutronFixture(self))
+        self.api.microversion = '2.72'
 
     @mock.patch.object(
         objects.service, 'get_minimum_version_all_cells',
@@ -3153,8 +3108,3 @@ class NonAdminExtendedResourceRequestOldCompute(
             'os_compute_api:servers:resize': '@',
             'os_compute_api:os-evacuate': '@',
         })
-
-    # this is bug 1945310
-    @unittest.expectedFailure
-    def test_interface_attach(self, mock_get_service):
-        super().test_interface_attach()

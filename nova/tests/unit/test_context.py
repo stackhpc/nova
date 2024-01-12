@@ -12,7 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from oslo_context import context as o_context
 from oslo_context import fixture as o_fixture
 from oslo_utils.fixture import uuidsentinel as uuids
@@ -196,7 +197,6 @@ class ContextTestCase(test.NoDBTestCase):
                            'roles': [],
                            'service_catalog': [],
                            'show_deleted': False,
-                           'tenant': 222,
                            'timestamp': '2015-03-02T22:31:56.641629',
                            'user': 111,
                            'user_domain': None,

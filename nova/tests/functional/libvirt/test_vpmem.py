@@ -12,9 +12,11 @@
 #    under the License.
 
 import fixtures
+from unittest import mock
 
 from oslo_config import cfg
 from oslo_log import log as logging
+from oslo_utils.fixture import uuidsentinel as uuids
 
 from nova import objects
 from nova.tests import fixtures as nova_fixtures
@@ -27,9 +29,6 @@ LOG = logging.getLogger(__name__)
 
 
 class VPMEMTestBase(integrated_helpers.LibvirtProviderUsageBaseTestCase):
-
-    FAKE_LIBVIRT_VERSION = 5000000
-    FAKE_QEMU_VERSION = 3001000
 
     def setUp(self):
         super(VPMEMTestBase, self).setUp()
@@ -75,6 +74,7 @@ class VPMEMTestBase(integrated_helpers.LibvirtProviderUsageBaseTestCase):
             'nova.privsep.libvirt.get_pmem_namespaces',
             return_value=self.fake_pmem_namespaces))
         self.useFixture(nova_fixtures.LibvirtImageBackendFixture())
+        self.useFixture(nova_fixtures.CGroupsFixture())
         self.useFixture(fixtures.MockPatch(
             'nova.virt.libvirt.LibvirtDriver._get_local_gb_info',
             return_value={'total': 128,
@@ -86,8 +86,6 @@ class VPMEMTestBase(integrated_helpers.LibvirtProviderUsageBaseTestCase):
     def _get_connection(self, host_info, hostname=None):
         fake_connection = fakelibvirt.Connection(
             'qemu:///system',
-            version=self.FAKE_LIBVIRT_VERSION,
-            hv_version=self.FAKE_QEMU_VERSION,
             host_info=host_info,
             hostname=hostname)
         return fake_connection
@@ -99,7 +97,9 @@ class VPMEMTestBase(integrated_helpers.LibvirtProviderUsageBaseTestCase):
                                            cpu_cores=2, cpu_threads=2),
             hostname=hostname)
         self.mock_conn.return_value = fake_connection
-        compute = self._start_compute(host=hostname)
+        with mock.patch('nova.virt.node.get_local_node_uuid') as m:
+            m.return_value = str(getattr(uuids, 'node_%s' % hostname))
+            compute = self._start_compute(host=hostname)
 
         # Ensure populating the existing pmems correctly.
         vpmems = compute.driver._vpmems_by_name

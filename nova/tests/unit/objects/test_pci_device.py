@@ -14,8 +14,8 @@
 #    under the License.
 
 import copy
+from unittest import mock
 
-import mock
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
@@ -160,6 +160,26 @@ class _TestPciDeviceObject(object):
                          set(['compute_node_id', 'address', 'product_id',
                               'vendor_id', 'numa_node', 'status', 'uuid',
                               'extra_info', 'dev_type', 'parent_addr']))
+
+    def test_pci_device_extra_info_card_serial_number(self):
+        self.dev_dict = copy.copy(dev_dict)
+        self.pci_device = pci_device.PciDevice.create(None, self.dev_dict)
+        self.assertIsNone(self.pci_device.card_serial_number)
+
+        self.dev_dict = copy.copy(dev_dict)
+        self.dev_dict['capabilities'] = {'vpd': {'card_serial_number': '42'}}
+        self.pci_device = pci_device.PciDevice.create(None, self.dev_dict)
+        self.assertEqual(self.pci_device.card_serial_number, '42')
+
+    def test_pci_device_extra_info_network_capabilities(self):
+        self.dev_dict = copy.copy(dev_dict)
+        self.pci_device = pci_device.PciDevice.create(None, self.dev_dict)
+        self.assertEqual(self.pci_device.network_caps, [])
+
+        self.dev_dict = copy.copy(dev_dict)
+        self.dev_dict['capabilities'] = {'network': ['sg', 'tso', 'tx']}
+        self.pci_device = pci_device.PciDevice.create(None, self.dev_dict)
+        self.assertEqual(self.pci_device.network_caps, ['sg', 'tso', 'tx'])
 
     def test_update_device(self):
         self.pci_device = pci_device.PciDevice.create(None, dev_dict)
@@ -456,6 +476,16 @@ class _TestPciDeviceObject(object):
         devobj = pci_device.PciDevice.create(None, dev_dict)
         devobj.claim(self.inst.uuid)
         self.assertRaises(exception.PciDeviceInvalidStatus, devobj.remove)
+
+    def test_remove_device_fail_owned_with_unavailable_state(self):
+        # This test creates an PCI device in an invalid state. This should
+        # not happen in any known scenario. But we want to be save not to allow
+        # removing a device that has an owner. See bug 1969496 for more details
+        self._create_fake_instance()
+        devobj = pci_device.PciDevice.create(None, dev_dict)
+        devobj.claim(self.inst.uuid)
+        devobj.status = fields.PciDeviceStatus.UNAVAILABLE
+        self.assertRaises(exception.PciDeviceInvalidOwner, devobj.remove)
 
 
 class TestPciDeviceObject(test_objects._LocalTest,

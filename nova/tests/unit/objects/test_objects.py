@@ -19,9 +19,10 @@ import datetime
 import inspect
 import os
 import pprint
+from unittest import mock
 
 import fixtures
-import mock
+from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
 from oslo_versionedobjects import base as ovo_base
 from oslo_versionedobjects import exception as ovo_exc
@@ -66,6 +67,7 @@ class MyObj(base.NovaPersistentObject, base.NovaObject,
         self._context = context
         return self
 
+    @base.lazy_load_counter
     def obj_load_attr(self, attrname):
         setattr(self, attrname, 'loaded!')
 
@@ -789,6 +791,35 @@ class TestObject(_LocalTest, _TestObject):
         self.assertTrue(obj.deleted)
 
 
+class TestObjectMisc(_BaseTestCase):
+    @mock.patch.object(base.LOG, 'debug')
+    def test_lazy_load_counter(self, mock_log):
+        obj = MyObj()
+        mock_log.assert_not_called()
+        self.assertIsNone(obj._lazy_loads)
+
+        obj.obj_load_attr('bar')
+        mock_log.assert_not_called()
+        self.assertEqual(['bar'], obj._lazy_loads)
+
+        obj.obj_load_attr('bar')
+        mock_log.assert_called_once_with(
+            'Object %s lazy-loaded attributes: %s', 'MyObj<anonymous>',
+            'bar,bar')
+        self.assertEqual(['bar', 'bar'], obj._lazy_loads)
+
+    def test_object_id(self):
+        obj1 = MyObj()
+        self.assertEqual('MyObj<anonymous>', base.object_id(obj1))
+
+        obj2 = objects.Instance(uuid=str(uuids.instance))
+        self.assertEqual('Instance<%s>' % str(uuids.instance),
+                         base.object_id(obj2))
+
+        obj3 = objects.Service(id=123)
+        self.assertEqual('Service<123>', base.object_id(obj3))
+
+
 class TestObjectSerializer(_BaseTestCase):
     def test_serialize_entity_primitive(self):
         ser = base.NovaObjectSerializer()
@@ -1009,6 +1040,7 @@ class TestArgsSerializer(test.NoDBTestCase):
 class TestRegistry(test.NoDBTestCase):
     @mock.patch('nova.objects.base.objects')
     def test_hook_chooses_newer_properly(self, mock_objects):
+        del mock_objects.MyObj
         reg = base.NovaObjectRegistry()
         reg.registration_hook(MyObj, 0)
 
@@ -1025,6 +1057,7 @@ class TestRegistry(test.NoDBTestCase):
 
     @mock.patch('nova.objects.base.objects')
     def test_hook_keeps_newer_properly(self, mock_objects):
+        del mock_objects.MyObj
         reg = base.NovaObjectRegistry()
         reg.registration_hook(MyObj, 0)
 
@@ -1046,9 +1079,7 @@ class TestRegistry(test.NoDBTestCase):
 object_data = {
     'Aggregate': '1.3-f315cb68906307ca2d1cca84d4753585',
     'AggregateList': '1.3-3ea55a050354e72ef3306adefa553957',
-    'BandwidthUsage': '1.2-c6e4c779c7f40f2407e3d70022e3cd1c',
-    'BandwidthUsageList': '1.2-5fe7475ada6fe62413cbfcc06ec70746',
-    'BlockDeviceMapping': '1.20-45a6ad666ddf14bbbedece2293af77e2',
+    'BlockDeviceMapping': '1.21-220abb8aa1450e759b72fce8ec6ff955',
     'BlockDeviceMappingList': '1.18-73bcbbae5ef5e8adcedbc821db869306',
     'BuildRequest': '1.3-077dee42bed93f8a5b62be77657b7152',
     'BuildRequestList': '1.0-cd95608eccb89fbc702c8b52f38ec738',
@@ -1068,20 +1099,20 @@ object_data = {
     'EC2InstanceMapping': '1.0-a4556eb5c5e94c045fe84f49cf71644f',
     'Flavor': '1.2-4ce99b41327bb230262e5a8f45ff0ce3',
     'FlavorList': '1.1-52b5928600e7ca973aa4fc1e46f3934c',
-    'HVSpec': '1.2-de06bcec472a2f04966b855a49c46b41',
     'HostMapping': '1.0-1a3390a696792a552ab7bd31a77ba9ac',
     'HostMappingList': '1.1-18ac2bfb8c1eb5545bed856da58a79bc',
+    'HVSpec': '1.2-de06bcec472a2f04966b855a49c46b41',
     'HyperVLiveMigrateData': '1.4-e265780e6acfa631476c8170e8d6fce0',
     'IDEDeviceBus': '1.0-29d4c9f27ac44197f01b6ac1b7e16502',
     'ImageMeta': '1.8-642d1b2eb3e880a367f37d72dd76162d',
-    'ImageMetaProps': '1.30-5bfc3dd01bbfdbb28cb3a096c0b2f383',
-    'Instance': '2.7-d187aec68cad2e4d8b8a03a68e4739ce',
+    'ImageMetaProps': '1.35-66ec4135a4c08d6e67e39cb0400b059e',
+    'Instance': '2.8-2727dba5e4a078e6cc848c1f94f7eb24',
     'InstanceAction': '1.2-9a5abc87fdd3af46f45731960651efb5',
     'InstanceActionEvent': '1.4-5b1f361bd81989f8bb2c20bb7e8a4cb4',
     'InstanceActionEventList': '1.1-13d92fb953030cdbfee56481756e02be',
     'InstanceActionList': '1.1-a2b2fb6006b47c27076d3a1d48baa759',
     'InstanceDeviceMetadata': '1.0-74d78dd36aa32d26d2769a1b57caf186',
-    'InstanceExternalEvent': '1.4-06c2dfcf2d2813c24cd37ee728524f1a',
+    'InstanceExternalEvent': '1.5-1ec57351a9851c1eb43ccd90662d6dd0',
     'InstanceFault': '1.2-7ef01f16f1084ad1304a513d6d410a38',
     'InstanceFaultList': '1.2-6bb72de2872fe49ded5eb937a93f2451',
     'InstanceGroup': '1.11-852ac511d30913ee88f3c3a869a8f30a',
@@ -1099,27 +1130,27 @@ object_data = {
     'LibvirtLiveMigrateBDMInfo': '1.1-5f4a68873560b6f834b74e7861d71aaf',
     'LibvirtLiveMigrateData': '1.10-348cf70ea44d3b985f45f64725d6f6a7',
     'LibvirtLiveMigrateNUMAInfo': '1.0-0e777677f3459d0ed1634eabbdb6c22f',
+    'LibvirtVPMEMDevice': '1.0-17ffaf47585199eeb9a2b83d6bde069f',
     'MemoryDiagnostics': '1.0-2c995ae0f2223bb0f8e523c5cc0b83da',
-    'Migration': '1.7-bd45b232fd7c95cd79ae9187e10ef582',
+    'Migration': '1.8-6ed577d80e71e9b9d88b8cf358af3781',
     'MigrationContext': '1.2-89f10a83999f852a489962ae37d8a026',
     'MigrationList': '1.5-36793f8d65bae421bd5564d09a4de7be',
     'MonitorMetric': '1.1-53b1db7c4ae2c531db79761e7acc52ba',
     'MonitorMetricList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
-    'NUMACell': '1.5-2592de3c926a7840d763bcc85f81afa7',
-    'NUMAPagesTopology': '1.1-edab9fa2dc43c117a38d600be54b4542',
-    'NUMATopology': '1.2-c63fad38be73b6afd04715c9c1b29220',
-    'NUMATopologyLimits': '1.1-4235c5da7a76c7e36075f0cd2f5cf922',
     'NetworkInterfaceMetadata': '1.2-6f3d480b40fe339067b1c0dd4d656716',
     'NetworkMetadata': '1.0-2cb8d21b34f87b0261d3e1d1ae5cf218',
     'NetworkRequest': '1.3-3a815ea3df7defa61e0b894dee5288ba',
     'NetworkRequestList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
     'NicDiagnostics': '1.0-895e9ad50e0f56d5258585e3e066aea5',
-    'PCIDeviceBus': '1.0-2b891cb77e42961044689f3dc2718995',
+    'NUMACell': '1.5-2592de3c926a7840d763bcc85f81afa7',
+    'NUMAPagesTopology': '1.1-edab9fa2dc43c117a38d600be54b4542',
+    'NUMATopology': '1.2-c63fad38be73b6afd04715c9c1b29220',
+    'NUMATopologyLimits': '1.1-4235c5da7a76c7e36075f0cd2f5cf922',
     'PciDevice': '1.7-680e4c590aae154958ccf9677774413b',
+    'PCIDeviceBus': '1.0-2b891cb77e42961044689f3dc2718995',
     'PciDeviceList': '1.3-52ff14355491c8c580bdc0ba34c26210',
     'PciDevicePool': '1.1-3f5ddc3ff7bfa14da7f6c7e9904cc000',
     'PciDevicePoolList': '1.1-15ecf022a68ddbb8c2a6739cfc9f8f5e',
-    'PowerVMLiveMigrateData': '1.4-a745f4eda16b45e1bc5686a0c498f27e',
     'Quotas': '1.3-3b2b91371f60e788035778fc5f87797d',
     'QuotasNoOp': '1.3-d1593cf969c81846bc8192255ea95cce',
     'RequestGroup': '1.3-0458d350a8ec9d0673f9be5640a990ce',
@@ -1129,9 +1160,9 @@ object_data = {
     'ResourceList': '1.0-4a53826625cc280e15fae64a575e0879',
     'ResourceMetadata': '1.0-77509ea1ea0dd750d5864b9bd87d3f9d',
     'S3ImageMapping': '1.0-7dd7366a890d82660ed121de9092276e',
-    'SCSIDeviceBus': '1.0-61c1e89a00901069ab1cf2991681533b',
     'SchedulerLimits': '1.0-249c4bd8e62a9b327b7026b7f19cc641',
     'SchedulerRetries': '1.1-3c9c8b16143ebbb6ad7030e999d14cc0',
+    'SCSIDeviceBus': '1.0-61c1e89a00901069ab1cf2991681533b',
     'SecurityGroup': '1.2-86d67d8d3ab0c971e1dc86e02f9524a8',
     'SecurityGroupList': '1.1-c655ed13298e630f4d398152f7d08d71',
     'Selection': '1.1-548e3c2f04da2a61ceaf9c4e1589f264',
@@ -1144,16 +1175,14 @@ object_data = {
     'TrustedCerts': '1.0-dcf528851e0f868c77ee47e90563cda7',
     'USBDeviceBus': '1.0-e4c7dd6032e46cd74b027df5eb2d4750',
     'VIFMigrateData': '1.0-cb15282b25a039ab35046ed705eb931d',
-    'VMwareLiveMigrateData': '1.0-a3cc858a2bf1d3806d6f57cfaa1fb98a',
     'VirtCPUFeature': '1.0-ea2464bdd09084bd388e5f61d5d4fc86',
     'VirtCPUModel': '1.0-5e1864af9227f698326203d7249796b5',
     'VirtCPUTopology': '1.0-fc694de72e20298f7c6bab1083fd4563',
     'VirtualInterface': '1.3-efd3ca8ebcc5ce65fff5a25f31754c54',
     'VirtualInterfaceList': '1.0-9750e2074437b3077e46359102779fc6',
+    'VMwareLiveMigrateData': '1.0-a3cc858a2bf1d3806d6f57cfaa1fb98a',
     'VolumeUsage': '1.0-6c8190c46ce1469bb3286a1f21c2e475',
     'XenDeviceBus': '1.0-272a4f899b24e31e42b2b9a7ed7e9194',
-    # TODO(efried): re-alphabetize this
-    'LibvirtVPMEMDevice': '1.0-17ffaf47585199eeb9a2b83d6bde069f',
 }
 
 

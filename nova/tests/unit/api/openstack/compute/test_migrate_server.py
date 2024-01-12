@@ -13,8 +13,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
 import fixtures
-import mock
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import uuidutils
 import webob
@@ -530,9 +531,8 @@ class MigrateServerTestsV256(MigrateServerTestsV234):
                           self.req, fakes.FAKE_UUID, body=body)
 
     def _test_migrate_exception(self, exc_info, expected_result):
-        @mock.patch.object(self.compute_api, 'get')
         @mock.patch.object(self.compute_api, 'resize', side_effect=exc_info)
-        def _test(mock_resize, mock_get):
+        def _test(mock_resize):
             instance = objects.Instance(uuid=uuids.instance)
             self.assertRaises(expected_result,
                               self.controller._migrate,

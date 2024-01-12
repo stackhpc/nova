@@ -16,9 +16,12 @@
 """Tests for the conductor service."""
 
 import copy
+import ddt
+from unittest import mock
 
-import mock
+from keystoneauth1 import exceptions as ks_exc
 from oslo_db import exception as db_exc
+from oslo_limit import exception as limit_exceptions
 import oslo_messaging as messaging
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel as uuids
@@ -44,12 +47,14 @@ from nova.db.api import models as api_models
 from nova.db.main import api as main_db_api
 from nova import exception as exc
 from nova.image import glance as image_api
+from nova.limit import placement as placement_limit
 from nova import objects
 from nova.objects import base as obj_base
 from nova.objects import block_device as block_device_obj
 from nova.objects import fields
 from nova.objects import request_spec
 from nova.scheduler.client import query
+from nova.scheduler.client import report
 from nova.scheduler import utils as scheduler_utils
 from nova import test
 from nova.tests import fixtures
@@ -147,6 +152,7 @@ class _BaseTestCase(object):
 
 class ConductorTestCase(_BaseTestCase, test.TestCase):
     """Conductor Manager Tests."""
+
     def setUp(self):
         super(ConductorTestCase, self).setUp()
         self.conductor = conductor_manager.ConductorManager()
@@ -308,6 +314,7 @@ class ConductorTestCase(_BaseTestCase, test.TestCase):
 
 class ConductorRPCAPITestCase(_BaseTestCase, test.TestCase):
     """Conductor RPC API Tests."""
+
     def setUp(self):
         super(ConductorRPCAPITestCase, self).setUp()
         self.conductor_service = self.start_service(
@@ -318,6 +325,7 @@ class ConductorRPCAPITestCase(_BaseTestCase, test.TestCase):
 
 class ConductorAPITestCase(_BaseTestCase, test.TestCase):
     """Conductor API Tests."""
+
     def setUp(self):
         super(ConductorAPITestCase, self).setUp()
         self.conductor_service = self.start_service(
@@ -380,7 +388,9 @@ class _BaseTaskTestCase(object):
                         'on_shared_storage': False,
                         'preserve_ephemeral': False,
                         'host': 'compute-host',
-                        'request_spec': None}
+                        'request_spec': None,
+                        'reimage_boot_volume': False,
+                        'target_state': None}
         if update_args:
             rebuild_args.update(update_args)
         compute_rebuild_args = copy.deepcopy(rebuild_args)
@@ -1352,6 +1362,7 @@ class _BaseTaskTestCase(object):
 
         fake_spec = fake_request_spec.fake_spec_obj()
         fake_spec.flavor = instance.flavor
+        fake_spec.is_bfv = False
         # FIXME(sbauza): Modify the fake RequestSpec object to either add a
         # non-empty SchedulerRetries object or nullify the field
         fake_spec.retry = None
@@ -1464,6 +1475,7 @@ class _BaseTaskTestCase(object):
         # 'shelved_image_id' is None for volumebacked instance
         instance.system_metadata['shelved_image_id'] = None
         self.request_spec.flavor = instance.flavor
+        self.request_spec.is_bfv = True
 
         with test.nested(
             mock.patch.object(self.conductor_manager,
@@ -1492,6 +1504,7 @@ class _BaseTaskTestCase(object):
     def test_unshelve_instance_schedule_and_rebuild(
             self, mock_im, mock_get, mock_schedule, mock_unshelve):
         fake_spec = objects.RequestSpec()
+        fake_spec.is_bfv = False
         # Set requested_destination to test setting cell_mapping in
         # existing object.
         fake_spec.requested_destination = objects.Destination(
@@ -1596,6 +1609,7 @@ class _BaseTaskTestCase(object):
     def test_unshelve_instance_schedule_and_rebuild_volume_backed(
             self, mock_im, mock_schedule, mock_unshelve):
         fake_spec = objects.RequestSpec()
+        fake_spec.is_bfv = True
         mock_im.return_value = objects.InstanceMapping(
             cell_mapping=objects.CellMapping.get_by_uuid(self.context,
                                                          uuids.cell1))
@@ -1627,6 +1641,7 @@ class _BaseTaskTestCase(object):
 
         request_spec = objects.RequestSpec()
         request_spec.flavor = instance.flavor
+        request_spec.is_bfv = False
 
         selection = objects.Selection(
             service_host='fake_host',
@@ -1670,6 +1685,7 @@ class _BaseTaskTestCase(object):
         request_spec = objects.RequestSpec()
         request_spec.flavor = instance.flavor
         request_spec.flavor.extra_specs = {'accel:device_profile': 'mydp'}
+        request_spec.is_bfv = False
 
         selection = objects.Selection(
             service_host='fake_host',
@@ -1718,6 +1734,7 @@ class _BaseTaskTestCase(object):
         request_spec = objects.RequestSpec()
         request_spec.flavor = instance.flavor
         request_spec.flavor.extra_specs = {'accel:device_profile': 'mydp'}
+        request_spec.is_bfv = False
 
         selection = objects.Selection(
             service_host='fake_host',
@@ -2258,6 +2275,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
         rs.instance_group = None
         rs.retry = None
         rs.limits = None
+        rs.is_bfv = False
         rs.create()
         params['request_specs'] = [rs]
         params['image'] = {'fake_data': 'should_pass_silently'}
@@ -2396,7 +2414,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
              '1', None, None, dp_name)
         arq_uuid = arq_in_list[0]['uuid']
 
-        # muliti device request
+        # multi device request
         mock_create.return_value = [arq_in_list[0], arq_in_list[0]]
         rp_map = {"request_group_0" + str(port_id): rp_uuid}
         request_tuples = [('123', '1.2.3.4', port_id,
@@ -2868,6 +2886,74 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
                     'image'):
             self.assertIn(key, request_spec_dict)
 
+    @mock.patch.object(placement_limit, 'enforce_num_instances_and_flavor')
+    @mock.patch('nova.compute.utils.notify_about_compute_task_error')
+    @mock.patch('nova.scheduler.rpcapi.SchedulerAPI.select_destinations')
+    def test_schedule_and_build_over_quota_during_recheck_ul(self, mock_select,
+                                                             mock_notify,
+                                                             mock_enforce):
+        self.flags(driver="nova.quota.UnifiedLimitsDriver",
+                   cores=1,
+                   group="quota")
+        mock_select.return_value = [[fake_selection1]]
+        # Simulate a race where the first check passes and the recheck fails.
+        # First check occurs in compute/api.
+        project_id = self.params['context'].project_id
+        mock_enforce.side_effect = limit_exceptions.ProjectOverLimit(
+            project_id, [limit_exceptions.OverLimitInfo('cores', 2, 3, 0)])
+
+        original_save = objects.Instance.save
+
+        def fake_save(inst, *args, **kwargs):
+            # Make sure the context is targeted to the cell that the instance
+            # was created in.
+            self.assertIsNotNone(
+                inst._context.db_connection, 'Context is not targeted')
+            original_save(inst, *args, **kwargs)
+
+        self.stub_out('nova.objects.Instance.save', fake_save)
+
+        # This is needed to register the compute node in a cell.
+        self.start_service('compute', host='host1')
+        self.assertRaises(
+            limit_exceptions.ProjectOverLimit,
+            self.conductor.schedule_and_build_instances, **self.params)
+
+        mock_enforce.assert_called_once_with(
+            self.params['context'], project_id, mock.ANY, False, 0, 0)
+
+        # Verify we set the instance to ERROR state and set the fault message.
+        instances = objects.InstanceList.get_all(self.ctxt)
+        self.assertEqual(1, len(instances))
+        instance = instances[0]
+        self.assertEqual(vm_states.ERROR, instance.vm_state)
+        self.assertIsNone(instance.task_state)
+        self.assertIn('ProjectOverLimit', instance.fault.message)
+        # Verify we removed the build objects.
+        build_requests = objects.BuildRequestList.get_all(self.ctxt)
+        # Verify that the instance is mapped to a cell
+        inst_mapping = objects.InstanceMapping.get_by_instance_uuid(
+            self.ctxt, instance.uuid)
+        self.assertIsNotNone(inst_mapping.cell_mapping)
+
+        self.assertEqual(0, len(build_requests))
+
+        @api_db_api.context_manager.reader
+        def request_spec_get_all(context):
+            return context.session.query(api_models.RequestSpec).all()
+
+        request_specs = request_spec_get_all(self.ctxt)
+        self.assertEqual(0, len(request_specs))
+
+        mock_notify.assert_called_once_with(
+            test.MatchType(context.RequestContext), 'build_instances',
+            instance.uuid, test.MatchType(dict), 'error',
+            test.MatchType(limit_exceptions.ProjectOverLimit))
+        request_spec_dict = mock_notify.call_args_list[0][0][3]
+        for key in ('instance_type', 'num_instances', 'instance_properties',
+                    'image'):
+            self.assertIn(key, request_spec_dict)
+
     @mock.patch('nova.compute.rpcapi.ComputeAPI.build_and_run_instance')
     @mock.patch('nova.objects.quotas.Quotas.check_deltas')
     @mock.patch('nova.scheduler.rpcapi.SchedulerAPI.select_destinations')
@@ -2885,6 +2971,131 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
         mock_check.assert_not_called()
 
         self.assertTrue(mock_build.called)
+
+    @mock.patch('nova.compute.rpcapi.ComputeAPI.unshelve_instance')
+    @mock.patch('nova.scheduler.rpcapi.SchedulerAPI.select_destinations')
+    @mock.patch('nova.objects.Instance.save', new=mock.Mock())
+    def _test_unshelve_over_quota_during_recheck(self, mock_select,
+                                                 mock_unshelve):
+        mock_select.return_value = [[fake_selection1]]
+
+        instance = fake_instance.fake_instance_obj(
+            self.context, vm_state=vm_states.SHELVED_OFFLOADED)
+        # This has to be set separately because fake_instance_obj() would
+        # overwrite it when it calls _from_db_object().
+        instance.system_metadata = {}
+
+        im = objects.InstanceMapping(
+            self.context, instance_uuid=instance.uuid,
+            project_id=instance.project_id)
+        im.cell_mapping = self.cell_mappings['cell1']
+        im.create()
+
+        req_spec = objects.RequestSpec(
+            instance_uuid=instance.uuid, flavor=instance.flavor,
+            instance_group=None, is_bfv=False)
+
+        self.assertRaises(
+            exc.TooManyInstances,
+            self.conductor.unshelve_instance,
+            self.context, instance, req_spec
+        )
+
+        # We should not have called the compute API unshelve().
+        self.assertFalse(mock_unshelve.called)
+
+        return instance, req_spec
+
+    @mock.patch('nova.objects.quotas.Quotas.check_deltas')
+    def test_unshelve_over_quota_during_recheck_placement(self, mock_check):
+        self.flags(count_usage_from_placement=True, group='quota')
+
+        # Simulate a race where the first check passes and the recheck fails.
+        # First check occurs in compute/api.
+        fake_quotas = {'instances': 5, 'cores': 10, 'ram': 4096}
+        fake_headroom = {'instances': 5, 'cores': 10, 'ram': 4096}
+        fake_usages = {'instances': 5, 'cores': 10, 'ram': 4096}
+        e = exc.OverQuota(overs=['instances'], quotas=fake_quotas,
+                          headroom=fake_headroom, usages=fake_usages)
+        mock_check.side_effect = e
+
+        instance, _ = self._test_unshelve_over_quota_during_recheck()
+
+        # Verify we called the quota check function with expected args.
+        mock_check.assert_called_once_with(
+            self.context, {'instances': 0, 'cores': 0, 'ram': 0},
+            instance.project_id, user_id=None,
+            check_project_id=instance.project_id, check_user_id=None)
+
+    @mock.patch.object(placement_limit, 'enforce_num_instances_and_flavor')
+    @mock.patch('nova.objects.quotas.Quotas.check_deltas', new=mock.Mock())
+    def test_unshelve_over_quota_during_recheck_ul(self, mock_enforce):
+        self.flags(driver="nova.quota.UnifiedLimitsDriver", group="quota")
+
+        # Simulate a race where the first check passes and the recheck fails.
+        # First check occurs in compute/api.
+        mock_enforce.side_effect = exc.TooManyInstances(
+            overs=['instances'], req=5, used=5, allowed=5)
+
+        instance, req_spec = self._test_unshelve_over_quota_during_recheck()
+
+        # Verify we called the quota check function with expected args.
+        mock_enforce.assert_called_once_with(
+            self.context, instance.project_id, instance.flavor,
+            req_spec.is_bfv, 0, 0)
+
+    @mock.patch('nova.compute.rpcapi.ComputeAPI.unshelve_instance')
+    @mock.patch.object(placement_limit, 'enforce_num_instances_and_flavor')
+    @mock.patch('nova.objects.quotas.Quotas.check_deltas')
+    @mock.patch('nova.scheduler.rpcapi.SchedulerAPI.select_destinations')
+    @mock.patch('nova.objects.Instance.save', new=mock.Mock())
+    def test_unshelve_no_quota_recheck(self, mock_select, mock_check,
+                                       mock_enforce, mock_unshelve):
+        # Quota should not be checked on unshelve for legacy quotas at all.
+        mock_select.return_value = [[fake_selection1]]
+
+        # This is needed to register the compute node in a cell.
+        self.start_service('compute', host='host1')
+
+        instance = fake_instance.fake_instance_obj(
+            self.context, vm_state=vm_states.SHELVED_OFFLOADED)
+        # This has to be set separately because fake_instance_obj() would
+        # overwrite it when it calls _from_db_object().
+        instance.system_metadata = {}
+
+        im = objects.InstanceMapping(
+            self.context, instance_uuid=instance.uuid,
+            project_id=instance.project_id)
+        im.cell_mapping = self.cell_mappings['cell1']
+        im.create()
+
+        req_spec = objects.RequestSpec(
+            instance_uuid=instance.uuid, flavor=instance.flavor,
+            instance_group=None)
+
+        self.conductor.unshelve_instance(self.context, instance, req_spec)
+
+        # check_deltas should not have been called
+        mock_check.assert_not_called()
+
+        # Same for enforce_num_instances_and_flavor
+        mock_enforce.assert_not_called()
+
+        # We should have called the compute API unshelve()
+        self.assertTrue(mock_unshelve.called)
+
+    def test_unshelve_quota_recheck_disabled(self):
+        # Disable recheck_quota.
+        self.flags(recheck_quota=False, group='quota')
+        self.test_unshelve_no_quota_recheck()
+
+    def test_unshelve_no_quota_recheck_disabled_placement(self):
+        self.flags(count_usage_from_placement=True, group='quota')
+        self.test_unshelve_quota_recheck_disabled()
+
+    def test_unshelve_no_quota_recheck_disabled_ul(self):
+        self.flags(driver='nova.quota.UnifiedLimitsDriver', group='quota')
+        self.test_unshelve_quota_recheck_disabled()
 
     def test_schedule_and_build_instances_fill_request_spec(self):
         # makes sure there is some request group in the spec to be mapped
@@ -4333,6 +4544,7 @@ class ConductorTaskTestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
 class ConductorTaskRPCAPITestCase(_BaseTaskTestCase,
         test_compute.BaseTestCase):
     """Conductor compute_task RPC namespace Tests."""
+
     def setUp(self):
         super(ConductorTaskRPCAPITestCase, self).setUp()
         self.conductor_service = self.start_service(
@@ -4672,9 +4884,72 @@ class ConductorTaskRPCAPITestCase(_BaseTaskTestCase,
                               mock.sentinel.migration)
         can_send_version.assert_called_once_with('1.23')
 
+    def test_evacuate_old_rpc_with_target_state(self):
+        inst_obj = self._create_fake_instance_obj()
+        rebuild_args, compute_args = self._prepare_rebuild_args(
+            {'host': inst_obj.host,
+             'target_state': 'stopped'})
+        with mock.patch.object(
+                self.conductor.client, 'can_send_version', return_value=False):
+            self.assertRaises(exc.UnsupportedRPCVersion,
+                              self.conductor.rebuild_instance,
+                              self.context, inst_obj, **rebuild_args)
+
+    def test_evacuate_old_rpc_without_target_state(self):
+        inst_obj = self._create_fake_instance_obj()
+        rebuild_args, compute_args = self._prepare_rebuild_args(
+            {'host': inst_obj.host,
+             'target_state': None})
+        with mock.patch.object(
+                self.conductor.client, 'can_send_version',
+            return_value=False) as can_send_version:
+            self.conductor.rebuild_instance(
+                self.context, inst_obj, **rebuild_args)
+            can_send_version.assert_has_calls([
+                mock.call('1.25'), mock.call('1.24'),
+                mock.call('1.12')])
+
+    def test_rebuild_instance_volume_backed(self):
+        inst_obj = self._create_fake_instance_obj()
+        version = '1.25'
+        cctxt_mock = mock.MagicMock()
+        rebuild_args, compute_args = self._prepare_rebuild_args(
+            {'host': inst_obj.host})
+        rebuild_args['reimage_boot_volume'] = True
+
+        @mock.patch.object(self.conductor.client, 'prepare',
+                          return_value=cctxt_mock)
+        @mock.patch.object(self.conductor.client, 'can_send_version',
+                   return_value=True)
+        def _test(mock_can_send_ver, prepare_mock):
+            self.conductor.rebuild_instance(
+                self.context, inst_obj, **rebuild_args)
+            prepare_mock.assert_called_once_with(version=version)
+            kw = {'instance': inst_obj, **rebuild_args}
+            cctxt_mock.cast.assert_called_once_with(
+                self.context, 'rebuild_instance', **kw)
+        _test()
+
+    def test_rebuild_instance_volume_backed_old_service(self):
+        """Tests rebuild_instance_volume_backed when the service is too old"""
+        inst_obj = mock.MagicMock()
+        rebuild_args, compute_args = self._prepare_rebuild_args(
+            {'host': inst_obj.host})
+        rebuild_args['reimage_boot_volume'] = True
+        with mock.patch.object(
+                self.conductor.client, 'can_send_version',
+                return_value=False) as can_send_version:
+            self.assertRaises(exc.NovaException,
+                              self.conductor.rebuild_instance,
+                              self.context, inst_obj,
+                              **rebuild_args)
+        can_send_version.assert_has_calls([mock.call('1.25'),
+                                           mock.call('1.24')])
+
 
 class ConductorTaskAPITestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
     """Compute task API Tests."""
+
     def setUp(self):
         super(ConductorTaskAPITestCase, self).setUp()
         self.conductor_service = self.start_service(
@@ -4793,3 +5068,35 @@ class ConductorTaskAPITestCase(_BaseTaskTestCase, test_compute.BaseTestCase):
             logtext)
         self.assertIn('host3\' because it is not up', logtext)
         self.assertIn('image1 failed 1 times', logtext)
+
+
+@ddt.ddt
+class TestConductorTaskManager(test.NoDBTestCase):
+    def test_placement_client_startup(self):
+        self.assertIsNone(report.PLACEMENTCLIENT)
+        conductor_manager.ComputeTaskManager()
+        self.assertIsNotNone(report.PLACEMENTCLIENT)
+
+    @ddt.data(ks_exc.MissingAuthPlugin,
+              ks_exc.Unauthorized,
+              test.TestingException)
+    def test_placement_client_startup_fatals(self, exc):
+        self.assertRaises(exc,
+                          self._test_placement_client_startup_exception, exc)
+
+    @ddt.data(ks_exc.EndpointNotFound,
+              ks_exc.DiscoveryFailure,
+              ks_exc.RequestTimeout,
+              ks_exc.GatewayTimeout,
+              ks_exc.ConnectFailure)
+    def test_placement_client_startup_non_fatal(self, exc):
+        self._test_placement_client_startup_exception(exc)
+
+    @mock.patch.object(report, 'LOG')
+    def _test_placement_client_startup_exception(self, exc, mock_log):
+        with mock.patch.object(report.SchedulerReportClient, '_create_client',
+                               side_effect=exc):
+            try:
+                conductor_manager.ComputeTaskManager()
+            finally:
+                mock_log.error.assert_called_once()

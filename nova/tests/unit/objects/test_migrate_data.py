@@ -94,8 +94,8 @@ class _TestLibvirtLiveMigrateData(object):
             target_connect_addr='127.0.0.1',
             dst_wants_file_backed_memory=False,
             file_backed_memory_discard=False,
-            src_supports_numa_live_migraton=True,
-            dst_supports_numa_live_migraton=True,
+            src_supports_numa_live_migration=True,
+            dst_supports_numa_live_migration=True,
             dst_numa_info=migrate_data.LibvirtLiveMigrateNUMAInfo())
         manifest = ovo_base.obj_tree_get_versions(obj.obj_name())
 
@@ -216,67 +216,6 @@ class TestHyperVLiveMigrateData(test_objects._LocalTest,
 
 class TestRemoteHyperVLiveMigrateData(test_objects._RemoteTest,
                                       _TestHyperVLiveMigrateData):
-    pass
-
-
-class _TestPowerVMLiveMigrateData(object):
-    @staticmethod
-    def _mk_obj():
-        return migrate_data.PowerVMLiveMigrateData(
-            host_mig_data=dict(one=2),
-            dest_ip='1.2.3.4',
-            dest_user_id='a_user',
-            dest_sys_name='a_sys',
-            public_key='a_key',
-            dest_proc_compat='POWER7',
-            vol_data=dict(three=4),
-            vea_vlan_mappings=dict(five=6),
-            old_vol_attachment_ids=dict(seven=8),
-            wait_for_vif_plugged=True)
-
-    @staticmethod
-    def _mk_leg():
-        return {
-            'host_mig_data': {'one': '2'},
-            'dest_ip': '1.2.3.4',
-            'dest_user_id': 'a_user',
-            'dest_sys_name': 'a_sys',
-            'public_key': 'a_key',
-            'dest_proc_compat': 'POWER7',
-            'vol_data': {'three': '4'},
-            'vea_vlan_mappings': {'five': '6'},
-            'old_vol_attachment_ids': {'seven': '8'},
-            'wait_for_vif_plugged': True
-        }
-
-    def test_migrate_data(self):
-        obj = self._mk_obj()
-        self.assertEqual('a_key', obj.public_key)
-        obj.public_key = 'key2'
-        self.assertEqual('key2', obj.public_key)
-
-    def test_obj_make_compatible(self):
-        obj = self._mk_obj()
-
-        data = lambda x: x['nova_object.data']
-
-        primitive = data(obj.obj_to_primitive())
-        self.assertIn('vea_vlan_mappings', primitive)
-        primitive = data(obj.obj_to_primitive(target_version='1.0'))
-        self.assertNotIn('vea_vlan_mappings', primitive)
-        primitive = data(obj.obj_to_primitive(target_version='1.1'))
-        self.assertNotIn('old_vol_attachment_ids', primitive)
-        primitive = data(obj.obj_to_primitive(target_version='1.2'))
-        self.assertNotIn('wait_for_vif_plugged', primitive)
-
-
-class TestPowerVMLiveMigrateData(test_objects._LocalTest,
-                                 _TestPowerVMLiveMigrateData):
-    pass
-
-
-class TestRemotePowerVMLiveMigrateData(test_objects._RemoteTest,
-                                      _TestPowerVMLiveMigrateData):
     pass
 
 

@@ -30,6 +30,7 @@ import nova.conf
 from nova import context as nova_context
 import nova.exception
 from nova.i18n import _
+from nova.limit import local as local_limit
 from nova import objects
 from nova.objects import service
 from nova.policies import server_groups as sg_policies
@@ -164,10 +165,10 @@ class ServerGroupController(wsgi.Controller):
             # In existing behavior, if non-admin users requesting
             # all projects server groups they do not get error instead
             # get their own server groups. Once we switch to policy
-            # new defaults completly then we can remove the above check.
+            # new defaults completely then we can remove the above check.
             # Until then, let's keep the old behaviour.
             context.can(sg_policies.POLICY_ROOT % 'index:all_projects',
-                        target={})
+                        target={'project_id': project_id})
             sgs = objects.InstanceGroupList.get_all(context)
         else:
             sgs = objects.InstanceGroupList.get_by_project_id(
@@ -191,6 +192,10 @@ class ServerGroupController(wsgi.Controller):
         try:
             objects.Quotas.check_deltas(context, {'server_groups': 1},
                                         project_id, context.user_id)
+            local_limit.enforce_db_limit(context, local_limit.SERVER_GROUPS,
+                                         entity_scope=project_id, delta=1)
+        except nova.exception.ServerGroupLimitExceeded as e:
+            raise exc.HTTPForbidden(explanation=str(e))
         except nova.exception.OverQuota:
             msg = _("Quota exceeded, too many server groups.")
             raise exc.HTTPForbidden(explanation=msg)
@@ -231,6 +236,16 @@ class ServerGroupController(wsgi.Controller):
                 objects.Quotas.check_deltas(context, {'server_groups': 0},
                                             project_id,
                                             context.user_id)
+                # TODO(johngarbutt): decide if we need this recheck
+                # The quota rechecking of limits is really just to protect
+                # against denial of service attacks that aim to fill up the
+                # database. Its usefulness could be debated.
+                local_limit.enforce_db_limit(context,
+                                             local_limit.SERVER_GROUPS,
+                                             project_id, delta=0)
+            except nova.exception.ServerGroupLimitExceeded as e:
+                sg.destroy()
+                raise exc.HTTPForbidden(explanation=str(e))
             except nova.exception.OverQuota:
                 sg.destroy()
                 msg = _("Quota exceeded, too many server groups.")

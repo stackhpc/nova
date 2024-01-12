@@ -28,6 +28,8 @@ from nova.db.api import api as api_db_api
 from nova.db.api import models as api_models
 from nova.db.main import api as main_db_api
 from nova import exception
+from nova.limit import local as local_limit
+from nova.limit import placement as placement_limit
 from nova import objects
 from nova.scheduler.client import report
 from nova import utils
@@ -52,6 +54,10 @@ class DbQuotaDriver(object):
     database.
     """
     UNLIMITED_VALUE = -1
+
+    def get_reserved(self):
+        # Since we stopped reserving the DB, we just return 0
+        return 0
 
     def get_defaults(self, context, resources):
         """Given a list of resources, retrieve the default quotas.
@@ -615,6 +621,10 @@ class NoopQuotaDriver(object):
     wish to have any quota checking.
     """
 
+    def get_reserved(self):
+        # Noop has always returned -1 for reserved
+        return -1
+
     def get_defaults(self, context, resources):
         """Given a list of resources, retrieve the default quotas.
 
@@ -768,6 +778,98 @@ class NoopQuotaDriver(object):
         pass
 
 
+class UnifiedLimitsDriver(NoopQuotaDriver):
+    """Ease migration to new unified limits code.
+
+    Help ease migration to unified limits by ensuring the old code
+    paths still work with unified limits. Eventually the expectation is
+    all this legacy quota code will go away, leaving the new simpler code
+    """
+
+    def __init__(self):
+        LOG.warning("The Unified Limits Quota Driver is experimental and "
+                    "is under active development. Do not use this driver.")
+
+    def get_reserved(self):
+        # To make unified limits APIs the same as the DB driver, return 0
+        return 0
+
+    def get_class_quotas(self, context, resources, quota_class):
+        """Given a list of resources, retrieve the quotas for the given
+        quota class.
+
+        :param context: The request context, for access checks.
+        :param resources: A dictionary of the registered resources.
+        :param quota_class: Placeholder, we always assume default quota class.
+        """
+        # NOTE(johngarbutt): ignoring quota_class, as ignored in noop driver
+        return self.get_defaults(context, resources)
+
+    def get_defaults(self, context, resources):
+        local_limits = local_limit.get_legacy_default_limits()
+        # Note we get 0 if there is no registered limit,
+        # to mirror oslo_limit behaviour when there is no registered limit
+        placement_limits = placement_limit.get_legacy_default_limits()
+        quotas = {}
+        for resource in resources.values():
+            if resource.name in placement_limits:
+                quotas[resource.name] = placement_limits[resource.name]
+            else:
+                # return -1 for things like security_group_rules
+                # that are neither a keystone limit or a local limit
+                quotas[resource.name] = local_limits.get(resource.name, -1)
+
+        return quotas
+
+    def get_project_quotas(self, context, resources, project_id,
+                           quota_class=None,
+                           usages=True, remains=False):
+        if quota_class is not None:
+            raise NotImplementedError("quota_class")
+
+        if remains:
+            raise NotImplementedError("remains")
+
+        local_limits = local_limit.get_legacy_default_limits()
+        # keystone limits always returns core, ram and instances
+        # if nothing set in keystone, we get back 0, i.e. don't allow
+        placement_limits = placement_limit.get_legacy_project_limits(
+            project_id)
+
+        project_quotas = {}
+        for resource in resources.values():
+            if resource.name in placement_limits:
+                limit = placement_limits[resource.name]
+            else:
+                # return -1 for things like security_group_rules
+                # that are neither a keystone limit or a local limit
+                limit = local_limits.get(resource.name, -1)
+            project_quotas[resource.name] = {"limit": limit}
+
+        if usages:
+            local_in_use = local_limit.get_in_use(context, project_id)
+            p_in_use = placement_limit.get_legacy_counts(context, project_id)
+
+            for resource in resources.values():
+                # default to 0 for resources that are deprecated,
+                # i.e. not in keystone or local limits, such that we
+                # are API compatible with what was returned with
+                # the db driver, even though noop driver returned -1
+                usage_count = 0
+                if resource.name in local_in_use:
+                    usage_count = local_in_use[resource.name]
+                if resource.name in p_in_use:
+                    usage_count = p_in_use[resource.name]
+                project_quotas[resource.name]["in_use"] = usage_count
+
+        return project_quotas
+
+    def get_user_quotas(self, context, resources, project_id, user_id,
+                        quota_class=None, usages=True):
+        return self.get_project_quotas(context, resources, project_id,
+                                       quota_class, usages)
+
+
 class BaseResource(object):
     """Describe a single resource for quota checking."""
 
@@ -869,13 +971,23 @@ class QuotaEngine(object):
         }
         # NOTE(mriedem): quota_driver is ever only supplied in tests with a
         # fake driver.
-        self.__driver = quota_driver
+        self.__driver_override = quota_driver
+        self.__driver = None
+        self.__driver_name = None
 
     @property
     def _driver(self):
-        if self.__driver:
-            return self.__driver
-        self.__driver = importutils.import_object(CONF.quota.driver)
+        if self.__driver_override:
+            return self.__driver_override
+
+        # NOTE(johngarbutt) to allow unit tests to change the driver by
+        # simply overriding config, double check if we have the correct
+        # driver cached before we return the currently cached driver
+        driver_name_in_config = CONF.quota.driver
+        if self.__driver_name != driver_name_in_config:
+            self.__driver = importutils.import_object(driver_name_in_config)
+            self.__driver_name = driver_name_in_config
+
         return self.__driver
 
     def get_defaults(self, context):
@@ -1044,9 +1156,7 @@ class QuotaEngine(object):
         return sorted(self._resources.keys())
 
     def get_reserved(self):
-        if isinstance(self._driver, NoopQuotaDriver):
-            return -1
-        return 0
+        return self._driver.get_reserved()
 
 
 @api_db_api.context_manager.reader
@@ -1132,6 +1242,37 @@ def _server_group_count_members_by_user_legacy(context, group, user_id):
     return {'user': {'server_group_members': count}}
 
 
+def is_qfd_populated(context):
+    """Check if user_id and queued_for_delete fields are populated.
+
+    This method is related to counting quota usage from placement. It is not
+    yet possible to count instances from placement, so in the meantime we can
+    use instance mappings for counting. This method is used to determine
+    whether the user_id and queued_for_delete columns are populated in the API
+    database's instance_mappings table. Instance mapping records are not
+    deleted from the database until the database is archived, so
+    queued_for_delete tells us whether or not we should count them for instance
+    quota usage. The user_id field enables us to scope instance quota usage to
+    a user (legacy quota).
+
+    Scoping instance quota to a user is only possible
+    when counting quota usage from placement is configured and unified limits
+    is not configured. When unified limits is configured, quotas are scoped
+    only to projects.
+
+    In the future when it is possible to count instance usage from placement,
+    this method will no longer be needed.
+    """
+    global UID_QFD_POPULATED_CACHE_ALL
+    if not UID_QFD_POPULATED_CACHE_ALL:
+        LOG.debug('Checking whether user_id and queued_for_delete are '
+                  'populated for all projects')
+        UID_QFD_POPULATED_CACHE_ALL = _user_id_queued_for_delete_populated(
+            context)
+
+    return UID_QFD_POPULATED_CACHE_ALL
+
+
 def _server_group_count_members_by_user(context, group, user_id):
     """Get the count of server group members for a group by user.
 
@@ -1149,14 +1290,7 @@ def _server_group_count_members_by_user(context, group, user_id):
     # So, we check whether user_id/queued_for_delete is populated for all
     # records and cache the result to prevent unnecessary checking once the
     # data migration has been completed.
-    global UID_QFD_POPULATED_CACHE_ALL
-    if not UID_QFD_POPULATED_CACHE_ALL:
-        LOG.debug('Checking whether user_id and queued_for_delete are '
-                  'populated for all projects')
-        UID_QFD_POPULATED_CACHE_ALL = _user_id_queued_for_delete_populated(
-            context)
-
-    if UID_QFD_POPULATED_CACHE_ALL:
+    if is_qfd_populated(context):
         count = objects.InstanceMappingList.get_count_by_uuids_and_user(
             context, group.members, user_id)
         return {'user': {'server_group_members': count}}
@@ -1214,11 +1348,8 @@ def _instances_cores_ram_count_legacy(context, project_id, user_id=None):
 
 
 def _cores_ram_count_placement(context, project_id, user_id=None):
-    global PLACEMENT_CLIENT
-    if not PLACEMENT_CLIENT:
-        PLACEMENT_CLIENT = report.SchedulerReportClient()
-    return PLACEMENT_CLIENT.get_usages_counts_for_quota(context, project_id,
-                                                        user_id=user_id)
+    return report.report_client_singleton().get_usages_counts_for_quota(
+        context, project_id, user_id=user_id)
 
 
 def _instances_cores_ram_count_api_db_placement(context, project_id,

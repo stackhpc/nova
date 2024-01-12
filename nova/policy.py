@@ -41,11 +41,15 @@ USER_BASED_RESOURCES = ['os-keypairs']
 saved_file_rules = []
 KEY_EXPR = re.compile(r'%\((\w+)\)s')
 
-# TODO(gmann): Remove setting the default value of config policy_file
-# once oslo_policy change the default value to 'policy.yaml'.
-# https://github.com/openstack/oslo.policy/blob/a626ad12fe5a3abd49d70e3e5b95589d279ab578/oslo_policy/opts.py#L49
+# TODO(gmann): Remove overriding the default value of config options
+# 'policy_file', 'enforce_scope', and 'enforce_new_defaults' once
+# oslo_policy change their default value to what is overridden here.
 DEFAULT_POLICY_FILE = 'policy.yaml'
-opts.set_defaults(cfg.CONF, DEFAULT_POLICY_FILE)
+opts.set_defaults(
+    cfg.CONF,
+    DEFAULT_POLICY_FILE,
+    enforce_scope=True,
+    enforce_new_defaults=True)
 
 
 def reset():
@@ -80,7 +84,7 @@ def init(policy_file=None, rules=None, default_rule=None, use_conf=True,
             rules=rules,
             default_rule=default_rule,
             use_conf=use_conf)
-        # NOTE(gmann): Explictly disable the warnings for policies
+        # NOTE(gmann): Explicitly disable the warnings for policies
         # changing their default check_str. During policy-defaults-refresh
         # work, all the policy defaults have been changed and warning for
         # each policy started filling the logs limit for various tool.
@@ -177,7 +181,7 @@ def authorize(context, action, target=None, do_raise=True, exc=None):
     if not exc:
         exc = exception.PolicyNotAuthorized
 
-    # Legacy fallback for emtpy target from context.can()
+    # Legacy fallback for empty target from context.can()
     # should be removed once we improve testing and scope checks
     if target is None:
         target = default_target(context)

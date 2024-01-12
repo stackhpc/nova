@@ -46,18 +46,21 @@ class MigrateServerController(wsgi.Controller):
 
         instance = common.get_instance(self.compute_api, context, id,
                                        expected_attrs=['flavor', 'services'])
-        context.can(ms_policies.POLICY_ROOT % 'migrate',
-                    target={'project_id': instance.project_id})
-
         host_name = None
         if (api_version_request.is_supported(req, min_version='2.56') and
             body['migrate'] is not None):
             host_name = body['migrate'].get('host')
 
+        if host_name:
+            context.can(ms_policies.POLICY_ROOT % 'migrate:host',
+                        target={'project_id': instance.project_id})
+        else:
+            context.can(ms_policies.POLICY_ROOT % 'migrate',
+                        target={'project_id': instance.project_id})
         try:
             self.compute_api.resize(req.environ['nova.context'], instance,
                                     host_name=host_name)
-        except (exception.TooManyInstances, exception.QuotaError) as e:
+        except exception.OverQuota as e:
             raise exc.HTTPForbidden(explanation=e.format_message())
         except (
             exception.InstanceIsLocked,

@@ -54,10 +54,11 @@ def _dict_with_extra_specs(flavor_model):
 # issues are resolved.
 @api_db_api.context_manager.reader
 def _get_projects_from_db(context, flavorid):
-    db_flavor = context.session.query(api_models.Flavors).\
-        filter_by(flavorid=flavorid).\
-        options(orm.joinedload('projects')).\
-        first()
+    db_flavor = context.session.query(api_models.Flavors).filter_by(
+        flavorid=flavorid
+    ).options(
+        orm.joinedload(api_models.Flavors.projects)
+    ).first()
     if not db_flavor:
         raise exception.FlavorNotFound(flavor_id=flavorid)
     return [x['project_id'] for x in db_flavor['projects']]
@@ -269,10 +270,12 @@ class Flavor(base.NovaPersistentObject, base.NovaObject,
         return flavor
 
     @staticmethod
-    @api_db_api.context_manager.reader
     def _flavor_get_query_from_db(context):
-        query = context.session.query(api_models.Flavors).\
-            options(orm.joinedload('extra_specs'))
+        # We don't use a database context decorator on this method because this
+        # method is not executing a query, it's only building one.
+        query = context.session.query(api_models.Flavors).options(
+            orm.joinedload(api_models.Flavors.extra_specs)
+        )
         if not context.is_admin:
             the_filter = [api_models.Flavors.is_public == sql.true()]
             the_filter.extend([
@@ -283,6 +286,7 @@ class Flavor(base.NovaPersistentObject, base.NovaObject,
 
     @staticmethod
     @db_utils.require_context
+    @api_db_api.context_manager.reader
     def _flavor_get_from_db(context, id):
         """Returns a dict describing specific flavor."""
         result = Flavor._flavor_get_query_from_db(context).\
@@ -294,6 +298,7 @@ class Flavor(base.NovaPersistentObject, base.NovaObject,
 
     @staticmethod
     @db_utils.require_context
+    @api_db_api.context_manager.reader
     def _flavor_get_by_name_from_db(context, name):
         """Returns a dict describing specific flavor."""
         result = Flavor._flavor_get_query_from_db(context).\
@@ -305,6 +310,7 @@ class Flavor(base.NovaPersistentObject, base.NovaObject,
 
     @staticmethod
     @db_utils.require_context
+    @api_db_api.context_manager.reader
     def _flavor_get_by_flavor_id_from_db(context, flavor_id):
         """Returns a dict describing specific flavor_id."""
         result = Flavor._flavor_get_query_from_db(context).\
@@ -325,6 +331,7 @@ class Flavor(base.NovaPersistentObject, base.NovaObject,
                                                    self.flavorid)
         self.obj_reset_changes(['projects'])
 
+    @base.lazy_load_counter
     def obj_load_attr(self, attrname):
         # NOTE(danms): Only projects could be lazy-loaded right now
         if attrname != 'projects':

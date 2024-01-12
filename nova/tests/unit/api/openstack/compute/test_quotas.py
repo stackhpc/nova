@@ -14,12 +14,18 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
+from oslo_limit import fixture as limit_fixture
+from oslo_utils.fixture import uuidsentinel as uuids
 import webob
 
 from nova.api.openstack.compute import quota_sets as quotas_v21
 from nova.db import constants as db_const
 from nova import exception
+from nova.limit import local as local_limit
+from nova.limit import placement as placement_limit
+from nova import objects
 from nova import quota
 from nova import test
 from nova.tests.unit.api.openstack import fakes
@@ -660,3 +666,475 @@ class QuotaSetsTestV275(QuotaSetsTestV257):
                                       query_string=query_string)
         self.assertRaises(exception.ValidationError, self.controller.delete,
                           req, 1234)
+
+
+class NoopQuotaSetsTest(test.NoDBTestCase):
+    quota_driver = "nova.quota.NoopQuotaDriver"
+    expected_detail = {'in_use': -1, 'limit': -1, 'reserved': -1}
+
+    def setUp(self):
+        super(NoopQuotaSetsTest, self).setUp()
+        self.flags(driver=self.quota_driver, group="quota")
+        self.controller = quotas_v21.QuotaSetsController()
+        self.stub_out('nova.api.openstack.identity.verify_project_id',
+                      lambda ctx, project_id: True)
+
+    def test_show_v21(self):
+        req = fakes.HTTPRequest.blank("")
+        response = self.controller.show(req, uuids.project_id)
+        expected_response = {
+            'quota_set': {
+                'id': uuids.project_id,
+                'cores': -1,
+                'fixed_ips': -1,
+                'floating_ips': -1,
+                'injected_file_content_bytes': -1,
+                'injected_file_path_bytes': -1,
+                'injected_files': -1,
+                'instances': -1,
+                'key_pairs': -1,
+                'metadata_items': -1,
+                'ram': -1,
+                'security_group_rules': -1,
+                'security_groups': -1,
+                'server_group_members': -1,
+                'server_groups': -1,
+            }
+        }
+        self.assertEqual(expected_response, response)
+
+    def test_show_v257(self):
+        req = fakes.HTTPRequest.blank("", version='2.57')
+        response = self.controller.show(req, uuids.project_id)
+        expected_response = {
+            'quota_set': {
+                'id': uuids.project_id,
+                'cores': -1,
+                'instances': -1,
+                'key_pairs': -1,
+                'metadata_items': -1,
+                'ram': -1,
+                'server_group_members': -1,
+                'server_groups': -1}}
+        self.assertEqual(expected_response, response)
+
+    def test_detail_v21(self):
+        req = fakes.HTTPRequest.blank("")
+        response = self.controller.detail(req, uuids.project_id)
+
+        expected_response = {
+            'quota_set': {
+                'id': uuids.project_id,
+                'cores': self.expected_detail,
+                'fixed_ips': self.expected_detail,
+                'floating_ips': self.expected_detail,
+                'injected_file_content_bytes': self.expected_detail,
+                'injected_file_path_bytes': self.expected_detail,
+                'injected_files': self.expected_detail,
+                'instances': self.expected_detail,
+                'key_pairs': self.expected_detail,
+                'metadata_items': self.expected_detail,
+                'ram': self.expected_detail,
+                'security_group_rules': self.expected_detail,
+                'security_groups': self.expected_detail,
+                'server_group_members': self.expected_detail,
+                'server_groups': self.expected_detail,
+            }
+        }
+        self.assertEqual(expected_response, response)
+
+    def test_detail_v21_user(self):
+        req = fakes.HTTPRequest.blank("?user_id=42")
+        response = self.controller.detail(req, uuids.project_id)
+        expected_response = {
+            'quota_set': {
+                'id': uuids.project_id,
+                'cores': self.expected_detail,
+                'fixed_ips': self.expected_detail,
+                'floating_ips': self.expected_detail,
+                'injected_file_content_bytes': self.expected_detail,
+                'injected_file_path_bytes': self.expected_detail,
+                'injected_files': self.expected_detail,
+                'instances': self.expected_detail,
+                'key_pairs': self.expected_detail,
+                'metadata_items': self.expected_detail,
+                'ram': self.expected_detail,
+                'security_group_rules': self.expected_detail,
+                'security_groups': self.expected_detail,
+                'server_group_members': self.expected_detail,
+                'server_groups': self.expected_detail,
+            }
+        }
+        self.assertEqual(expected_response, response)
+
+    def test_update_still_rejects_badrequests(self):
+        req = fakes.HTTPRequest.blank("")
+        body = {'quota_set': {'instances': 50, 'cores': 50,
+                              'ram': 51200, 'unsupported': 12}}
+        self.assertRaises(exception.ValidationError, self.controller.update,
+                          req, uuids.project_id, body=body)
+
+    @mock.patch.object(objects.Quotas, "create_limit")
+    def test_update_v21(self, mock_create):
+        req = fakes.HTTPRequest.blank("")
+        body = {'quota_set': {'server_groups': 2}}
+        response = self.controller.update(req, uuids.project_id, body=body)
+        expected_response = {
+            'quota_set': {
+                'cores': -1,
+                'fixed_ips': -1,
+                'floating_ips': -1,
+                'injected_file_content_bytes': -1,
+                'injected_file_path_bytes': -1,
+                'injected_files': -1,
+                'instances': -1,
+                'key_pairs': -1,
+                'metadata_items': -1,
+                'ram': -1,
+                'security_group_rules': -1,
+                'security_groups': -1,
+                'server_group_members': -1,
+                'server_groups': -1,
+            }
+        }
+        self.assertEqual(expected_response, response)
+        mock_create.assert_called_once_with(req.environ['nova.context'],
+                                            uuids.project_id, "server_groups",
+                                            2, user_id=None)
+
+    @mock.patch.object(objects.Quotas, "create_limit")
+    def test_update_v21_user(self, mock_create):
+        req = fakes.HTTPRequest.blank("?user_id=42")
+        body = {'quota_set': {'key_pairs': 52}}
+        response = self.controller.update(req, uuids.project_id, body=body)
+        expected_response = {
+            'quota_set': {
+                'cores': -1,
+                'fixed_ips': -1,
+                'floating_ips': -1,
+                'injected_file_content_bytes': -1,
+                'injected_file_path_bytes': -1,
+                'injected_files': -1,
+                'instances': -1,
+                'key_pairs': -1,
+                'metadata_items': -1,
+                'ram': -1,
+                'security_group_rules': -1,
+                'security_groups': -1,
+                'server_group_members': -1,
+                'server_groups': -1,
+            }
+        }
+        self.assertEqual(expected_response, response)
+        mock_create.assert_called_once_with(req.environ['nova.context'],
+                                            uuids.project_id, "key_pairs", 52,
+                                            user_id="42")
+
+    def test_defaults_v21(self):
+        req = fakes.HTTPRequest.blank("")
+        response = self.controller.defaults(req, uuids.project_id)
+        expected_response = {
+            'quota_set': {
+                'id': uuids.project_id,
+                'cores': -1,
+                'fixed_ips': -1,
+                'floating_ips': -1,
+                'injected_file_content_bytes': -1,
+                'injected_file_path_bytes': -1,
+                'injected_files': -1,
+                'instances': -1,
+                'key_pairs': -1,
+                'metadata_items': -1,
+                'ram': -1,
+                'security_group_rules': -1,
+                'security_groups': -1,
+                'server_group_members': -1,
+                'server_groups': -1,
+            }
+        }
+        self.assertEqual(expected_response, response)
+
+    @mock.patch('nova.objects.Quotas.destroy_all_by_project')
+    def test_quotas_delete(self, mock_destroy_all_by_project):
+        req = fakes.HTTPRequest.blank("")
+        self.controller.delete(req, "1234")
+        mock_destroy_all_by_project.assert_called_once_with(
+            req.environ['nova.context'], "1234")
+
+    @mock.patch('nova.objects.Quotas.destroy_all_by_project_and_user')
+    def test_user_quotas_delete(self, mock_destroy_all_by_user):
+        req = fakes.HTTPRequest.blank("?user_id=42")
+        self.controller.delete(req, "1234")
+        mock_destroy_all_by_user.assert_called_once_with(
+            req.environ['nova.context'], "1234", "42")
+
+
+class UnifiedLimitsQuotaSetsTest(NoopQuotaSetsTest):
+    quota_driver = "nova.quota.UnifiedLimitsDriver"
+    # this matches what the db driver returns
+    expected_detail = {'in_use': 0, 'limit': -1, 'reserved': 0}
+
+    def setUp(self):
+        super(UnifiedLimitsQuotaSetsTest, self).setUp()
+        reglimits = {local_limit.SERVER_METADATA_ITEMS: 128,
+                     local_limit.INJECTED_FILES: 5,
+                     local_limit.INJECTED_FILES_CONTENT: 10 * 1024,
+                     local_limit.INJECTED_FILES_PATH: 255,
+                     local_limit.KEY_PAIRS: 100,
+                     local_limit.SERVER_GROUPS: 12,
+                     local_limit.SERVER_GROUP_MEMBERS: 10}
+        self.limit_fixture = self.useFixture(
+            limit_fixture.LimitFixture(reglimits, {}))
+
+    @mock.patch.object(placement_limit, "get_legacy_project_limits")
+    def test_show_v21(self, mock_proj):
+        mock_proj.return_value = {"instances": 1, "cores": 2, "ram": 3}
+        req = fakes.HTTPRequest.blank("")
+        response = self.controller.show(req, uuids.project_id)
+        expected_response = {
+            'quota_set': {
+                'id': uuids.project_id,
+                'cores': 2,
+                'fixed_ips': -1,
+                'floating_ips': -1,
+                'injected_file_content_bytes': 10240,
+                'injected_file_path_bytes': 255,
+                'injected_files': 5,
+                'instances': 1,
+                'key_pairs': 100,
+                'metadata_items': 128,
+                'ram': 3,
+                'security_group_rules': -1,
+                'security_groups': -1,
+                'server_group_members': 10,
+                'server_groups': 12,
+            }
+        }
+        self.assertEqual(expected_response, response)
+
+    @mock.patch.object(placement_limit, "get_legacy_project_limits")
+    def test_show_v257(self, mock_proj):
+        mock_proj.return_value = {"instances": 1, "cores": 2, "ram": 3}
+        req = fakes.HTTPRequest.blank("", version='2.57')
+        response = self.controller.show(req, uuids.project_id)
+        expected_response = {
+            'quota_set': {
+                'id': uuids.project_id,
+                'cores': 2,
+                'instances': 1,
+                'key_pairs': 100,
+                'metadata_items': 128,
+                'ram': 3,
+                'server_group_members': 10,
+                'server_groups': 12}}
+        self.assertEqual(expected_response, response)
+
+    @mock.patch.object(placement_limit, "get_legacy_counts")
+    @mock.patch.object(placement_limit, "get_legacy_project_limits")
+    @mock.patch.object(objects.InstanceGroupList, "get_counts")
+    def test_detail_v21(self, mock_count, mock_proj, mock_kcount):
+        mock_proj.return_value = {"instances": 1, "cores": 2, "ram": 3}
+        mock_kcount.return_value = {"instances": 4, "cores": 5, "ram": 6}
+        mock_count.return_value = {'project': {'server_groups': 9}}
+        req = fakes.HTTPRequest.blank("")
+        response = self.controller.detail(req, uuids.project_id)
+        expected_response = {
+            'quota_set': {
+                'id': uuids.project_id,
+                'cores': {
+                    'in_use': 5, 'limit': 2, 'reserved': 0},
+                'fixed_ips': self.expected_detail,
+                'floating_ips': self.expected_detail,
+                'injected_file_content_bytes': {
+                    'in_use': 0, 'limit': 10240, 'reserved': 0},
+                'injected_file_path_bytes': {
+                    'in_use': 0, 'limit': 255, 'reserved': 0},
+                'injected_files': {
+                    'in_use': 0, 'limit': 5, 'reserved': 0},
+                'instances': {
+                    'in_use': 4, 'limit': 1, 'reserved': 0},
+                'key_pairs': {
+                    'in_use': 0, 'limit': 100, 'reserved': 0},
+                'metadata_items': {
+                    'in_use': 0, 'limit': 128, 'reserved': 0},
+                'ram': {
+                    'in_use': 6, 'limit': 3, 'reserved': 0},
+                'security_group_rules': self.expected_detail,
+                'security_groups': self.expected_detail,
+                'server_group_members': {
+                    'in_use': 0, 'limit': 10, 'reserved': 0},
+                'server_groups': {
+                    'in_use': 9, 'limit': 12, 'reserved': 0},
+            }
+        }
+        self.assertEqual(expected_response, response)
+
+    @mock.patch.object(placement_limit, "get_legacy_counts")
+    @mock.patch.object(placement_limit, "get_legacy_project_limits")
+    @mock.patch.object(objects.InstanceGroupList, "get_counts")
+    def test_detail_v21_user(self, mock_count, mock_proj, mock_kcount):
+        mock_proj.return_value = {"instances": 1, "cores": 2, "ram": 3}
+        mock_kcount.return_value = {"instances": 4, "cores": 5, "ram": 6}
+        mock_count.return_value = {'project': {'server_groups': 9}}
+        req = fakes.HTTPRequest.blank("?user_id=42")
+        response = self.controller.detail(req, uuids.project_id)
+        expected_response = {
+            'quota_set': {
+                'id': uuids.project_id,
+                'cores': {
+                    'in_use': 5, 'limit': 2, 'reserved': 0},
+                'fixed_ips': self.expected_detail,
+                'floating_ips': self.expected_detail,
+                'injected_file_content_bytes': {
+                    'in_use': 0, 'limit': 10240, 'reserved': 0},
+                'injected_file_path_bytes': {
+                    'in_use': 0, 'limit': 255, 'reserved': 0},
+                'injected_files': {
+                    'in_use': 0, 'limit': 5, 'reserved': 0},
+                'instances': {
+                    'in_use': 4, 'limit': 1, 'reserved': 0},
+                'key_pairs': {
+                    'in_use': 0, 'limit': 100, 'reserved': 0},
+                'metadata_items': {
+                    'in_use': 0, 'limit': 128, 'reserved': 0},
+                'ram': {
+                    'in_use': 6, 'limit': 3, 'reserved': 0},
+                'security_group_rules': self.expected_detail,
+                'security_groups': self.expected_detail,
+                'server_group_members': {
+                    'in_use': 0, 'limit': 10, 'reserved': 0},
+                'server_groups': {
+                    'in_use': 9, 'limit': 12, 'reserved': 0},
+            }
+        }
+        self.assertEqual(expected_response, response)
+
+    @mock.patch.object(placement_limit, "get_legacy_project_limits")
+    @mock.patch.object(objects.Quotas, "create_limit")
+    def test_update_v21(self, mock_create, mock_proj):
+        mock_proj.return_value = {"instances": 1, "cores": 2, "ram": 3}
+        req = fakes.HTTPRequest.blank("")
+        # TODO(johngarbutt) still need to implement get_settable_quotas
+        body = {'quota_set': {'server_groups': 2}}
+        response = self.controller.update(req, uuids.project_id, body=body)
+        expected_response = {
+            'quota_set': {
+                'cores': 2,
+                'fixed_ips': -1,
+                'floating_ips': -1,
+                'injected_file_content_bytes': 10240,
+                'injected_file_path_bytes': 255,
+                'injected_files': 5,
+                'instances': 1,
+                'key_pairs': 100,
+                'metadata_items': 128,
+                'ram': 3,
+                'security_group_rules': -1,
+                'security_groups': -1,
+                'server_group_members': 10,
+                'server_groups': 12,
+            }
+        }
+        self.assertEqual(expected_response, response)
+        self.assertEqual(0, mock_create.call_count)
+
+    @mock.patch.object(placement_limit, "get_legacy_project_limits")
+    @mock.patch.object(objects.Quotas, "create_limit")
+    def test_update_v21_user(self, mock_create, mock_proj):
+        mock_proj.return_value = {"instances": 1, "cores": 2, "ram": 3}
+        req = fakes.HTTPRequest.blank("?user_id=42")
+        body = {'quota_set': {'key_pairs': 52}}
+        response = self.controller.update(req, uuids.project_id, body=body)
+        expected_response = {
+            'quota_set': {
+                'cores': 2,
+                'fixed_ips': -1,
+                'floating_ips': -1,
+                'injected_file_content_bytes': 10240,
+                'injected_file_path_bytes': 255,
+                'injected_files': 5,
+                'instances': 1,
+                'key_pairs': 100,
+                'metadata_items': 128,
+                'ram': 3,
+                'security_group_rules': -1,
+                'security_groups': -1,
+                'server_group_members': 10,
+                'server_groups': 12,
+            }
+        }
+        self.assertEqual(expected_response, response)
+        self.assertEqual(0, mock_create.call_count)
+
+    @mock.patch.object(placement_limit, "get_legacy_default_limits")
+    def test_defaults_v21(self, mock_default):
+        mock_default.return_value = {"instances": 1, "cores": 2, "ram": 3}
+        req = fakes.HTTPRequest.blank("")
+        response = self.controller.defaults(req, uuids.project_id)
+        expected_response = {
+            'quota_set': {
+                'id': uuids.project_id,
+                'cores': 2,
+                'fixed_ips': -1,
+                'floating_ips': -1,
+                'injected_file_content_bytes': 10240,
+                'injected_file_path_bytes': 255,
+                'injected_files': 5,
+                'instances': 1,
+                'key_pairs': 100,
+                'metadata_items': 128,
+                'ram': 3,
+                'security_group_rules': -1,
+                'security_groups': -1,
+                'server_group_members': 10,
+                'server_groups': 12,
+            }
+        }
+        self.assertEqual(expected_response, response)
+
+    def test_defaults_v21_different_limit_values(self):
+        reglimits = {local_limit.SERVER_METADATA_ITEMS: 7,
+                     local_limit.INJECTED_FILES: 6,
+                     local_limit.INJECTED_FILES_CONTENT: 4,
+                     local_limit.INJECTED_FILES_PATH: 5,
+                     local_limit.KEY_PAIRS: 1,
+                     local_limit.SERVER_GROUPS: 3,
+                     local_limit.SERVER_GROUP_MEMBERS: 2}
+        self.limit_fixture.reglimits = reglimits
+
+        req = fakes.HTTPRequest.blank("")
+        response = self.controller.defaults(req, uuids.project_id)
+        expected_response = {
+            'quota_set': {
+                'id': uuids.project_id,
+                'cores': 0,
+                'fixed_ips': -1,
+                'floating_ips': -1,
+                'injected_file_content_bytes': 4,
+                'injected_file_path_bytes': 5,
+                'injected_files': 6,
+                'instances': 0,
+                'key_pairs': 1,
+                'metadata_items': 7,
+                'ram': 0,
+                'security_group_rules': -1,
+                'security_groups': -1,
+                'server_group_members': 2,
+                'server_groups': 3,
+            }
+        }
+        self.assertEqual(expected_response, response)
+
+    @mock.patch('nova.objects.Quotas.destroy_all_by_project')
+    def test_quotas_delete(self, mock_destroy_all_by_project):
+        req = fakes.HTTPRequest.blank("")
+        self.controller.delete(req, "1234")
+        # Ensure destroy isn't called for unified limits
+        self.assertEqual(0, mock_destroy_all_by_project.call_count)
+
+    @mock.patch('nova.objects.Quotas.destroy_all_by_project_and_user')
+    def test_user_quotas_delete(self, mock_destroy_all_by_user):
+        req = fakes.HTTPRequest.blank("?user_id=42")
+        self.controller.delete(req, "1234")
+        # Ensure destroy isn't called for unified limits
+        self.assertEqual(0, mock_destroy_all_by_user.call_count)

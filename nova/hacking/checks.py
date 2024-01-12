@@ -136,6 +136,13 @@ mock_class_aliasing_re = re.compile(
 # Regex for catching aliasing mock.Mock class in test
 mock_class_as_new_value_in_patching_re = re.compile(
     r"mock\.patch(\.object)?.* new=mock\.(Magic|NonCallable)?Mock[^(]")
+# Regex for direct use of oslo.concurrency lockutils.ReaderWriterLock
+rwlock_re = re.compile(
+    r"(?P<module_part>(oslo_concurrency\.)?(lockutils|fasteners))"
+    r"\.ReaderWriterLock\(.*\)")
+six_re = re.compile(r"^(import six(\..*)?|from six(\..*)? import .*)$")
+# Regex for catching the setDaemon method
+set_daemon_re = re.compile(r"\.setDaemon\(")
 
 
 class BaseASTChecker(ast.NodeVisitor):
@@ -1001,3 +1008,94 @@ def do_not_use_mock_class_as_new_mock_value(logical_line, filename):
                 "leak out from the test and can cause interference. "
                 "Use new=mock.Mock() or new_callable=mock.Mock instead."
             )
+
+
+@core.flake8ext
+def check_lockutils_rwlocks(logical_line):
+    """Check for direct use of oslo.concurrency lockutils.ReaderWriterLock()
+
+    oslo.concurrency lockutils uses fasteners.ReaderWriterLock to provide
+    read/write locks and fasteners calls threading.current_thread() to track
+    and identify lock holders and waiters. The eventlet implementation of
+    current_thread() only supports greenlets of type GreenThread, else it falls
+    back on the native threading.current_thread() method.
+
+    See https://github.com/eventlet/eventlet/issues/731 for details.
+
+    N369
+    """
+    msg = ("N369: %(module)s.ReaderWriterLock() does not "
+           "function correctly with eventlet patched code. "
+           "Use nova.utils.ReaderWriterLock() instead.")
+    match = re.match(rwlock_re, logical_line)
+    if match:
+        yield (
+            0,
+            msg % {'module': match.group('module_part')}
+        )
+
+
+@core.flake8ext
+def check_six(logical_line):
+    """Check for use of six
+
+    nova is now Python 3-only so we don't want six. However, people might use
+    it out of habit and it will likely work since six is a transitive
+    dependency.
+
+    N370
+    """
+    match = re.match(six_re, logical_line)
+    if match:
+        yield (0, "N370: Don't use or import six")
+
+
+@core.flake8ext
+def import_stock_mock(logical_line):
+    """Use python's mock, not the mock library.
+
+    Since we `dropped support for python 2`__, we no longer need to use the
+    mock library, which existed to backport py3 functionality into py2. Change
+    Ib44b5bff657c8e76c4f701e14d51a4efda3f6d32 cut over to importing the stock
+    mock, which must be done by saying::
+
+        from unittest import mock
+
+    ...because if you say::
+
+        import mock
+
+    ...you may be getting the stock mock; or, due to transitive dependencies in
+    the environment, the library mock. This check can be removed in the future
+    (and we can start saying ``import mock`` again) if we manage to purge these
+    transitive dependencies.
+
+    .. __: https://review.opendev.org/#/c/687954/
+
+    N371
+    """
+    if logical_line == 'import mock' or logical_line.startswith('from mock'):
+        yield (
+            0,
+            "N371: You must explicitly import python's mock: "
+            "``from unittest import mock``"
+        )
+
+
+@core.flake8ext
+def check_set_daemon(logical_line):
+    """Check for use of the setDaemon method of the threading.Thread class
+
+    The setDaemon method of the threading.Thread class has been deprecated
+    since Python 3.10. Use the daemon attribute instead.
+
+    See
+    https://docs.python.org/3.10/library/threading.html#threading.Thread.setDaemon
+    for details.
+
+    N372
+    """
+    res = set_daemon_re.search(logical_line)
+    if res:
+        yield (0, "N372: Don't use the setDaemon method. "
+                  "Use the daemon attribute instead.")

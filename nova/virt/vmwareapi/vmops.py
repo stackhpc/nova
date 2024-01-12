@@ -263,11 +263,11 @@ class VMwareVMOps(object):
             parent_folder = folder_ref
         return folder_ref
 
-    def _get_folder_name(self, name, id):
+    def _get_folder_name(self, name, id_):
         # Maximum folder length must be less than 80 characters.
         # The 'id' length is 36. The maximum prefix for name is 40.
         # We cannot truncate the 'id' as this is unique across OpenStack.
-        return '%s (%s)' % (name[:40], id[:36])
+        return '%s (%s)' % (name[:40], id_[:36])
 
     def build_virtual_machine(self, instance, image_info,
                               dc_info, datastore, network_info, extra_specs,
@@ -728,6 +728,12 @@ class VMwareVMOps(object):
                                      vi.cache_image_folder, flat_file)
         if new_size is not None:
             vi.ii.file_size = new_size
+
+    def prepare_for_spawn(self, instance):
+        if (int(instance.flavor.memory_mb) % 4 != 0):
+            reason = _("Memory size is not multiple of 4")
+            raise exception.InstanceUnacceptable(instance_id=instance.uuid,
+                                                 reason=reason)
 
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, network_info, block_device_info=None):

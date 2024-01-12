@@ -33,7 +33,7 @@ SUPPORTED_SCHEMA_VERSIONS = {
 
 # Supported provider config file schema
 SCHEMA_V1 = {
-    # This defintion uses JSON Schema Draft 7.
+    # This definition uses JSON Schema Draft 7.
     # https://json-schema.org/draft-07/json-schema-release-notes.html
     'type': 'object',
     'properties': {
@@ -137,7 +137,7 @@ SCHEMA_V1 = {
                         'patternProperties': {
                             # Allows any key name matching the resource class
                             # pattern, check to prevent conflicts with virt
-                            # driver owned resouces classes will be done after
+                            # driver owned resources classes will be done after
                             # schema validation.
                             '^[A-Z0-9_]{1,255}$': {
                                 'type': 'object',
@@ -229,8 +229,9 @@ def _load_yaml_file(path):
                 if hasattr(ex, 'problem_mark'):
                     pos = ex.problem_mark
                     message += _("File: %s ") % open_file.name
-                    message += _("Error position: (%s:%s)") % (
-                        pos.line + 1, pos.column + 1)
+                    message += _("Error position: "
+                                 "({line}:{column})").format(
+                                     line=pos.line + 1, column=pos.column + 1)
                 raise nova_exc.ProviderConfigException(error=message)
     except OSError:
         message = _("Unable to read yaml config file: %s") % path

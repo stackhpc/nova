@@ -10,7 +10,8 @@ a variety of options.
 In the default configuration, this scheduler considers hosts that meet all the
 following criteria:
 
-* Are in the requested :term:`Availability Zone` (``AvailabilityZoneFilter``).
+* Are in the requested :term:`Availability Zone`
+  (``map_az_to_placement_aggregate``) placement pre filter.
 
 * Can service the request meaning the nova-compute service handling the target
   node is available and not disabled (``ComputeFilter``).
@@ -108,8 +109,8 @@ The Filter Scheduler
 
 .. versionchanged:: 23.0.0 (Wallaby)
 
-    Support for custom filters was removed. Only the filter scheduler is now
-    supported by nova.
+    Support for custom scheduler drivers was removed. Only the filter scheduler
+    is now supported by nova.
 
 Nova's scheduler, known as the *filter scheduler*, supports filtering and
 weighting to make informed decisions on where a new instance should be created.
@@ -165,9 +166,6 @@ possible to avoid unnecessary costs. We can sort
 :oslo.config:option:`filter_scheduler.enabled_filters`
 items by their costs in reverse order. For example, ``ComputeFilter`` is better
 before any resource calculating filters like ``NUMATopologyFilter``.
-
-In medium/large environments having AvailabilityZoneFilter before any
-capability or resource calculating filters can be useful.
 
 .. _AggregateImagePropertiesIsolation:
 
@@ -349,20 +347,6 @@ Refer to :doc:`/admin/aggregates` for more information.
 This is a no-op filter. It does not eliminate any of the available hosts.
 
 
-.. _AvailabilityZoneFilter:
-
-``AvailabilityZoneFilter``
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Filters hosts by availability zone. It passes hosts matching the availability
-zone specified in the instance properties.  Use a comma to specify multiple
-zones. The filter will then ensure it matches any zone specified.
-
-You must enable this filter for the scheduler to respect availability zones in
-requests.
-
-Refer to :doc:`/admin/availability-zones` for more information.
-
 .. _ComputeCapabilitiesFilter:
 
 ``ComputeCapabilitiesFilter``
@@ -406,7 +390,7 @@ Some of attributes that can be used as useful key and their values contains:
 * ``free_ram_mb`` (compared with a number, values like ``>= 4096``)
 * ``free_disk_mb`` (compared with a number, values like ``>= 10240``)
 * ``host`` (compared with a string, values like ``<in> compute``, ``s== compute_01``)
-* ``hypervisor_type`` (compared with a string, values like ``s== QEMU``, ``s== powervm``)
+* ``hypervisor_type`` (compared with a string, values like ``s== QEMU``, ``s== ironic``)
 * ``hypervisor_version`` (compared with a number, values like ``>= 1005003``, ``== 2000000``)
 * ``num_instances`` (compared with a number, values like ``<= 10``)
 * ``num_io_ops`` (compared with a number, values like ``<= 5``)
@@ -761,7 +745,9 @@ For example, when using the :command:`openstack server create` command, use the
 
    $ openstack server group create --policy affinity group-1
    $ openstack server create --image IMAGE_ID --flavor 1 \
-     --hint group=SERVER_GROUP_UUID server-1
+       --hint group=SERVER_GROUP_UUID server-1
+
+For more information on server groups, refer to :doc:`/user/server-groups`.
 
 
 .. _ServerGroupAntiAffinityFilter:
@@ -781,7 +767,9 @@ For example, when using the :command:`openstack server create` command, use the
 
    $ openstack server group create --policy anti-affinity group-1
    $ openstack server create --image IMAGE_ID --flavor 1 \
-     --hint group=SERVER_GROUP_UUID server-1
+       --hint group=SERVER_GROUP_UUID server-1
+
+For more information on server groups, refer to :doc:`/user/server-groups`.
 
 
 ``SimpleCIDRAffinityFilter``
@@ -853,7 +841,6 @@ Hosts are weighted based on the following config options:
 - :oslo.config:option:`filter_scheduler.host_subset_size`
 - :oslo.config:option:`filter_scheduler.weight_classes`
 
-
 ``RAMWeigher``
 ~~~~~~~~~~~~~~
 
@@ -869,7 +856,6 @@ value would be chosen as the ram weight multiplier. Otherwise, it will fall
 back to the :oslo.config:option:`filter_scheduler.ram_weight_multiplier`.
 If more than one value is found for a host in aggregate metadata, the minimum
 value will be used.
-
 
 ``CPUWeigher``
 ~~~~~~~~~~~~~~
@@ -887,7 +873,6 @@ back to the :oslo.config:option:`filter_scheduler.cpu_weight_multiplier`. If
 more than one value is found for a host in aggregate metadata, the minimum
 value will be used.
 
-
 ``DiskWeigher``
 ~~~~~~~~~~~~~~~
 
@@ -901,7 +886,6 @@ value would be chosen as the disk weight multiplier. Otherwise, it will fall
 back to the :oslo.config:option:`filter_scheduler.disk_weight_multiplier`. If
 more than one value is found for a host in aggregate metadata, the minimum value
 will be used.
-
 
 ``MetricsWeigher``
 ~~~~~~~~~~~~~~~~~~
@@ -929,14 +913,17 @@ metrics weight multiplier. Otherwise, it will fall back to the
 one value is found for a host in aggregate metadata, the minimum value will
 be used.
 
-
 ``IoOpsWeigher``
 ~~~~~~~~~~~~~~~~
 
-The weigher can compute the weight based on the compute node
-host's workload. The default is to preferably choose light workload compute
-hosts. If the multiplier is positive, the weigher prefer choosing heavy
-workload compute hosts, the weighing has the opposite effect of the default.
+The weigher can compute the weight based on the compute node host's workload.
+This is calculated by examining the number of instances in the ``building``
+``vm_state`` or in one of the following ``task_state``\ 's:
+``resize_migrating``, ``rebuilding``, ``resize_prep``, ``image_snapshot``,
+``image_backup``, ``rescuing``, or ``unshelving``.
+The default is to preferably choose light workload compute hosts. If the
+multiplier is positive, the weigher prefers choosing heavy workload compute
+hosts, the weighing has the opposite effect of the default.
 
 Starting with the Stein release, if per-aggregate value with the key
 ``io_ops_weight_multiplier`` is found, this
@@ -1006,6 +993,8 @@ the
 If more than one value is found for a host in aggregate metadata, the minimum
 value will be used.
 
+.. _build-failure-weigher:
+
 ``BuildFailureWeigher``
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -1020,6 +1009,17 @@ build failure weight multiplier. Otherwise, it will fall back to the
 more than one value is found for a host in aggregate metadata, the minimum
 value will be used.
 
+.. important::
+
+    The :oslo.config:option:`filter_scheduler.build_failure_weight_multiplier`
+    option defaults to a very high value. This is intended to offset weight
+    given by other enabled weighers due to available resources, giving this
+    weigher priority. However, not all build failures imply a problem with the
+    host itself - it could be user error - but the failure will still be
+    counted. If you find hosts are frequently reporting build failures and
+    effectively being excluded during scheduling, you may wish to lower the
+    value of the multiplier.
+
 .. _cross-cell-weigher:
 
 ``CrossCellWeigher``
@@ -1028,14 +1028,60 @@ value will be used.
 .. versionadded:: 21.0.0 (Ussuri)
 
 Weighs hosts based on which cell they are in. "Local" cells are preferred when
-moving an instance. Use configuration option
-:oslo.config:option:`filter_scheduler.cross_cell_move_weight_multiplier` to
-control the weight. If per-aggregate value with the key
-`cross_cell_move_weight_multiplier` is found, this value would be chosen as the
-cross-cell move weight multiplier. Otherwise, it will fall back to the
+moving an instance.
+
+If per-aggregate value with the key `cross_cell_move_weight_multiplier` is
+found, this value would be chosen as the cross-cell move weight multiplier.
+Otherwise, it will fall back to the
 :oslo.config:option:`filter_scheduler.cross_cell_move_weight_multiplier`.  If
 more than one value is found for a host in aggregate metadata, the minimum
 value will be used.
+
+``HypervisorVersionWeigher``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 28.0.0 (Bobcat)
+
+Weigh hosts by their relative hypervisor version reported by the virt driver.
+
+While the hypervisor_version filed for all virt drivers is an int,
+each nova virt driver uses a different algorithm to convert the hypervisor-specific
+version sequence into an int. As such the values are not directly comparable between
+hosts with different hypervisors.
+
+For example, the ironic virt driver uses the ironic API micro-version as the hypervisor
+version for a given node. The libvirt driver uses the libvirt version
+i.e. Libvirt `7.1.123` becomes `700100123` vs  Ironic `1.82` becomes `1`
+Hyper-V `6.3` becomes `6003`.
+
+If you have a mixed virt driver deployment in the ironic vs non-ironic
+case nothing special needs to be done. ironic nodes are scheduled using custom
+resource classes so ironic flavors will never match non-ironic compute nodes.
+
+If a deployment has multiple non-ironic virt drivers it is recommended to use aggregates
+to group hosts by virt driver. While this is not strictly required, it is
+desirable to avoid bias towards one virt driver.
+see :ref:`filtering_hosts_by_isolating_aggregates` and :ref:`AggregateImagePropertiesIsolation`
+for more information.
+
+The default behavior of the HypervisorVersionWeigher is to select newer hosts.
+If you prefer to invert the behavior set the
+:oslo.config:option:`filter_scheduler.hypervisor_version_weight_multiplier` option
+to a negative number and the weighing has the opposite effect of the default.
+
+
+``NumInstancesWeigher``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 28.0.0 (Bobcat)
+
+This weigher compares hosts and orders them based on their number of instances
+respectively. By default the weigher is doing nothing but you
+can change its behaviour by modifying the value of
+:oslo.config:option:`filter_scheduler.num_instances_weight_multiplier`.
+A positive value will favor hosts with a larger number of instances (packing
+strategy) while a negative value will follow a spread strategy that will
+favor hosts with the lesser number of instances.
 
 
 Utilization-aware scheduling
@@ -1088,6 +1134,16 @@ control the initial allocation ratio values for a compute node:
 * :oslo.config:option:`initial_disk_allocation_ratio` the initial DISK_GB
   inventory allocation ratio for a new compute node record, defaults to 1.0
 
+Starting with the 27.0.0 Antelope release, the following default values are used
+for the initial allocation ratio values for a compute node:
+
+* :oslo.config:option:`initial_cpu_allocation_ratio` the initial VCPU
+  inventory allocation ratio for a new compute node record, defaults to 4.0
+* :oslo.config:option:`initial_ram_allocation_ratio` the initial MEMORY_MB
+  inventory allocation ratio for a new compute node record, defaults to 1.0
+* :oslo.config:option:`initial_disk_allocation_ratio` the initial DISK_GB
+  inventory allocation ratio for a new compute node record, defaults to 1.0
+
 Scheduling considerations
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -1100,10 +1156,9 @@ scheduling.
 Usage scenarios
 ~~~~~~~~~~~~~~~
 
-Since allocation ratios can be set via nova configuration, host aggregate
-metadata and the placement API, it can be confusing to know which should be
-used. This really depends on your scenario. A few common scenarios are detailed
-here.
+Since allocation ratios can be set via nova configuration and the placement
+API, it can be confusing to know which should be used. This really depends on
+your scenario. A few common scenarios are detailed here.
 
 1. When the deployer wants to **always** set an override value for a resource
    on a compute node, the deployer should ensure that the
@@ -1150,7 +1205,7 @@ here.
     :oslo.config:option:`DEFAULT.cpu_allocation_ratio`,
     :oslo.config:option:`DEFAULT.ram_allocation_ratio` or
     :oslo.config:option:`DEFAULT.disk_allocation_ratio` to a non-null value
-    would ensure the user-configured value was always overriden.
+    would ensure the user-configured value was always overridden.
 
 .. _osc-placement: https://docs.openstack.org/osc-placement/latest/index.html
 

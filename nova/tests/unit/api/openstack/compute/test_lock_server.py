@@ -13,7 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
 
 from nova.api.openstack import api_version_request
 from nova.api.openstack import common
@@ -114,7 +114,7 @@ class LockServerTestsV273(LockServerTestsV21):
             self.controller._lock, self.req, instance.uuid, body=body)
         self.assertIn("256 is not of type 'string'", str(exp))
 
-    def test_lock_with_invalid_paramater(self):
+    def test_lock_with_invalid_parameter(self):
         # This will fail from 2.73 since we have a schema check that allows
         # only locked_reason
         instance = fake_instance.fake_instance_obj(

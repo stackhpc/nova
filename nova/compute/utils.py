@@ -159,7 +159,7 @@ def get_device_name_for_instance(instance, bdms, device):
     This method is a wrapper for get_next_device_name that gets the list
     of used devices and the root device from a block device mapping.
 
-    :raises TooManyDiskDevices: if the maxmimum allowed devices to attach to a
+    :raises TooManyDiskDevices: if the maximum allowed devices to attach to a
                                 single instance is exceeded.
     """
     mappings = block_device.instance_block_mapping(instance, bdms)
@@ -172,7 +172,7 @@ def default_device_names_for_instance(instance, root_device_name,
     """Generate missing device names for an instance.
 
 
-    :raises TooManyDiskDevices: if the maxmimum allowed devices to attach to a
+    :raises TooManyDiskDevices: if the maximum allowed devices to attach to a
                                 single instance is exceeded.
     """
 
@@ -212,7 +212,7 @@ def get_next_device_name(instance, device_name_list,
     /dev/vdc is specified but the backend uses /dev/xvdc), the device
     name will be converted to the appropriate format.
 
-    :raises TooManyDiskDevices: if the maxmimum allowed devices to attach to a
+    :raises TooManyDiskDevices: if the maximum allowed devices to attach to a
                                 single instance is exceeded.
     """
 
@@ -370,7 +370,7 @@ def notify_usage_exists(notifier, context, instance_ref, host,
 
     extra_info = dict(audit_period_beginning=str(audit_start),
                       audit_period_ending=str(audit_end),
-                      bandwidth={}, image_meta=image_meta)
+                      image_meta=image_meta)
 
     if extra_usage_info:
         extra_info.update(extra_usage_info)
@@ -379,30 +379,34 @@ def notify_usage_exists(notifier, context, instance_ref, host,
                                 extra_usage_info=extra_info)
 
     audit_period = instance_notification.AuditPeriodPayload(
-            audit_period_beginning=audit_start,
-            audit_period_ending=audit_end)
+        audit_period_beginning=audit_start,
+        audit_period_ending=audit_end,
+    )
 
     payload = instance_notification.InstanceExistsPayload(
         context=context,
         instance=instance_ref,
         audit_period=audit_period,
-        bandwidth=[])
+    )
 
     notification = instance_notification.InstanceExistsNotification(
         context=context,
         priority=fields.NotificationPriority.INFO,
         publisher=notification_base.NotificationPublisher(
-            host=host, source=fields.NotificationSource.COMPUTE),
+            host=host, source=fields.NotificationSource.COMPUTE,
+        ),
         event_type=notification_base.EventType(
             object='instance',
-            action=fields.NotificationAction.EXISTS),
-        payload=payload)
+            action=fields.NotificationAction.EXISTS,
+        ),
+        payload=payload,
+    )
     notification.emit(context)
 
 
 def notify_about_instance_usage(notifier, context, instance, event_suffix,
                                 network_info=None, extra_usage_info=None,
-                                fault=None):
+                                fault=None, best_effort=False):
     """Send an unversioned legacy notification about an instance.
 
     All new notifications should use notify_about_instance_action which sends
@@ -431,7 +435,14 @@ def notify_about_instance_usage(notifier, context, instance, event_suffix,
     else:
         method = notifier.info
 
-    method(context, 'compute.instance.%s' % event_suffix, usage_info)
+    try:
+        method(context, 'compute.instance.%s' % event_suffix, usage_info)
+    except Exception as e:
+        if best_effort:
+            LOG.error('Exception during notification sending: %s. '
+                      'Attempting to proceed with normal operation.', e)
+        else:
+            raise e
 
 
 def _get_fault_and_priority_from_exception(exception: Exception):
@@ -450,7 +461,7 @@ def _get_fault_and_priority_from_exception(exception: Exception):
 @rpc.if_notifications_enabled
 def notify_about_instance_action(context, instance, host, action, phase=None,
                                  source=fields.NotificationSource.COMPUTE,
-                                 exception=None, bdms=None):
+                                 exception=None, bdms=None, best_effort=False):
     """Send versioned notification about the action made on the instance
     :param instance: the instance which the action performed on
     :param host: the host emitting the notification
@@ -477,7 +488,14 @@ def notify_about_instance_action(context, instance, host, action, phase=None,
                     action=action,
                     phase=phase),
             payload=payload)
-    notification.emit(context)
+    try:
+        notification.emit(context)
+    except Exception as e:
+        if best_effort:
+            LOG.error('Exception during notification sending: %s. '
+                      'Attempting to proceed with normal operation.', e)
+        else:
+            raise e
 
 
 @rpc.if_notifications_enabled
@@ -1106,6 +1124,8 @@ def check_num_instances_quota(
     deltas = {'instances': max_count, 'cores': req_cores, 'ram': req_ram}
 
     try:
+        # NOTE(johngarbutt) when using unified limits, this is call
+        # is a no op, and as such, this function always returns max_count
         objects.Quotas.check_deltas(context, deltas,
                                     project_id, user_id=user_id,
                                     check_project_id=project_id,
@@ -1485,7 +1505,7 @@ def notify_about_instance_delete(notifier, context, instance,
                 phase=fields.NotificationPhase.END)
 
 
-def update_pci_request_spec_with_allocated_interface_name(
+def update_pci_request_with_placement_allocations(
         context, report_client, pci_requests, provider_mapping):
     """Update the instance's PCI request based on the request group -
     resource provider mapping and the device RP name from placement.
@@ -1506,12 +1526,33 @@ def update_pci_request_spec_with_allocated_interface_name(
     if not pci_requests:
         return
 
-    def needs_update(pci_request, mapping):
+    def needs_update_due_to_qos(pci_request, mapping):
         return (pci_request.requester_id and
                 pci_request.requester_id in mapping)
 
+    def get_group_mapping_for_flavor_based_pci_request(pci_request, mapping):
+        # NOTE(gibi): for flavor based PCI requests nova generates RequestGroup
+        # suffixes from InstancePCIRequests in the form of
+        # {request_id}-{count_index}
+        # NOTE(gibi): a suffixed request group always fulfilled from a single
+        # RP
+        return {
+            group_id: rp_uuids[0]
+            for group_id, rp_uuids in mapping.items()
+            if group_id.startswith(pci_request.request_id)
+        }
+
     for pci_request in pci_requests:
-        if needs_update(pci_request, provider_mapping):
+        mapping = get_group_mapping_for_flavor_based_pci_request(
+            pci_request, provider_mapping)
+
+        if mapping:
+            for spec in pci_request.spec:
+                # FIXME(gibi): this is baaad but spec is a dict of strings so
+                #  we need to serialize
+                spec['rp_uuids'] = ','.join(mapping.values())
+
+        elif needs_update_due_to_qos(pci_request, provider_mapping):
 
             provider_uuids = provider_mapping[pci_request.requester_id]
             if len(provider_uuids) != 1:

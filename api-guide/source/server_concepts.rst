@@ -95,8 +95,8 @@ are exposed to administrators:
   Refer to :nova-doc:`VM States <reference/vm-states.html>`.
 
 - task_state represents what is happening to the instance at the
-  current moment. These tasks can be generic, such as `spawning`, or specific,
-  such as `block_device_mapping`. These task states allow for a better view into
+  current moment. These tasks can be generic, such as ``spawning``, or specific,
+  such as ``block_device_mapping``. These task states allow for a better view into
   what a server is doing.
 
 Server creation
@@ -518,12 +518,12 @@ Server actions
 
 -  **Suspend**, **Resume**
 
-   Administrative users might want to suspend a server if it is
-   infrequently used or to perform system maintenance. When you suspend
-   a server, its VM state is stored on disk, all memory is written to
-   disk, and the virtual machine is stopped. Suspending a server is
-   similar to placing a device in hibernation; memory and vCPUs become
-   available to create other servers.
+   Users might want to suspend a server if it is infrequently used or
+   to perform system maintenance. When you suspend a server, its VM state
+   is stored on disk, all memory is written to disk, and the virtual machine
+   is stopped. Suspending a server is similar to placing a device in
+   hibernation and its occupied resource will not be freed but rather kept
+   for when the server is resumed.
 
    Resume will resume a suspended server to an active state.
 
@@ -1048,7 +1048,7 @@ Nova is able to write metadata to a special configuration drive that attaches
 to the server when it boots. The server can mount this drive and read files
 from it to get information that is normally available through the metadata
 service. For more details, refer to the :nova-doc:`user guide
-<user/metadata.html>`.
+<user/metadata.html#config-drives>`.
 
 User data
 ---------

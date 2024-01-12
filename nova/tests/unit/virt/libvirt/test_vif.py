@@ -12,9 +12,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
 import fixtures
 from lxml import etree
-import mock
 import os_vif
 from os_vif import exception as osv_exception
 from os_vif import objects as osv_objects
@@ -517,18 +518,17 @@ class LibvirtVifTestCase(test.NoDBTestCase):
     def setUp(self):
         super(LibvirtVifTestCase, self).setUp()
 
-        self.useFixture(nova_fixtures.LibvirtFixture(stub_os_vif=False))
+        self.libvirt = self.useFixture(
+            nova_fixtures.LibvirtFixture(stub_os_vif=False))
 
         # os_vif.initialize is typically done in nova-compute startup
         os_vif.initialize()
         self.setup_os_vif_objects()
 
         # multiqueue configuration is host OS specific
-        _a = mock.patch('os.uname')
-        self.mock_uname = _a.start()
+        self.mock_uname = self.libvirt.mock_uname
         self.mock_uname.return_value = fakelibvirt.os_uname(
             'Linux', '', '5.10.13-200-generic', '', 'x86_64')
-        self.addCleanup(_a.stop)
 
     def _get_node(self, xml):
         doc = etree.fromstring(xml)
@@ -702,17 +702,20 @@ class LibvirtVifTestCase(test.NoDBTestCase):
         image_meta = objects.ImageMeta.from_dict(
             {'properties': {'hw_vif_model': 'virtio',
                             'hw_vif_multiqueue_enabled': 'true'}})
-        flavor = objects.Flavor(name='m1.small',
-                    memory_mb=128,
-                    vcpus=4,
-                    root_gb=0,
-                    ephemeral_gb=0,
-                    swap=0,
-                    deleted_at=None,
-                    deleted=0,
-                    created_at=None, flavorid=1,
-                    is_public=True, vcpu_weight=None,
-                    id=2, disabled=False, rxtx_factor=1.0)
+        flavor = objects.Flavor(
+            id=2,
+            name='m1.small',
+            memory_mb=128,
+            vcpus=4,
+            root_gb=0,
+            ephemeral_gb=0,
+            swap=0,
+            deleted_at=None,
+            deleted=0,
+            created_at=None, flavorid=1,
+            is_public=True, vcpu_weight=None,
+            disabled=False,
+            extra_specs={})
         conf = d.get_base_config(None, 'ca:fe:de:ad:be:ef', image_meta,
                                  flavor, 'kvm', 'normal')
         self.assertEqual(4, conf.vhost_queues)
@@ -722,13 +725,46 @@ class LibvirtVifTestCase(test.NoDBTestCase):
         self.assertEqual(4, conf.vhost_queues)
         self.assertIsNone(conf.driver_name)
 
+    def _test_virtio_packed_config(self, image_meta, flavor):
+        d = vif.LibvirtGenericVIFDriver()
+
+        xml = self._get_instance_xml(d, self.vif_bridge,
+                                     image_meta, flavor)
+
+        node = self._get_node(xml)
+        packed = node.find("driver").get("packed")
+        self.assertEqual(packed, 'on')
+
+    def test_image_packed_config(self):
+        extra_specs = {}
+        extra_specs['hw:virtio_packed_ring'] = True
+
+        flavor = objects.Flavor(
+            name='foo', vcpus=2, memory_mb=1024, extra_specs=extra_specs)
+        image_meta = objects.ImageMeta.from_dict(
+            {'name': 'bar', 'properties': {}})
+
+        self._test_virtio_packed_config(image_meta, flavor)
+
+    def test_flavor_packed_config(self):
+        image_meta_props = {}
+        image_meta_props['hw_virtio_packed_ring'] = True
+
+        flavor = objects.Flavor(
+            name='foo', vcpus=2, memory_mb=1024, extra_specs={})
+        image_meta = objects.ImageMeta.from_dict(
+            {'name': 'bar', 'properties': image_meta_props})
+
+        self._test_virtio_packed_config(image_meta, flavor)
+
     def _test_virtio_config_queue_sizes(
             self, vnic_type=network_model.VNIC_TYPE_NORMAL):
         self.flags(rx_queue_size=512, group='libvirt')
         self.flags(tx_queue_size=1024, group='libvirt')
         v = vif.LibvirtGenericVIFDriver()
         conf = v.get_base_config(
-            None, 'ca:fe:de:ad:be:ef', {}, objects.Flavor(), 'kvm', vnic_type)
+            None, 'ca:fe:de:ad:be:ef', {},
+            objects.Flavor(vcpus=2), 'kvm', vnic_type)
         return v, conf
 
     def test_virtio_vhost_queue_sizes(self):
@@ -874,14 +910,28 @@ class LibvirtVifTestCase(test.NoDBTestCase):
         d = vif.LibvirtGenericVIFDriver()
         image_meta = {'properties': {'os_name': 'fedora22'}}
         image_meta = objects.ImageMeta.from_dict(image_meta)
+        flavor = objects.Flavor(
+            id=2,
+            name='m1.small',
+            memory_mb=128,
+            vcpus=4,
+            root_gb=0,
+            ephemeral_gb=0,
+            swap=0,
+            deleted_at=None,
+            deleted=0,
+            created_at=None, flavorid=1,
+            is_public=True, vcpu_weight=None,
+            disabled=False,
+            extra_specs={})
         d.get_base_config(None, 'ca:fe:de:ad:be:ef', image_meta,
-                          None, 'kvm', 'normal')
+                          flavor, 'kvm', 'normal')
         mock_set.assert_called_once_with(mock.ANY, 'ca:fe:de:ad:be:ef',
-                                         'virtio', None, None, None)
+                                         'virtio', None, None, None, False)
 
     @mock.patch.object(vif.designer, 'set_vif_guest_frontend_config',
                        wraps=vif.designer.set_vif_guest_frontend_config)
-    def _test_model_sriov(self, vinc_type, mock_set):
+    def _test_model_sriov(self, vnic_type, mock_set):
         """Direct attach vNICs shouldn't retrieve info from image_meta."""
         self.flags(use_virtio_for_bridges=True,
                    virt_type='kvm',
@@ -893,9 +943,9 @@ class LibvirtVifTestCase(test.NoDBTestCase):
         image_meta = objects.ImageMeta.from_dict(
             {'properties': {'hw_vif_model': 'virtio'}})
         conf = d.get_base_config(None, 'ca:fe:de:ad:be:ef', image_meta,
-                                 None, 'kvm', vinc_type)
+                                 objects.Flavor(vcpus=2), 'kvm', vnic_type)
         mock_set.assert_called_once_with(mock.ANY, 'ca:fe:de:ad:be:ef',
-                                         None, None, None, None)
+                                         None, None, None, None, False)
         self.assertIsNone(conf.vhost_queues)
         self.assertIsNone(conf.driver_name)
         self.assertIsNone(conf.model)
@@ -965,14 +1015,9 @@ class LibvirtVifTestCase(test.NoDBTestCase):
                                   self.vif_bridge,
                                   self.vif_bridge['network']['bridge'])
 
-    @mock.patch.object(pci_utils, 'get_ifname_by_pci_address')
-    @mock.patch.object(pci_utils, 'get_vf_num_by_pci_address', return_value=1)
-    @mock.patch('nova.privsep.linux_net.set_device_macaddr')
-    @mock.patch('nova.privsep.linux_net.set_device_macaddr_and_vlan')
-    def _test_hw_veb_op(self, op, vlan, mock_set_macaddr_and_vlan,
-                        mock_set_macaddr, mock_get_vf_num,
-                        mock_get_ifname):
-        mock_get_ifname.side_effect = ['eth1', 'eth13']
+    def _test_hw_veb_op(self, op, vlan):
+        self.libvirt.mock_get_vf_num_by_pci_address.return_value = 1
+        pci_utils.get_ifname_by_pci_address.side_effect = ['eth1', 'eth13']
         vlan_id = int(vlan)
         port_state = 'up' if vlan_id > 0 else 'down'
         mac = ('00:00:00:00:00:00' if op.__name__ == 'unplug'
@@ -987,10 +1032,13 @@ class LibvirtVifTestCase(test.NoDBTestCase):
             'set_macaddr': [mock.call('eth13', mac, port_state=port_state)]
         }
         op(self.instance, self.vif_hw_veb_macvtap)
-        mock_get_ifname.assert_has_calls(calls['get_ifname'])
-        mock_get_vf_num.assert_has_calls(calls['get_vf_num'])
-        mock_set_macaddr.assert_has_calls(calls['set_macaddr'])
-        mock_set_macaddr_and_vlan.assert_called_once_with(
+        pci_utils.get_ifname_by_pci_address.assert_has_calls(
+            calls['get_ifname'])
+        self.libvirt.mock_get_vf_num_by_pci_address.assert_has_calls(
+            calls['get_vf_num'])
+        self.libvirt.mock_set_device_macaddr.assert_has_calls(
+            calls['set_macaddr'])
+        self.libvirt.mock_set_device_macaddr_and_vlan.assert_called_once_with(
             'eth1', 1, mock.ANY, vlan_id)
 
     def test_plug_hw_veb(self):
@@ -1089,9 +1137,9 @@ class LibvirtVifTestCase(test.NoDBTestCase):
         mq_ins = objects.Instance(
             id=1, uuid='f0000000-0000-0000-0000-000000000001',
             image_ref=uuids.image_ref, flavor=self.flavor_2vcpu,
-            project_id=723, system_metadata={
+            system_metadata={
                 'image_hw_vif_multiqueue_enabled': 'True'
-            }
+            },
         )
         d2.plug(mq_ins, self.vif_tap)
         mock_create_tap_dev.assert_called_once_with(
@@ -1129,9 +1177,10 @@ class LibvirtVifTestCase(test.NoDBTestCase):
         ins = objects.Instance(
             id=1, uuid='f0000000-0000-0000-0000-000000000001',
             image_ref=uuids.image_ref, flavor=self.flavor_2vcpu,
-            project_id=723, system_metadata={
+            project_id=723,
+            system_metadata={
                 'image_hw_vif_multiqueue_enabled': 'True'
-            }
+            },
         )
         d1.plug(ins, self.vif_tap)
         mock_create_tap_dev.assert_called_once_with(
@@ -1147,10 +1196,11 @@ class LibvirtVifTestCase(test.NoDBTestCase):
         ins = objects.Instance(
             id=1, uuid='f0000000-0000-0000-0000-000000000001',
             image_ref=uuids.image_ref, flavor=self.flavor_2vcpu,
-            project_id=723, system_metadata={
+            project_id=723,
+            system_metadata={
                 'image_hw_vif_multiqueue_enabled': 'True',
                 'image_hw_vif_model': 'e1000',
-            }
+            },
         )
         d1.plug(ins, self.vif_tap)
         mock_create_tap_dev.assert_called_once_with(
@@ -1198,9 +1248,8 @@ class LibvirtVifTestCase(test.NoDBTestCase):
         self.assertEqual(1, len(node))
         self._assertPciEqual(node, self.vif_hostdev_physical)
 
-    @mock.patch.object(pci_utils, 'get_ifname_by_pci_address',
-                       return_value='eth1')
-    def test_hw_veb_driver_macvtap(self, mock_get_ifname):
+    def test_hw_veb_driver_macvtap(self):
+        pci_utils.get_ifname_by_pci_address.return_value = 'eth1'
         d = vif.LibvirtGenericVIFDriver()
         xml = self._get_instance_xml(d, self.vif_hw_veb_macvtap)
         node = self._get_node(xml)

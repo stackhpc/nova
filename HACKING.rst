@@ -63,7 +63,7 @@ Nova Specific Commandments
   assertNotRegexpMatches
 - [N362] Imports for privsep modules should be specific. Use "import nova.privsep.path",
   not "from nova.privsep import path". This ensures callers know that the method they're
-  calling is using priviledge escalation.
+  calling is using privilege escalation.
 - [N363] Disallow ``(not_a_tuple)`` because you meant ``(a_tuple_of_one,)``.
 - [N364] Check non-existent mock assertion methods and attributes.
 - [N365] Check misuse of assertTrue/assertIsNone.
@@ -71,6 +71,12 @@ Nova Specific Commandments
 - [N367] Disallow aliasing the mock.Mock and similar classes in tests.
 - [N368] Reject if the mock.Mock class is used as a replacement value instead of and
   instance of a mock.Mock during patching in tests.
+- [N369] oslo_concurrency.lockutils.ReaderWriterLock() or
+  fasteners.ReaderWriterLock() does not function correctly
+  with eventlet patched code. Use nova.utils.ReaderWriterLock() instead.
+- [N370] Don't use or import six
+- [N371] You must explicitly import python's mock: ``from unittest import mock``
+- [N372] Don't use the setDaemon method. Use the daemon attribute instead.
 
 Creating Unit Tests
 -------------------

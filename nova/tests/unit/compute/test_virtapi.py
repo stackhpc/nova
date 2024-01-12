@@ -13,8 +13,9 @@
 #    under the License.
 
 import collections
+from unittest import mock
 
-import mock
+import eventlet.timeout
 import os_traits
 from oslo_utils.fixture import uuidsentinel as uuids
 
@@ -131,7 +132,8 @@ class ComputeVirtAPITest(VirtAPIBaseTest):
                           [('foo', 'bar'),
                            ('foo', 'baz')])
 
-    def test_wait_for_instance_event(self):
+    @mock.patch.object(compute_manager, 'LOG')
+    def test_wait_for_instance_event(self, mock_log):
         and_i_ran = ''
         event_1_tag = objects.InstanceExternalEvent.make_key(
             'event1')
@@ -150,6 +152,9 @@ class ComputeVirtAPITest(VirtAPIBaseTest):
             self.assertEqual('instance', event.instance)
             self.assertIn((event.name, event.tag), events.keys())
             event.wait.assert_called_once_with()
+        mock_log.debug.assert_called_once_with(
+            'Instance event wait completed in %i seconds for %s',
+            mock.ANY, 'event1,event2', instance=event.instance)
 
     def test_wait_for_instance_event_failed(self):
         def _failer():
@@ -182,16 +187,159 @@ class ComputeVirtAPITest(VirtAPIBaseTest):
 
         do_test()
 
+    @mock.patch(
+        'oslo_utils.timeutils.StopWatch.elapsed',
+        new=mock.Mock(return_value=1.23))
     def test_wait_for_instance_event_timeout(self):
+        instance = mock.Mock()
+        instance.vm_state = mock.sentinel.vm_state
+        instance.task_state = mock.sentinel.task_state
+
+        mock_log = mock.Mock()
+
+        @mock.patch.object(compute_manager, 'LOG', new=mock_log)
         @mock.patch.object(self.virtapi._compute, '_event_waiter',
-                           side_effect=test.TestingException())
-        @mock.patch('eventlet.timeout.Timeout')
-        def do_test(mock_timeout, mock_waiter):
-            with self.virtapi.wait_for_instance_event('instance',
-                                                      [('foo', 'bar')]):
+                           side_effect=eventlet.timeout.Timeout())
+        def do_test(mock_waiter):
+            with self.virtapi.wait_for_instance_event(
+                    instance, [('foo', 'bar')]):
                 pass
 
-        self.assertRaises(test.TestingException, do_test)
+        self.assertRaises(eventlet.timeout.Timeout, do_test)
+        mock_log.warning.assert_called_once_with(
+            'Timeout waiting for %(events)s for instance with vm_state '
+            '%(vm_state)s and task_state %(task_state)s. '
+            'Event states are: %(event_states)s',
+            {
+                'events': ['foo-bar'],
+                'vm_state': mock.sentinel.vm_state,
+                'task_state': mock.sentinel.task_state,
+                'event_states':
+                    'foo-bar: timed out after 1.23 seconds',
+            },
+            instance=instance
+        )
+
+    @mock.patch(
+        'oslo_utils.timeutils.StopWatch.elapsed',
+        new=mock.Mock(return_value=1.23))
+    def test_wait_for_instance_event_one_received_one_timed_out(self):
+        instance = mock.Mock()
+        instance.vm_state = mock.sentinel.vm_state
+        instance.task_state = mock.sentinel.task_state
+
+        mock_log = mock.Mock()
+
+        calls = []
+
+        def fake_event_waiter(*args, **kwargs):
+            calls.append((args, kwargs))
+            if len(calls) == 1:
+                event = mock.Mock(status="completed")
+                return event
+            else:
+                raise eventlet.timeout.Timeout()
+
+        @mock.patch.object(compute_manager, 'LOG', new=mock_log)
+        @mock.patch.object(self.virtapi._compute, '_event_waiter',
+                           side_effect=fake_event_waiter)
+        def do_test(mock_waiter):
+            with self.virtapi.wait_for_instance_event(
+                    instance, [('foo', 'bar'), ('missing', 'event')]):
+                pass
+
+        self.assertRaises(eventlet.timeout.Timeout, do_test)
+        mock_log.warning.assert_called_once_with(
+            'Timeout waiting for %(events)s for instance with vm_state '
+            '%(vm_state)s and task_state %(task_state)s. '
+            'Event states are: %(event_states)s',
+            {
+                'events': ['foo-bar', 'missing-event'],
+                'vm_state': mock.sentinel.vm_state,
+                'task_state': mock.sentinel.task_state,
+                'event_states':
+                    'foo-bar: received after waiting 1.23 seconds, '
+                    'missing-event: timed out after 1.23 seconds',
+            },
+            instance=instance
+        )
+
+    @mock.patch(
+        'oslo_utils.timeutils.StopWatch.elapsed',
+        new=mock.Mock(return_value=1.23))
+    def test_wait_for_instance_event_multiple_events(self):
+        instance = mock.Mock()
+        instance.vm_state = mock.sentinel.vm_state
+        instance.task_state = mock.sentinel.task_state
+
+        mock_log = mock.Mock()
+
+        calls = []
+
+        def fake_event_waiter(*args, **kwargs):
+            calls.append((args, kwargs))
+            if len(calls) == 1:
+                event = mock.Mock(status="completed")
+                return event
+            else:
+                raise eventlet.timeout.Timeout()
+
+        def fake_prepare_for_instance_event(instance, name, tag):
+            m = mock.MagicMock()
+            m.instance = instance
+            m.name = name
+            m.tag = tag
+            m.event_name = '%s-%s' % (name, tag)
+            m.wait.side_effect = fake_event_waiter
+            if name == 'received-but-not-waited':
+                m.ready.return_value = True
+            if name == 'missing-but-not-waited':
+                m.ready.return_value = False
+            return m
+
+        self.virtapi._compute.instance_events.prepare_for_instance_event.\
+            side_effect = fake_prepare_for_instance_event
+
+        @mock.patch.object(compute_manager, 'LOG', new=mock_log)
+        def do_test():
+            with self.virtapi.wait_for_instance_event(
+                    instance,
+                    [
+                        ('received', 'event'),
+                        ('early', 'event'),
+                        ('missing', 'event'),
+                        ('received-but-not-waited', 'event'),
+                        ('missing-but-not-waited', 'event'),
+                    ]
+            ):
+                self.virtapi.exit_wait_early([('early', 'event')])
+
+        self.assertRaises(eventlet.timeout.Timeout, do_test)
+        mock_log.warning.assert_called_once_with(
+            'Timeout waiting for %(events)s for instance with vm_state '
+            '%(vm_state)s and task_state %(task_state)s. '
+            'Event states are: %(event_states)s',
+            {
+                'events':
+                    [
+                        'received-event',
+                        'early-event',
+                        'missing-event',
+                        'received-but-not-waited-event',
+                        'missing-but-not-waited-event'
+                     ],
+                'vm_state': mock.sentinel.vm_state,
+                'task_state': mock.sentinel.task_state,
+                'event_states':
+                    'received-event: received after waiting 1.23 seconds, '
+                    'early-event: received early, '
+                    'missing-event: timed out after 1.23 seconds, '
+                    'received-but-not-waited-event: received but not '
+                    'processed, '
+                    'missing-but-not-waited-event: expected but not received'
+            },
+            instance=instance
+        )
 
     def test_wait_for_instance_event_exit_early(self):
         # Wait for two events, exit early skipping one.

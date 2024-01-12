@@ -32,6 +32,7 @@ import fixtures
 import os_resource_classes as orc
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
+from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import versionutils
 
 from nova.compute import power_state
@@ -48,6 +49,7 @@ from nova.objects import migrate_data
 from nova.virt import driver
 from nova.virt import hardware
 from nova.virt.ironic import driver as ironic
+import nova.virt.node
 from nova.virt import virtapi
 
 CONF = nova.conf.CONF
@@ -116,6 +118,9 @@ class FakeDriver(driver.ComputeDriver):
         "supports_trusted_certs": True,
         "supports_pcpus": False,
         "supports_accelerators": True,
+        "supports_remote_managed_ports": True,
+        "supports_address_space_passthrough": True,
+        "supports_address_space_emulated": True,
 
         # Supported image types
         "supports_image_type_raw": True,
@@ -159,8 +164,8 @@ class FakeDriver(driver.ComputeDriver):
         self._host = host
         # NOTE(gibi): this is unnecessary complex and fragile but this is
         # how many current functional sample tests expect the node name.
-        self._nodes = (['fake-mini'] if self._host == 'compute'
-                       else [self._host])
+        self._set_nodes(['fake-mini'] if self._host == 'compute'
+                        else [self._host])
 
     def _set_nodes(self, nodes):
         # NOTE(gibi): this is not part of the driver interface but used
@@ -503,6 +508,12 @@ class FakeDriver(driver.ComputeDriver):
         host_status['host_hostname'] = nodename
         host_status['host_name_label'] = nodename
         host_status['cpu_info'] = jsonutils.dumps(cpu_info)
+        # NOTE(danms): Because the fake driver runs on the same host
+        # in tests, potentially with multiple nodes, we need to
+        # control our node uuids. Make sure we return a unique and
+        # consistent uuid for each node we are responsible for to
+        # avoid the persistent local node identity from taking over.
+        host_status['uuid'] = str(getattr(uuids, 'node_%s' % nodename))
         return host_status
 
     def update_provider_tree(self, provider_tree, nodename, allocations=None):
@@ -591,7 +602,7 @@ class FakeDriver(driver.ComputeDriver):
                          allocations, block_device_info=None, power_on=True):
         injected_files = admin_password = None
         # Finish migration is just like spawning the guest on a destination
-        # host during resize/cold migrate, so re-use the spawn() fake to
+        # host during resize/cold migrate, so reuse the spawn() fake to
         # claim resources and track the instance on this "hypervisor".
         self.spawn(context, instance, image_meta, injected_files,
                    admin_password, allocations,
@@ -644,6 +655,10 @@ class FakeDriver(driver.ComputeDriver):
 
     def get_available_nodes(self, refresh=False):
         return self._nodes
+
+    def get_nodenames_by_uuid(self, refresh=False):
+        return {str(getattr(uuids, 'node_%s' % n)): n
+                for n in self.get_available_nodes()}
 
     def instance_on_disk(self, instance):
         return False
@@ -757,12 +772,13 @@ class PredictableNodeUUIDDriver(SmallFakeDriver):
     """SmallFakeDriver variant that reports a predictable node uuid in
     get_available_resource, like IronicDriver.
     """
+
     def get_available_resource(self, nodename):
         resources = super(
             PredictableNodeUUIDDriver, self).get_available_resource(nodename)
         # This is used in ComputeNode.update_from_virt_driver which is called
         # from the ResourceTracker when creating a ComputeNode.
-        resources['uuid'] = uuid.uuid5(uuid.NAMESPACE_DNS, nodename)
+        resources['uuid'] = str(uuid.uuid5(uuid.NAMESPACE_DNS, nodename))
         return resources
 
 
@@ -798,6 +814,7 @@ class FakeBuildAbortDriver(FakeDriver):
     """FakeDriver derivative that always fails on spawn() with a
     BuildAbortException so no reschedule is attempted.
     """
+
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
               block_device_info=None, power_on=True, accel_info=None):
@@ -814,6 +831,7 @@ class FakeUnshelveSpawnFailDriver(FakeDriver):
     """FakeDriver derivative that always fails on spawn() with a
     VirtualInterfaceCreateException when unshelving an offloaded instance.
     """
+
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
               block_device_info=None, power_on=True, accel_info=None):
@@ -887,6 +905,36 @@ class FakeLiveMigrateDriverWithNestedCustomResources(
 
 
 class FakeDriverWithPciResources(SmallFakeDriver):
+    """NOTE: this driver provides symmetric compute nodes. Each compute will
+    have the same resources with the same addresses. It is dangerous as using
+    this driver can hide issues when in an asymmetric environment nova fails to
+    update entities according to the host specific addresses (e.g. pci_slot of
+    the neutron port bindings).
+
+    The current non virt driver specific functional test environment has many
+    shortcomings making it really hard to simulate host specific virt drivers.
+
+    1) The virt driver is instantiated by the service logic from the name of
+    the driver class. This makes passing input to the driver instance from the
+    test at init time pretty impossible. This could be solved with some
+    fixtures around nova.virt.driver.load_compute_driver()
+
+    2) The compute service access the hypervisor not only via the virt
+    interface but also reads the sysfs of the host. So simply providing a fake
+    virt driver instance is not enough to isolate simulated compute services
+    that are running on the same host. Also these low level sysfs reads are not
+    having host specific information in the call params. So simply mocking the
+    low level call does not give a way to provide host specific return values.
+
+    3) CONF is global, and it is read dynamically by the driver. So
+    providing host specific CONF to driver instances without race conditions
+    between the drivers are extremely hard especially if periodic tasks are
+    enabled.
+
+    The libvirt based functional test env under nova.tests.functional.libvirt
+    has better support to create asymmetric environments. So please consider
+    using that if possible instead.
+    """
 
     PCI_ADDR_PF1 = '0000:01:00.0'
     PCI_ADDR_PF1_VF1 = '0000:01:00.1'
@@ -902,7 +950,7 @@ class FakeDriverWithPciResources(SmallFakeDriver):
         def setUp(self):
             super(FakeDriverWithPciResources.
                   FakeDriverWithPciResourcesConfigFixture, self).setUp()
-            # Set passthrough_whitelist before the compute node starts to match
+            # Set device_spec before the compute node starts to match
             # with the PCI devices reported by this fake driver.
 
             # NOTE(gibi): 0000:01:00 is tagged to physnet1 and therefore not a
@@ -917,7 +965,7 @@ class FakeDriverWithPciResources(SmallFakeDriver):
             # Having two PFs on the same physnet will allow us to test the
             # placement allocation - physical allocation matching based on the
             # bandwidth allocation in the future.
-            CONF.set_override('passthrough_whitelist', override=[
+            CONF.set_override('device_spec', override=[
                 jsonutils.dumps(
                     {
                         "address": {
@@ -950,6 +998,19 @@ class FakeDriverWithPciResources(SmallFakeDriver):
                 ),
             ],
                              group='pci')
+
+            # These mocks should be removed after bug
+            # https://bugs.launchpad.net/nova/+bug/1961587 has been fixed and
+            # every SRIOV device related information is transferred through the
+            # virt driver and the PciDevice object instead of queried with
+            # sysfs calls by the network.neutron.API code.
+            self.useFixture(fixtures.MockPatch(
+                'nova.pci.utils.get_mac_by_pci_address',
+                return_value='52:54:00:1e:59:c6'))
+
+            self.useFixture(fixtures.MockPatch(
+                'nova.pci.utils.get_vf_num_by_pci_address',
+                return_value=1))
 
     def get_available_resource(self, nodename):
         host_status = super(
@@ -1052,3 +1113,42 @@ class FakeDriverWithCaching(FakeDriver):
         else:
             self.cached_images.add(image_id)
             return True
+
+
+class EphEncryptionDriver(MediumFakeDriver):
+    capabilities = dict(
+        FakeDriver.capabilities,
+        supports_ephemeral_encryption=True)
+
+
+class EphEncryptionDriverLUKS(MediumFakeDriver):
+    capabilities = dict(
+        FakeDriver.capabilities,
+        supports_ephemeral_encryption=True,
+        supports_ephemeral_encryption_luks=True)
+
+
+class EphEncryptionDriverPLAIN(MediumFakeDriver):
+    capabilities = dict(
+        FakeDriver.capabilities,
+        supports_ephemeral_encryption=True,
+        supports_ephemeral_encryption_plain=True)
+
+
+class FakeDriverWithoutFakeNodes(FakeDriver):
+    """FakeDriver that behaves like a real single-node driver.
+
+    This behaves like a real virt driver from the perspective of its
+    nodes, with a stable nodename and use of the global node identity
+    stuff to provide a stable node UUID.
+    """
+
+    def get_available_resource(self, nodename):
+        resources = super().get_available_resource(nodename)
+        resources['uuid'] = nova.virt.node.get_local_node_uuid()
+        return resources
+
+    def get_nodenames_by_uuid(self, refresh=False):
+        return {
+            nova.virt.node.get_local_node_uuid(): self.get_available_nodes()[0]
+        }

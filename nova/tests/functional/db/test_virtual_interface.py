@@ -11,7 +11,8 @@
 #    under the License.
 
 import datetime
-import mock
+from unittest import mock
+
 from oslo_config import cfg
 from oslo_utils import timeutils
 
@@ -235,7 +236,7 @@ class VirtualInterfaceListMigrationTestCase(
         match, done = virtual_interface.fill_virtual_interface_list(
             self.context, 5)
 
-        # I don't know whats going on so instance VirtualInterfaceList
+        # I don't know what's going on so instance VirtualInterfaceList
         # should stay untouched.
         self.assertEqual(1, match)
         self.assertEqual(0, done)

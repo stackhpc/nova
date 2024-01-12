@@ -38,7 +38,7 @@ DEPRECATED_BAREMETAL_POLICY = policy.DeprecatedRule(
 baremetal_nodes_policies = [
     policy.DocumentedRuleDefault(
         name=BASE_POLICY_NAME % 'list',
-        check_str=base.SYSTEM_READER,
+        check_str=base.ADMIN,
         description="""List and show details of bare metal nodes.
 
 These APIs are proxy calls to the Ironic service and are deprecated.
@@ -49,11 +49,11 @@ These APIs are proxy calls to the Ironic service and are deprecated.
                 'path': '/os-baremetal-nodes'
             }
         ],
-        scope_types=['system'],
+        scope_types=['project'],
         deprecated_rule=DEPRECATED_BAREMETAL_POLICY),
     policy.DocumentedRuleDefault(
         name=BASE_POLICY_NAME % 'show',
-        check_str=base.SYSTEM_READER,
+        check_str=base.ADMIN,
         description="""Show action details for a server.""",
         operations=[
             {
@@ -61,7 +61,7 @@ These APIs are proxy calls to the Ironic service and are deprecated.
                 'path': '/os-baremetal-nodes/{node_id}'
             }
         ],
-        scope_types=['system'],
+        scope_types=['project'],
         deprecated_rule=DEPRECATED_BAREMETAL_POLICY)
 ]
 

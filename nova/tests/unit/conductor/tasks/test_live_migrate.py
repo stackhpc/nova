@@ -10,7 +10,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 import oslo_messaging as messaging
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel as uuids
@@ -345,6 +346,36 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
                           mock.call(self.destination)],
                          mock_get_info.call_args_list)
 
+    @mock.patch.object(live_migrate.LiveMigrationTask, '_get_compute_info')
+    def test_skip_hypervisor_version_check_on_lm_raise_ex(self, mock_get_info):
+        host1 = {'hypervisor_type': 'a', 'hypervisor_version': 7}
+        host2 = {'hypervisor_type': 'a', 'hypervisor_version': 6}
+        self.flags(group='workarounds',
+                   skip_hypervisor_version_check_on_lm=False)
+        mock_get_info.side_effect = [objects.ComputeNode(**host1),
+                                     objects.ComputeNode(**host2)]
+        self.assertRaises(exception.DestinationHypervisorTooOld,
+                          self.task._check_compatible_with_source_hypervisor,
+                          self.destination)
+        self.assertEqual([mock.call(self.instance_host),
+                          mock.call(self.destination)],
+                         mock_get_info.call_args_list)
+
+    @mock.patch.object(live_migrate.LiveMigrationTask, '_get_compute_info')
+    def test_skip_hypervisor_version_check_on_lm_do_not_raise_ex(
+        self, mock_get_info
+    ):
+        host1 = {'hypervisor_type': 'a', 'hypervisor_version': 7}
+        host2 = {'hypervisor_type': 'a', 'hypervisor_version': 6}
+        self.flags(group='workarounds',
+                   skip_hypervisor_version_check_on_lm=True)
+        mock_get_info.side_effect = [objects.ComputeNode(**host1),
+                                     objects.ComputeNode(**host2)]
+        self.task._check_compatible_with_source_hypervisor(self.destination)
+        self.assertEqual([mock.call(self.instance_host),
+                          mock.call(self.destination)],
+                         mock_get_info.call_args_list)
+
     @mock.patch.object(compute_rpcapi.ComputeAPI,
                        'check_can_live_migrate_destination')
     def test_check_requested_destination(self, mock_check):
@@ -353,7 +384,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
 
         with test.nested(
             mock.patch.object(self.task.network_api,
-                              'supports_port_binding_extension',
+                              'has_port_binding_extension',
                               return_value=False),
             mock.patch.object(self.task, '_check_can_migrate_pci')):
             self.assertIsNone(self.task._check_requested_destination())
@@ -387,7 +418,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
 
         with test.nested(
             mock.patch.object(self.task.network_api,
-                              'supports_port_binding_extension',
+                              'has_port_binding_extension',
                               return_value=False),
             mock.patch.object(self.task, '_check_can_migrate_pci')):
             ex = self.assertRaises(exception.MigrationPreCheckError,
@@ -730,7 +761,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
 
     @mock.patch(
         'nova.compute.utils.'
-        'update_pci_request_spec_with_allocated_interface_name')
+        'update_pci_request_with_placement_allocations')
     @mock.patch('nova.scheduler.utils.fill_provider_mapping')
     @mock.patch.object(live_migrate.LiveMigrationTask,
                        '_call_livem_checks_on_host')
@@ -813,7 +844,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
         """
 
         @mock.patch.object(self.task.network_api,
-                           'supports_port_binding_extension')
+                           'has_port_binding_extension')
         @mock.patch.object(live_migrate,
                            'supports_vif_related_pci_allocations')
         def _test(instance_pci_reqs,
@@ -827,7 +858,7 @@ class LiveMigrationTaskTestCase(test.NoDBTestCase):
                 supp_binding_ext_retval
             self.task.instance.pci_requests = instance_pci_reqs
             self.task._check_can_migrate_pci("Src", "Dst")
-            # in case we managed to get away without rasing, check mocks
+            # in case we managed to get away without raising, check mocks
             if instance_pci_reqs:
                 mock_supp_port_binding_ext.assert_called_once_with(
                     self.context)

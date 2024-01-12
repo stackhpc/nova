@@ -17,13 +17,14 @@
 import collections
 import copy
 import datetime
+from unittest import mock
+
 import ddt
 import functools
 from urllib import parse as urlparse
 
 import fixtures
 import iso8601
-import mock
 from oslo_policy import policy as oslo_policy
 from oslo_serialization import base64
 from oslo_serialization import jsonutils
@@ -389,17 +390,36 @@ class ServersControllerTest(_ServersControllerTest):
                           (network, None, None, None, None, None)],
                           res.as_tuples())
 
-    def test_requested_networks_enabled_conflict_on_fixed_ip(self):
-        network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+    def test_requested_networks_duplicate_ports(self):
+        """The same port can't be specified twice."""
         port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
-        addr = '10.0.0.1'
-        requested_networks = [{'uuid': network,
-                               'fixed_ip': addr,
-                               'port': port}]
-        self.assertRaises(
+        requested_networks = [{'port': port}, {'port': port}]
+        exc = self.assertRaises(
             webob.exc.HTTPBadRequest,
             self.controller._get_requested_networks,
-            requested_networks)
+            requested_networks,
+        )
+        self.assertIn(
+            "Port ID 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee' was specified "
+            "twice",
+            str(exc),
+        )
+
+    def test_requested_networks_conflict_on_fixed_ip(self):
+        """A fixed IP can't be specified at the same as a port ID."""
+        port = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+        addr = '10.0.0.1'
+        requested_networks = [{'fixed_ip': addr, 'port': port}]
+        exc = self.assertRaises(
+            webob.exc.HTTPBadRequest,
+            self.controller._get_requested_networks,
+            requested_networks,
+        )
+        self.assertIn(
+            "Specified Fixed IP '10.0.0.1' cannot be used with port "
+            "'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'",
+            str(exc),
+        )
 
     def test_requested_networks_api_enabled_with_v2_subclass(self):
         network = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
@@ -417,7 +437,8 @@ class ServersControllerTest(_ServersControllerTest):
         def fake_get(*args, **kwargs):
             expected_attrs = kwargs['expected_attrs']
             self.assertEqual(['flavor', 'info_cache', 'metadata',
-                              'numa_topology'], expected_attrs)
+                              'numa_topology', 'services'],
+                              expected_attrs)
             ctxt = context.RequestContext('fake', self.project_id)
             return fake_instance.fake_instance_obj(
                 ctxt, expected_attrs=expected_attrs,
@@ -492,7 +513,8 @@ class ServersControllerTest(_ServersControllerTest):
         self.mock_get.assert_called_once_with(
             self.request.environ['nova.context'], FAKE_UUID,
             expected_attrs=['flavor', 'info_cache', 'metadata',
-                            'numa_topology'], cell_down_support=False)
+                            'numa_topology', 'services'],
+                            cell_down_support=False)
 
     def test_get_server_with_id_image_ref_by_id(self):
         image_bookmark = "http://localhost/%s/images/%s" % (
@@ -511,7 +533,8 @@ class ServersControllerTest(_ServersControllerTest):
         self.mock_get.assert_called_once_with(
             self.request.environ['nova.context'], FAKE_UUID,
             expected_attrs=['flavor', 'info_cache', 'metadata',
-                            'numa_topology'], cell_down_support=False)
+                            'numa_topology', 'services'],
+                            cell_down_support=False)
 
     def _generate_nw_cache_info(self):
         pub0 = ('172.19.0.1', '172.19.0.2',)
@@ -2068,10 +2091,10 @@ class ServersControllerTestV216(_ServersControllerTest):
 
         return server_dict
 
-    @mock.patch('nova.compute.api.API.get_instance_host_status')
-    def _verify_host_status_policy_behavior(self, func, mock_get_host_status):
+    def _verify_host_status_policy_behavior(self, func):
         # Set policy to disallow both host_status cases and verify we don't
         # call the get_instance_host_status compute RPC API.
+        self.mock_get_instance_host_status.reset_mock()
         rules = {
             'os_compute_api:servers:show:host_status': '!',
             'os_compute_api:servers:show:host_status:unknown-only': '!',
@@ -2079,7 +2102,7 @@ class ServersControllerTestV216(_ServersControllerTest):
         orig_rules = policy.get_rules()
         policy.set_rules(oslo_policy.Rules.from_dict(rules), overwrite=False)
         func()
-        mock_get_host_status.assert_not_called()
+        self.mock_get_instance_host_status.assert_not_called()
         # Restore the original rules.
         policy.set_rules(orig_rules)
 
@@ -2619,15 +2642,13 @@ class ServersControllerTestV275(ControllerTest):
 
     microversion = '2.75'
 
-    @mock.patch('nova.compute.api.API.get_all')
-    def test_get_servers_additional_query_param_old_version(self, mock_get):
+    def test_get_servers_additional_query_param_old_version(self):
         req = fakes.HTTPRequest.blank(self.path_with_query % 'unknown=1',
                                       use_admin_context=True,
                                       version='2.74')
         self.controller.index(req)
 
-    @mock.patch('nova.compute.api.API.get_all')
-    def test_get_servers_ignore_sort_key_old_version(self, mock_get):
+    def test_get_servers_ignore_sort_key_old_version(self):
         req = fakes.HTTPRequest.blank(
                 self.path_with_query % 'sort_key=deleted',
                 use_admin_context=True, version='2.74')
@@ -3565,13 +3586,13 @@ class ServersControllerRebuildTestV263(ControllerTest):
             },
         }
 
-    @mock.patch('nova.compute.api.API.get')
-    def _rebuild_server(self, mock_get, certs=None,
-                        conf_enabled=True, conf_certs=None):
+    def _rebuild_server(self, certs=None, conf_enabled=True, conf_certs=None):
         ctx = self.req.environ['nova.context']
-        mock_get.return_value = fakes.stub_instance_obj(ctx,
-            vm_state=vm_states.ACTIVE, trusted_certs=certs,
-            project_id=self.req_project_id, user_id=self.req_user_id)
+        self.mock_get.side_effect = None
+        self.mock_get.return_value = fakes.stub_instance_obj(
+            ctx, vm_state=vm_states.ACTIVE, trusted_certs=certs,
+            project_id=self.req_project_id, user_id=self.req_user_id
+        )
 
         self.flags(default_trusted_certificate_ids=conf_certs, group='glance')
 
@@ -3724,10 +3745,10 @@ class ServersControllerRebuildTestV271(ControllerTest):
             }
         }
 
-    @mock.patch('nova.compute.api.API.get')
-    def _rebuild_server(self, mock_get):
+    def _rebuild_server(self):
         ctx = self.req.environ['nova.context']
-        mock_get.return_value = fakes.stub_instance_obj(ctx,
+        self.mock_get.side_effect = None
+        self.mock_get.return_value = fakes.stub_instance_obj(ctx,
             vm_state=vm_states.ACTIVE, project_id=self.req_project_id,
             user_id=self.req_user_id)
         server = self.controller._action_rebuild(
@@ -6789,6 +6810,7 @@ class ServersControllerCreateTestV237(test.NoDBTestCase):
     These tests are mostly about testing the validation on the 2.37
     server create request with emphasis on negative scenarios.
     """
+
     def setUp(self):
         super(ServersControllerCreateTestV237, self).setUp()
         # Create the server controller.
@@ -6989,6 +7011,7 @@ class ServersControllerCreateTestV257(test.NoDBTestCase):
             new=lambda *args, **kwargs: 1)
 class ServersControllerCreateTestV260(test.NoDBTestCase):
     """Negative tests for creating a server with a multiattach volume."""
+
     def setUp(self):
         super(ServersControllerCreateTestV260, self).setUp()
         self.useFixture(nova_fixtures.NoopQuotaDriverFixture())
@@ -8002,7 +8025,7 @@ class ServersViewBuilderTestV269(_ServersViewBuilderTest):
             version=self.microversion)
 
     def test_get_server_list_detail_with_down_cells(self):
-        # Fake out 1 partially constructued instance and one full instance.
+        # Fake out 1 partially constructed instance and one full instance.
         self.instances = [
                 self.instance,
                 objects.Instance(
@@ -8130,7 +8153,7 @@ class ServersViewBuilderTestV269(_ServersViewBuilderTest):
         self.assertThat(output, matchers.DictMatches(expected))
 
     def test_get_server_list_with_down_cells(self):
-        # Fake out 1 partially constructued instance and one full instance.
+        # Fake out 1 partially constructed instance and one full instance.
         self.instances = [
                 self.instance,
                 objects.Instance(
@@ -8182,7 +8205,7 @@ class ServersViewBuilderTestV269(_ServersViewBuilderTest):
         self.assertThat(output, matchers.DictMatches(expected))
 
     def test_get_server_with_down_cells(self):
-        # Fake out 1 partially constructued instance.
+        # Fake out 1 partially constructed instance.
         self.instance = objects.Instance(
             context=self.ctxt,
             uuid=self.uuid,
@@ -8245,7 +8268,7 @@ class ServersViewBuilderTestV269(_ServersViewBuilderTest):
         self.assertThat(output, matchers.DictMatches(expected))
 
     def test_get_server_without_image_avz_user_id_set_from_down_cells(self):
-        # Fake out 1 partially constructued instance.
+        # Fake out 1 partially constructed instance.
         self.instance = objects.Instance(
             context=self.ctxt,
             uuid=self.uuid,

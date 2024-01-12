@@ -27,10 +27,8 @@ from oslo_log import log as logging
 from oslo_utils import excutils
 from oslo_utils import units
 from oslo_utils import versionutils as v_utils
-from oslo_vmware import api
 from oslo_vmware import exceptions as vexc
 from oslo_vmware import pbm
-from oslo_vmware import vim
 from oslo_vmware import vim_util
 
 from nova.compute import power_state
@@ -47,6 +45,7 @@ from nova.virt.vmwareapi import constants
 from nova.virt.vmwareapi import ds_util
 from nova.virt.vmwareapi import error_util
 from nova.virt.vmwareapi import host
+from nova.virt.vmwareapi import session
 from nova.virt.vmwareapi import vim_util as nova_vim_util
 from nova.virt.vmwareapi import vm_util
 from nova.virt.vmwareapi import vmops
@@ -72,6 +71,9 @@ class VMwareVCDriver(driver.ComputeDriver):
         "supports_trusted_certs": False,
         "supports_pcpus": False,
         "supports_accelerators": False,
+        "supports_remote_managed_ports": False,
+        "supports_address_space_passthrough": False,
+        "supports_address_space_emulated": False,
 
         # Image type support flags
         "supports_image_type_aki": False,
@@ -86,13 +88,6 @@ class VMwareVCDriver(driver.ComputeDriver):
         "supports_image_type_vmdk": True,
         "supports_image_type_ploop": False,
     }
-
-    # Legacy nodename is of the form: <mo id>(<cluster name>)
-    # e.g. domain-26(TestCluster)
-    # We assume <mo id> consists of alphanumeric, _ and -.
-    # We assume cluster name is everything between the first ( and the last ).
-    # We pull out <mo id> for re-use.
-    LEGACY_NODENAME = re.compile(r'([\w-]+)\(.+\)')
 
     # The vCenter driver includes API that acts on ESX hosts or groups
     # of ESX hosts in clusters or non-cluster logical-groupings.
@@ -119,7 +114,7 @@ class VMwareVCDriver(driver.ComputeDriver):
                     _("Invalid Regular Expression %s")
                     % CONF.vmware.datastore_regex)
 
-        self._session = VMwareAPISession(scheme=scheme)
+        self._session = session.VMwareAPISession(scheme=scheme)
 
         self._check_min_version()
 
@@ -193,6 +188,14 @@ class VMwareVCDriver(driver.ComputeDriver):
                 self._datastore_regex = None
 
     def init_host(self, host):
+        LOG.warning(
+            'The vmwareapi driver is not tested by the OpenStack project nor '
+            'does it have clear maintainer(s) and thus its quality can not be '
+            'ensured. It should be considered experimental and may be removed '
+            'in a future release. If you are using the driver in production '
+            'please let us know via the openstack-discuss mailing list.'
+        )
+
         vim = self._session.vim
         if vim is None:
             self._session._create_session()
@@ -525,6 +528,10 @@ class VMwareVCDriver(driver.ComputeDriver):
         # where cpu traits are added. In the vmware world, this is where we
         # would add nested providers representing tenant VDC and similar.
 
+    def prepare_for_spawn(self, instance):
+        """Perform pre-checks for spawn."""
+        self._vmops.prepare_for_spawn(instance)
+
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
               block_device_info=None, power_on=True, accel_info=None):
@@ -718,49 +725,3 @@ class VMwareVCDriver(driver.ComputeDriver):
     def detach_interface(self, context, instance, vif):
         """Detach an interface from the instance."""
         self._vmops.detach_interface(context, instance, vif)
-
-
-class VMwareAPISession(api.VMwareAPISession):
-    """Sets up a session with the VC/ESX host and handles all
-    the calls made to the host.
-    """
-    def __init__(self, host_ip=CONF.vmware.host_ip,
-                 host_port=CONF.vmware.host_port,
-                 username=CONF.vmware.host_username,
-                 password=CONF.vmware.host_password,
-                 retry_count=CONF.vmware.api_retry_count,
-                 scheme="https",
-                 cacert=CONF.vmware.ca_file,
-                 insecure=CONF.vmware.insecure,
-                 pool_size=CONF.vmware.connection_pool_size):
-        super(VMwareAPISession, self).__init__(
-                host=host_ip,
-                port=host_port,
-                server_username=username,
-                server_password=password,
-                api_retry_count=retry_count,
-                task_poll_interval=CONF.vmware.task_poll_interval,
-                scheme=scheme,
-                create_session=True,
-                cacert=cacert,
-                insecure=insecure,
-                pool_size=pool_size)
-
-    def _is_vim_object(self, module):
-        """Check if the module is a VIM Object instance."""
-        return isinstance(module, vim.Vim)
-
-    def _call_method(self, module, method, *args, **kwargs):
-        """Calls a method within the module specified with
-        args provided.
-        """
-        if not self._is_vim_object(module):
-            return self.invoke_api(module, method, self.vim, *args, **kwargs)
-        else:
-            return self.invoke_api(module, method, *args, **kwargs)
-
-    def _wait_for_task(self, task_ref):
-        """Return a Deferred that will give the result of the given task.
-        The task is polled until it completes.
-        """
-        return self.wait_for_task(task_ref)

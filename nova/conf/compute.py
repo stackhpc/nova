@@ -41,7 +41,6 @@ Possible values:
 * ``ironic.IronicDriver``
 * ``vmwareapi.VMwareVCDriver``
 * ``hyperv.HyperVDriver``
-* ``powervm.PowerVMDriver``
 * ``zvm.ZVMDriver``
 """),
     cfg.BoolOpt('allow_resize_to_same_host',
@@ -200,7 +199,7 @@ The template will be rendered using Jinja2 template engine, and receive a
 top-level key called ``interfaces``. This key will contain a list of
 dictionaries, one for each interface.
 
-Refer to the cloudinit documentaion for more information:
+Refer to the cloudinit documentation for more information:
 
   https://cloudinit.readthedocs.io/en/latest/topics/datasources.html
 
@@ -306,6 +305,21 @@ Related options:
   agent disabled. When used with libvirt the instance mode should be
   configured as HVM.
  """),
+    cfg.IntOpt('reimage_timeout_per_gb',
+        default=20,
+        min=1,
+        help="""
+Timeout for reimaging a volume.
+
+Number of seconds to wait for volume-reimaged events to arrive before
+continuing or failing.
+
+This is a per gigabyte time which has a default value of 20 seconds and
+will be multiplied by the GB size of image. Eg: an image of 6 GB will have
+a timeout of 20 * 6 = 120 seconds.
+Try increasing the timeout if the image copy per GB takes more time and you
+are hitting timeout failures.
+"""),
 ]
 
 resource_tracker_opts = [
@@ -349,7 +363,7 @@ Related options:
     cfg.MultiOpt('reserved_huge_pages',
         item_type=types.Dict(),
         help="""
-Number of huge/large memory pages to reserved per NUMA host cell.
+Number of huge/large memory pages to reserve per NUMA host cell.
 
 Possible values:
 
@@ -426,9 +440,7 @@ allocation_ratio_opts = [
 Virtual CPU to physical CPU allocation ratio.
 
 This option is used to influence the hosts selected by the Placement API by
-configuring the allocation ratio for ``VCPU`` inventory. In addition, the
-``AggregateCoreFilter`` (deprecated) will fall back to this configuration value
-if no per-aggregate setting is found.
+configuring the allocation ratio for ``VCPU`` inventory.
 
 .. note::
 
@@ -459,9 +471,7 @@ Related options:
 Virtual RAM to physical RAM allocation ratio.
 
 This option is used to influence the hosts selected by the Placement API by
-configuring the allocation ratio for ``MEMORY_MB`` inventory. In addition, the
-``AggregateRamFilter`` (deprecated) will fall back to this configuration value
-if no per-aggregate setting is found.
+configuring the allocation ratio for ``MEMORY_MB`` inventory.
 
 .. note::
 
@@ -487,9 +497,7 @@ Related options:
 Virtual disk to physical disk allocation ratio.
 
 This option is used to influence the hosts selected by the Placement API by
-configuring the allocation ratio for ``DISK_GB`` inventory. In addition, the
-``AggregateDiskFilter`` (deprecated) will fall back to this configuration value
-if no per-aggregate setting is found.
+configuring the allocation ratio for ``DISK_GB`` inventory.
 
 When configured, a ratio greater than 1.0 will result in over-subscription of
 the available physical disk, which can be useful for more efficiently packing
@@ -521,7 +529,7 @@ Related options:
 * ``initial_disk_allocation_ratio``
 """),
     cfg.FloatOpt('initial_cpu_allocation_ratio',
-                 default=16.0,
+                 default=4.0,
                  min=0.0,
                  help="""
 Initial virtual CPU to physical CPU allocation ratio.
@@ -537,7 +545,7 @@ Related options:
 * ``cpu_allocation_ratio``
 """),
     cfg.FloatOpt('initial_ram_allocation_ratio',
-                 default=1.5,
+                 default=1.0,
                  min=0.0,
                  help="""
 Initial virtual RAM to physical RAM allocation ratio.
@@ -1007,6 +1015,33 @@ Related options:
 * ``[scheduler]query_placement_for_image_type_support`` - enables
   filtering computes based on supported image types, which is required
   to be enabled for this to take effect.
+"""),
+    cfg.ListOpt('vmdk_allowed_types',
+                default=['streamOptimized', 'monolithicSparse'],
+                help="""
+A list of strings describing allowed VMDK "create-type" subformats
+that will be allowed. This is recommended to only include
+single-file-with-sparse-header variants to avoid potential host file
+exposure due to processing named extents. If this list is empty, then no
+form of VMDK image will be allowed.
+"""),
+    cfg.BoolOpt('packing_host_numa_cells_allocation_strategy',
+        default=False,
+        help="""
+This option controls allocation strategy used to choose NUMA cells on host for
+placing VM's NUMA cells (for VMs with defined numa topology). By
+default host's NUMA cell with more resources consumed will be chosen last for
+placing attempt. When the packing_host_numa_cells_allocation_strategy variable
+is set to ``False``, host's NUMA cell with more resources available will be
+used. When set to ``True`` cells with some usage will be packed with VM's cell
+until it will be completely exhausted, before a new free host's cell will be
+used.
+
+Possible values:
+
+* ``True``: Packing VM's NUMA cell on most used host NUMA cell.
+* ``False``: Spreading VM's NUMA cell on host's NUMA cells with more resources
+  available.
 """),
 ]
 

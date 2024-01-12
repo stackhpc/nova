@@ -147,7 +147,7 @@ Possible values:
         deprecated_group='DEFAULT',
         deprecated_name='quota_server_groups',
         help="""
-The maxiumum number of server groups per project.
+The maximum number of server groups per project.
 
 Server groups are used to control the affinity and anti-affinity scheduling
 policy for a group of servers or instances. Reducing the quota will not affect
@@ -175,12 +175,23 @@ Possible values:
     cfg.StrOpt('driver',
         default='nova.quota.DbQuotaDriver',
         choices=[
-            ('nova.quota.DbQuotaDriver', 'Stores quota limit information '
-             'in the database and relies on the ``quota_*`` configuration '
-             'options for default quota limit values. Counts quota usage '
-             'on-demand.'),
+            ('nova.quota.DbQuotaDriver', '(deprecated) Stores quota limit '
+             'information in the database and relies on the ``quota_*`` '
+             'configuration options for default quota limit values. Counts '
+             'quota usage on-demand.'),
             ('nova.quota.NoopQuotaDriver', 'Ignores quota and treats all '
              'resources as unlimited.'),
+            ('nova.quota.UnifiedLimitsDriver', 'Uses Keystone unified limits '
+             'to store quota limit information and relies on resource '
+             'usage counting from Placement. Counts quota usage on-demand. '
+             'Resources missing unified limits in Keystone will be treated '
+             'as a quota limit of 0, so it is important to ensure all '
+             'resources have registered limits in Keystone. The ``nova-manage '
+             'limits migrate_to_unified_limits`` command can be used to copy '
+             'existing quota limits from the Nova database to Keystone '
+             'unified limits via the Keystone API. Alternatively, unified '
+             'limits can be created manually using the OpenStackClient or '
+             'by calling the Keystone API directly.'),
         ],
         help="""
 Provides abstraction for quota checks. Users can configure a specific

@@ -13,12 +13,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
+from unittest import mock
+
 from oslo_config import cfg
 
 from nova.compute import instance_actions
 from nova import context
 from nova.db.main import api as db
+from nova import objects
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional.api import client
@@ -64,12 +66,12 @@ class ServerGroupTestBase(test.TestCase,
         self.useFixture(nova_fixtures.NeutronFixture(self))
 
         self.useFixture(func_fixtures.PlacementFixture())
-        api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
+        self.api_fixture = self.useFixture(nova_fixtures.OSAPIFixture(
             api_version='v2.1'))
 
-        self.api = api_fixture.api
+        self.api = self.api_fixture.api
         self.api.microversion = self.microversion
-        self.admin_api = api_fixture.admin_api
+        self.admin_api = self.api_fixture.admin_api
         self.admin_api.microversion = self.microversion
 
         self.start_service('conductor')
@@ -102,7 +104,10 @@ class ServerGroupFakeDriver(fake.SmallFakeDriver):
     """
 
     vcpus = 1000
-    memory_mb = 8192
+    # the testcases were built with a default ram allocation ratio
+    # of 1.5 and 8192 mb of ram so to maintain the same capacity with
+    # the new default allocation ratio of 1.0 we use 8192+4096=12288
+    memory_mb = 12288
     local_gb = 100000
 
 
@@ -174,13 +179,8 @@ class ServerGroupTestV21(ServerGroupTestBase):
 
         # Create an API using project 'openstack1'.
         # This is a non-admin API.
-        #
-        # NOTE(sdague): this is actually very much *not* how this
-        # fixture should be used. This actually spawns a whole
-        # additional API server. Should be addressed in the future.
-        api_openstack1 = self.useFixture(nova_fixtures.OSAPIFixture(
-            api_version=self.api_major_version,
-            project_id=PROJECT_ID_ALT)).api
+        api_openstack1 = self.api_fixture.alternative_api
+        api_openstack1.project_id = PROJECT_ID_ALT
         api_openstack1.microversion = self.microversion
 
         # Create a server group in project 'openstack'
@@ -445,7 +445,8 @@ class ServerGroupTestV21(ServerGroupTestBase):
 
         evacuated_server = self._evacuate_server(
             servers[1], {'onSharedStorage': 'False'},
-            expected_migration_status='done')
+            expected_migration_status='done',
+            expected_state='ACTIVE')
 
         # check that the server is evacuated to another host
         self.assertNotEqual(evacuated_server['OS-EXT-SRV-ATTR:host'],
@@ -498,6 +499,85 @@ class ServerGroupTestV21(ServerGroupTestBase):
         self.assertEqual(400, ex.response.status_code)
         self.assertIn('Invalid input', ex.response.text)
         self.assertIn('soft-affinity', ex.response.text)
+
+    @mock.patch('nova.scheduler.filters.affinity_filter.'
+        'ServerGroupAffinityFilter.host_passes', return_value=True)
+    def test_failed_count_with_affinity_violation(self, mock_host_passes):
+        """Check failed count not incremented after violation of the late
+        affinity check. https://bugs.launchpad.net/nova/+bug/1996732
+        """
+
+        created_group = self.api.post_server_groups(self.affinity)
+        flavor = self.api.get_flavors()[2]
+
+        # Ensure the first instance is on compute1
+        with utils.temporary_mutation(self.admin_api, microversion='2.53'):
+            compute2_service_id = self.admin_api.get_services(
+            host=self.compute2.host, binary='nova-compute')[0]['id']
+            self.admin_api.put_service(compute2_service_id,
+                                        {'status': 'disabled'})
+
+        self._boot_a_server_to_group(created_group, flavor=flavor)
+
+        # Ensure the second instance is on compute2
+        with utils.temporary_mutation(self.admin_api, microversion='2.53'):
+            self.admin_api.put_service(compute2_service_id,
+                                        {'status': 'enabled'})
+            compute1_service_id = self.admin_api.get_services(
+            host=self.compute.host, binary='nova-compute')[0]['id']
+            self.admin_api.put_service(compute1_service_id,
+                                        {'status': 'disabled'})
+
+        # Expects GroupAffinityViolation exception
+        failed_server = self._boot_a_server_to_group(created_group,
+                                                     flavor=flavor,
+                                                     expected_status='ERROR')
+
+        self.assertEqual('Exceeded maximum number of retries. Exhausted all '
+                         'hosts available for retrying build failures for '
+                         'instance %s.' % failed_server['id'],
+                         failed_server['fault']['message'])
+
+        ctxt = context.get_admin_context()
+        computes = objects.ComputeNodeList.get_all(ctxt)
+
+        for node in computes:
+            self.assertEqual(node.stats.get('failed_builds'), '0')
+
+    @mock.patch('nova.scheduler.filters.affinity_filter.'
+        'ServerGroupAntiAffinityFilter.host_passes', return_value=True)
+    def test_failed_count_with_anti_affinity_violation(self, mock_host_passes):
+        """Check failed count after violation of the late affinity check.
+        https://bugs.launchpad.net/nova/+bug/1996732
+        """
+
+        created_group = self.api.post_server_groups(self.anti_affinity)
+        flavor = self.api.get_flavors()[2]
+
+        # Ensure two instances are scheduled on the same host
+        with utils.temporary_mutation(self.admin_api, microversion='2.53'):
+            compute2_service_id = self.admin_api.get_services(
+            host=self.compute2.host, binary='nova-compute')[0]['id']
+            self.admin_api.put_service(compute2_service_id,
+                                        {'status': 'disabled'})
+
+        self._boot_a_server_to_group(created_group, flavor=flavor)
+
+        # Expects GroupAffinityViolation exception
+        failed_server = self._boot_a_server_to_group(created_group,
+                                                     flavor=flavor,
+                                                     expected_status='ERROR')
+
+        self.assertEqual('Exceeded maximum number of retries. Exhausted all '
+                         'hosts available for retrying build failures for '
+                         'instance %s.' % failed_server['id'],
+                         failed_server['fault']['message'])
+
+        ctxt = context.get_admin_context()
+        computes = objects.ComputeNodeList.get_all(ctxt)
+
+        for node in computes:
+            self.assertEqual(node.stats.get('failed_builds'), '0')
 
 
 class ServerGroupAffinityConfTest(ServerGroupTestBase):
@@ -622,7 +702,8 @@ class ServerGroupTestV215(ServerGroupTestV21):
         compute3 = self.start_service('compute', host='host3')
 
         evacuated_server = self._evacuate_server(
-            servers[1], expected_migration_status='done')
+            servers[1], expected_migration_status='done',
+            expected_state='ACTIVE')
 
         # check that the server is evacuated
         self.assertNotEqual(evacuated_server['OS-EXT-SRV-ATTR:host'],
@@ -801,7 +882,8 @@ class ServerGroupTestV215(ServerGroupTestV21):
         self._set_forced_down(host, True)
 
         evacuated_server = self._evacuate_server(
-            servers[1], expected_migration_status='done')
+            servers[1], expected_migration_status='done',
+            expected_state='ACTIVE')
 
         # Note(gibi): need to get the server again as the state of the instance
         # goes to ACTIVE first then the host of the instance changes to the
@@ -869,6 +951,54 @@ class ServerGroupTestV264(ServerGroupTestV215):
         # each host has 2 servers
         for host in set(hosts):
             self.assertEqual(2, hosts.count(host))
+
+
+class ServerGroupTestV295(ServerGroupTestV264):
+    microversion = '2.95'
+
+    def _evacuate_with_soft_anti_affinity_policies(self, group):
+        created_group = self.api.post_server_groups(group)
+        servers = self._boot_servers_to_group(created_group)
+
+        host = self._get_compute_service_by_host_name(
+            servers[1]['OS-EXT-SRV-ATTR:host'])
+        # Set forced_down on the host to ensure nova considers the host down.
+        self._set_forced_down(host, True)
+
+        evacuated_server = self._evacuate_server(
+            servers[1], expected_migration_status='done')
+
+        # Note(gibi): need to get the server again as the state of the instance
+        # goes to ACTIVE first then the host of the instance changes to the
+        # new host later
+        evacuated_server = self.admin_api.get_server(evacuated_server['id'])
+
+        return [evacuated_server['OS-EXT-SRV-ATTR:host'],
+                servers[0]['OS-EXT-SRV-ATTR:host']]
+
+    def test_evacuate_with_anti_affinity(self):
+        created_group = self.api.post_server_groups(self.anti_affinity)
+        servers = self._boot_servers_to_group(created_group)
+
+        host = self._get_compute_service_by_host_name(
+            servers[1]['OS-EXT-SRV-ATTR:host'])
+        # Set forced_down on the host to ensure nova considers the host down.
+        self._set_forced_down(host, True)
+
+        # Start additional host to test evacuation
+        compute3 = self.start_service('compute', host='host3')
+
+        evacuated_server = self._evacuate_server(
+            servers[1], expected_migration_status='done')
+
+        # check that the server is evacuated
+        self.assertNotEqual(evacuated_server['OS-EXT-SRV-ATTR:host'],
+                            servers[1]['OS-EXT-SRV-ATTR:host'])
+        # check that policy is kept
+        self.assertNotEqual(evacuated_server['OS-EXT-SRV-ATTR:host'],
+                            servers[0]['OS-EXT-SRV-ATTR:host'])
+
+        compute3.kill()
 
 
 class ServerGroupTestMultiCell(ServerGroupTestBase):

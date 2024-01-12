@@ -31,6 +31,7 @@ from collections import defaultdict
 import fnmatch
 import glob
 import inspect
+from lxml import etree
 import operator
 import os
 import queue
@@ -46,6 +47,7 @@ from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import excutils
 from oslo_utils import importutils
+from oslo_utils import strutils
 from oslo_utils import units
 from oslo_utils import versionutils
 
@@ -64,6 +66,7 @@ from nova.virt.libvirt import event as libvirtevent
 from nova.virt.libvirt import guest as libvirt_guest
 from nova.virt.libvirt import migration as libvirt_migrate
 from nova.virt.libvirt import utils as libvirt_utils
+import nova.virt.node  # noqa
 
 if ty.TYPE_CHECKING:
     import libvirt
@@ -136,6 +139,7 @@ class Host(object):
         self._caps = None
         self._domain_caps = None
         self._hostname = None
+        self._node_uuid = None
 
         self._wrapped_conn = None
         self._wrapped_conn_lock = threading.Lock()
@@ -158,6 +162,8 @@ class Host(object):
         # kernel, QEMU, and/or libvirt. These are determined on demand and
         # memoized by various properties below
         self._supports_amd_sev: ty.Optional[bool] = None
+        self._max_sev_guests: ty.Optional[int] = None
+        self._max_sev_es_guests: ty.Optional[int] = None
         self._supports_uefi: ty.Optional[bool] = None
         self._supports_secure_boot: ty.Optional[bool] = None
 
@@ -488,11 +494,14 @@ class Host(object):
         LOG.debug("Starting native event thread")
         self._event_thread = native_threading.Thread(
             target=self._native_thread)
-        self._event_thread.setDaemon(True)
+        self._event_thread.daemon = True
         self._event_thread.start()
 
         LOG.debug("Starting green dispatch thread")
         utils.spawn(self._dispatch_thread)
+
+        LOG.debug("Starting connection event dispatch thread")
+        utils.spawn(self._conn_event_thread)
 
     def _get_new_connection(self):
         # call with _wrapped_conn_lock held
@@ -613,9 +622,6 @@ class Host(object):
         libvirt.virEventRegisterDefaultImpl()
         self._init_events()
 
-        LOG.debug("Starting connection event dispatch thread")
-        utils.spawn(self._conn_event_thread)
-
         self._initialized = True
 
     def _version_check(self, lv_ver=None, hv_ver=None, hv_type=None,
@@ -735,6 +741,14 @@ class Host(object):
             doms.append(dom)
 
         return doms
+
+    def get_available_cpus(self):
+        """Get the set of CPUs that exist on the host.
+
+        :returns: set of CPUs, raises libvirtError on error
+        """
+        cpus, cpu_map, online = self.get_connection().getCPUMap()
+        return {cpu for cpu in range(cpus)}
 
     def get_online_cpus(self):
         """Get the set of CPUs that are online on the host
@@ -1057,6 +1071,12 @@ class Host(object):
                       {'old': self._hostname, 'new': hostname})
         return self._hostname
 
+    def get_node_uuid(self):
+        """Returns the UUID of this node."""
+        if not self._node_uuid:
+            self._node_uuid = nova.virt.node.get_local_node_uuid()
+        return self._node_uuid
+
     def find_secret(self, usage_type, usage_id):
         """Find a secret.
 
@@ -1197,6 +1217,25 @@ class Host(object):
         stats["frequency"] = self._get_hardware_info()[3]
         return stats
 
+    def _check_machine_type(self, caps, mach_type):
+        """Validate if hw machine type is in capabilities of the host
+
+        :param caps: host capabilities
+        :param mach_type: machine type
+        """
+        possible_machine_types = []
+
+        caps_tree = etree.fromstring(str(caps))
+        for guest in caps_tree.findall('guest'):
+            for machine in guest.xpath('arch/machine'):
+                possible_machine_types.append(machine.text)
+
+        if mach_type not in possible_machine_types:
+            raise exception.InvalidMachineType(
+                message="'%s' is not valid/supported machine type, "
+                    "Supported machine types are: %s" % (
+                        mach_type, possible_machine_types))
+
     def write_instance_config(self, xml):
         """Defines a domain, but does not start it.
 
@@ -1229,12 +1268,65 @@ class Host(object):
         cfgdev.parse_str(xmlstr)
         return cfgdev.pci_capability.features
 
+    def _get_vf_parent_pci_vpd_info(
+        self,
+        vf_device: 'libvirt.virNodeDevice',
+        parent_pf_name: str,
+        candidate_devs: ty.List['libvirt.virNodeDevice']
+    ) -> ty.Optional[vconfig.LibvirtConfigNodeDeviceVpdCap]:
+        """Returns PCI VPD info of a parent device of a PCI VF.
+
+        :param vf_device: a VF device object to use for lookup.
+        :param str parent_pf_name: parent PF name formatted as pci_dddd_bb_ss_f
+        :param candidate_devs: devices that could be parent devs for the VF.
+        :returns: A VPD capability object of a parent device.
+        """
+        parent_dev = next(
+            (dev for dev in candidate_devs if dev.name() == parent_pf_name),
+            None
+        )
+        if parent_dev is None:
+            return None
+
+        xmlstr = parent_dev.XMLDesc(0)
+        cfgdev = vconfig.LibvirtConfigNodeDevice()
+        cfgdev.parse_str(xmlstr)
+        return cfgdev.pci_capability.vpd_capability
+
+    @staticmethod
+    def _get_vpd_card_serial_number(
+        dev: 'libvirt.virNodeDevice',
+    ) -> ty.Optional[ty.List[str]]:
+        """Returns a card serial number stored in PCI VPD (if present)."""
+        xmlstr = dev.XMLDesc(0)
+        cfgdev = vconfig.LibvirtConfigNodeDevice()
+        cfgdev.parse_str(xmlstr)
+        vpd_cap = cfgdev.pci_capability.vpd_capability
+        if not vpd_cap:
+            return None
+        return vpd_cap.card_serial_number
+
+    def _get_pf_details(self, device: dict, pci_address: str) -> dict:
+        if device.get('dev_type') != fields.PciDeviceType.SRIOV_PF:
+            return {}
+
+        try:
+            return {
+                'mac_address': pci_utils.get_mac_by_pci_address(pci_address)
+            }
+        except exception.PciDeviceNotFoundById:
+            LOG.debug(
+                'Cannot get MAC address of the PF %s. It is probably attached '
+                'to a guest already', pci_address)
+            return {}
+
     def _get_pcidev_info(
         self,
         devname: str,
         dev: 'libvirt.virNodeDevice',
         net_devs: ty.List['libvirt.virNodeDevice'],
         vdpa_devs: ty.List['libvirt.virNodeDevice'],
+        pci_devs: ty.List['libvirt.virNodeDevice'],
     ) -> ty.Dict[str, ty.Union[str, dict]]:
         """Returns a dict of PCI device."""
 
@@ -1297,23 +1389,112 @@ class Host(object):
 
             return {'dev_type': fields.PciDeviceType.STANDARD}
 
+        def _get_vpd_details(
+            device_dict: dict,
+            device: 'libvirt.virNodeDevice',
+            pci_devs: ty.List['libvirt.virNodeDevice']
+        ) -> ty.Dict[str, ty.Any]:
+            """Get information from PCI VPD (if present).
+
+            PCI/PCIe devices may include the optional VPD capability. It may
+            contain useful information such as the unique serial number
+            uniquely assigned at a factory.
+
+            If a device is a VF and it does not contain the VPD capability,
+            a parent device's VPD is used (if present) as a fallback to
+            retrieve the unique add-in card number. Whether a VF exposes
+            the VPD capability or not may be controlled via a vendor-specific
+            firmware setting.
+            """
+            vpd_info: ty.Dict[str, ty.Any] = {}
+            # At the time of writing only the serial number had a clear
+            # use-case. However, the set of fields may be extended.
+            card_serial_number = self._get_vpd_card_serial_number(device)
+
+            if (not card_serial_number and
+               device_dict.get('dev_type') == fields.PciDeviceType.SRIOV_VF
+            ):
+                # Format the address of a physical function to use underscores
+                # since that's how Libvirt formats the <name> element content.
+                pf_addr = device_dict.get('parent_addr')
+                if not pf_addr:
+                    LOG.warning("A VF device dict does not have a parent PF "
+                                "address in it which is unexpected. Skipping "
+                                "serial number retrieval")
+                    return vpd_info
+
+                formatted_addr = pf_addr.replace('.', '_').replace(':', '_')
+                vpd_cap = self._get_vf_parent_pci_vpd_info(
+                    device, f'pci_{formatted_addr}', pci_devs)
+                if vpd_cap is not None:
+                    card_serial_number = vpd_cap.card_serial_number
+
+            if card_serial_number:
+                vpd_info = {'card_serial_number': card_serial_number}
+            return vpd_info
+
+        def _get_sriov_netdev_details(
+            device_dict: dict,
+            device: 'libvirt.virNodeDevice',
+        ) -> ty.Dict[str, ty.Dict[str, ty.Any]]:
+            """Get SR-IOV related information"""
+            sriov_info: ty.Dict[str, ty.Any] = {}
+
+            if device_dict.get('dev_type') != fields.PciDeviceType.SRIOV_VF:
+                return sriov_info
+
+            pf_addr = device_dict['parent_addr']
+
+            # A netdev VF may be associated with a PF which does not have a
+            # netdev as described in LP #1915255.
+            try:
+                sriov_info.update({
+                    'pf_mac_address': pci_utils.get_mac_by_pci_address(pf_addr)
+                })
+            except exception.PciDeviceNotFoundById:
+                LOG.debug(f'Could not get a PF mac for {pf_addr}')
+                # For the purposes Nova uses this information currently,
+                # having both a PF MAC and a VF number is needed so we return
+                # an empty dict if a PF MAC is not available.
+                return {}
+
+            vf_num = pci_utils.get_vf_num_by_pci_address(
+                device_dict['address'])
+
+            sriov_info.update({'vf_num': vf_num})
+            return sriov_info
+
         def _get_device_capabilities(
             device_dict: dict,
             device: 'libvirt.virNodeDevice',
+            pci_devs: ty.List['libvirt.virNodeDevice'],
             net_devs: ty.List['libvirt.virNodeDevice']
-        ) -> ty.Dict[str, ty.Dict[str, ty.Any]]:
+        ) -> ty.Dict[str, ty.Any]:
             """Get PCI VF device's additional capabilities.
 
             If a PCI device is a virtual function, this function reads the PCI
             parent's network capabilities (must be always a NIC device) and
             appends this information to the device's dictionary.
             """
-            caps: ty.Dict[str, ty.Dict[str, ty.Any]] = {}
+            caps: ty.Dict[str, ty.Any] = {}
 
             if device_dict.get('dev_type') == fields.PciDeviceType.SRIOV_VF:
                 pcinet_info = self._get_pcinet_info(device, net_devs)
                 if pcinet_info:
-                    return {'capabilities': {'network': pcinet_info}}
+                    caps['network'] = pcinet_info
+                    # Only attempt to get SR-IOV details if a VF is a netdev
+                    # because there are no use cases for other dev types yet.
+                sriov_caps = _get_sriov_netdev_details(device_dict, dev)
+                if sriov_caps:
+                    caps['sriov'] = sriov_caps
+
+            vpd_info = _get_vpd_details(device_dict, device, pci_devs)
+            if vpd_info:
+                caps['vpd'] = vpd_info
+
+            if caps:
+                return {'capabilities': caps}
+
             return caps
 
         xmlstr = dev.XMLDesc(0)
@@ -1339,7 +1520,9 @@ class Host(object):
         device['label'] = 'label_%(vendor_id)s_%(product_id)s' % device
         device.update(
             _get_device_type(cfgdev, address, dev, net_devs, vdpa_devs))
-        device.update(_get_device_capabilities(device, dev, net_devs))
+        device.update(_get_device_capabilities(device, dev,
+                                               pci_devs, net_devs))
+        device.update(self._get_pf_details(device, address))
         return device
 
     def get_vdpa_nodedev_by_address(
@@ -1361,7 +1544,7 @@ class Host(object):
         vdpa_devs = [
             dev for dev in devices.values() if "vdpa" in dev.listCaps()]
         pci_info = [
-            self._get_pcidev_info(name, dev, [], vdpa_devs) for name, dev
+            self._get_pcidev_info(name, dev, [], vdpa_devs, []) for name, dev
             in devices.items() if "pci" in dev.listCaps()]
         parent_dev = next(
             dev for dev in pci_info if dev['address'] == pci_address)
@@ -1401,7 +1584,7 @@ class Host(object):
     def list_mediated_devices(self, flags=0):
         """Lookup mediated devices.
 
-        :returns: a list of virNodeDevice instance
+        :returns: a list of strings with the name of the instance
         """
         return self._list_devices("mdev", flags=flags)
 
@@ -1440,21 +1623,66 @@ class Host(object):
         """Compares the given CPU description with the host CPU."""
         return self.get_connection().compareCPU(xmlDesc, flags)
 
+    def compare_hypervisor_cpu(self, xmlDesc, flags=0):
+        """Compares the given CPU description with the CPU provided by
+        the host hypervisor. This is different from the older method,
+        compare_cpu(), which compares a given CPU definition with the
+        host CPU without considering the abilities of the host
+        hypervisor. Except @xmlDesc, rest of all the parameters to
+        compareHypervisorCPU API are optional (libvirt will choose
+        sensible defaults).
+        """
+        emulator = None
+        arch = None
+        machine = None
+        virttype = None
+        return self.get_connection().compareHypervisorCPU(
+            emulator, arch, machine, virttype, xmlDesc, flags)
+
     def is_cpu_control_policy_capable(self):
         """Returns whether kernel configuration CGROUP_SCHED is enabled
 
         CONFIG_CGROUP_SCHED may be disabled in some kernel configs to
         improve scheduler latency.
         """
+        return self._has_cgroupsv1_cpu_controller() or \
+               self._has_cgroupsv2_cpu_controller()
+
+    def _has_cgroupsv1_cpu_controller(self):
+        LOG.debug(f"Searching host: '{self.get_hostname()}' "
+                  "for CPU controller through CGroups V1...")
         try:
             with open("/proc/self/mounts", "r") as fd:
                 for line in fd.readlines():
                     # mount options and split options
                     bits = line.split()[3].split(",")
                     if "cpu" in bits:
+                        LOG.debug("CPU controller found on host.")
                         return True
+                LOG.debug("CPU controller missing on host.")
                 return False
-        except IOError:
+        except IOError as ex:
+            LOG.debug(f"Search failed due to: '{ex}'. "
+                      "Maybe the host is not running under CGroups V1. "
+                      "Deemed host to be missing controller by this approach.")
+            return False
+
+    def _has_cgroupsv2_cpu_controller(self):
+        LOG.debug(f"Searching host: '{self.get_hostname()}' "
+                  "for CPU controller through CGroups V2...")
+        try:
+            with open("/sys/fs/cgroup/cgroup.controllers", "r") as fd:
+                for line in fd.readlines():
+                    bits = line.split()
+                    if "cpu" in bits:
+                        LOG.debug("CPU controller found on host.")
+                        return True
+                LOG.debug("CPU controller missing on host.")
+                return False
+        except IOError as ex:
+            LOG.debug(f"Search failed due to: '{ex}'. "
+                      "Maybe the host is not running under CGroups V2. "
+                      "Deemed host to be missing controller by this approach.")
             return False
 
     def get_canonical_machine_type(self, arch, machine) -> str:
@@ -1546,7 +1774,7 @@ class Host(object):
             return self._supports_secure_boot
 
         # we only check the host architecture since the libvirt driver doesn't
-        # truely support non-host architectures currently
+        # truly support non-host architectures currently
         arch = self.get_capabilities().host.cpu.arch
         domain_caps = self.get_domain_capabilities()
         for machine_type in domain_caps[arch]:
@@ -1570,9 +1798,9 @@ class Host(object):
             return False
 
         with open(SEV_KERNEL_PARAM_FILE) as f:
-            contents = f.read()
-            LOG.debug("%s contains [%s]", SEV_KERNEL_PARAM_FILE, contents)
-            return contents == "1\n"
+            content = f.read()
+            LOG.debug("%s contains [%s]", SEV_KERNEL_PARAM_FILE, content)
+            return strutils.bool_from_string(content)
 
     @property
     def supports_amd_sev(self) -> bool:
@@ -1610,10 +1838,45 @@ class Host(object):
                     if feature_is_sev and feature.supported:
                         LOG.info("AMD SEV support detected")
                         self._supports_amd_sev = True
+                        self._max_sev_guests = feature.max_guests
+                        self._max_sev_es_guests = feature.max_es_guests
                         return self._supports_amd_sev
 
         LOG.debug("No AMD SEV support detected for any (arch, machine_type)")
         return self._supports_amd_sev
+
+    @property
+    def max_sev_guests(self) -> ty.Optional[int]:
+        """Determine maximum number of guests with AMD SEV.
+        """
+        if not self.supports_amd_sev:
+            return None
+        return self._max_sev_guests
+
+    @property
+    def max_sev_es_guests(self) -> ty.Optional[int]:
+        """Determine maximum number of guests with AMD SEV-ES.
+        """
+        if not self.supports_amd_sev:
+            return None
+        return self._max_sev_es_guests
+
+    @property
+    def supports_remote_managed_ports(self) -> bool:
+        """Determine if the host supports remote managed ports.
+
+        Returns a boolean indicating whether remote managed ports are
+        possible to use on this host.
+
+        The check is based on a Libvirt version which added support for
+        parsing and exposing PCI VPD since a card serial number (if present in
+        the VPD) since the use of remote managed ports depends on this.
+        https://libvirt.org/news.html#v7-9-0-2021-11-01
+
+        The actual presence of a card serial number for a particular device
+        is meant to be checked elsewhere.
+        """
+        return self.has_min_version(lv_ver=(7, 9, 0))
 
     @property
     def loaders(self) -> ty.List[dict]:
@@ -1642,11 +1905,11 @@ class Host(object):
         arch: str,
         machine: str,
         has_secure_boot: bool,
-    ) -> ty.Tuple[str, str]:
+    ) -> ty.Tuple[str, str, bool]:
         """Get loader for the specified architecture and machine type.
 
-        :returns: A tuple of the bootloader executable path and the NVRAM
-            template path.
+        :returns: A the bootloader executable path and the NVRAM
+            template path and a bool indicating if we need to enable SMM.
         """
 
         machine = self.get_canonical_machine_type(arch, machine)
@@ -1676,6 +1939,7 @@ class Host(object):
             return (
                 loader['mapping']['executable']['filename'],
                 loader['mapping']['nvram-template']['filename'],
+                'requires-smm' in loader['features'],
             )
 
         raise exception.UEFINotSupported()

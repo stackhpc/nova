@@ -19,8 +19,8 @@ Tests For HostManager
 import collections
 import contextlib
 import datetime
+from unittest import mock
 
-import mock
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import versionutils
@@ -1562,10 +1562,14 @@ class HostStateTestCase(test.NoDBTestCase):
 
         self.assertIsNone(host.updated)
         host.consume_from_request(spec_obj)
-        numa_fit_mock.assert_called_once_with(fake_host_numa_topology,
-                                              fake_numa_topology,
-                                              limits=None, pci_requests=None,
-                                              pci_stats=None)
+        numa_fit_mock.assert_called_once_with(
+            fake_host_numa_topology,
+            fake_numa_topology,
+            limits=None,
+            pci_requests=None,
+            pci_stats=None,
+            provider_mapping=None,
+        )
         numa_usage_mock.assert_called_once_with(fake_host_numa_topology,
                                                 fake_numa_topology)
         sync_mock.assert_called_once_with(("fakehost", "fakenode"))

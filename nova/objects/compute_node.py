@@ -12,6 +12,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from oslo_db import exception as db_exc
 from oslo_serialization import jsonutils
 from oslo_utils import uuidutils
 from oslo_utils import versionutils
@@ -339,7 +340,12 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
         self._convert_supported_instances_to_db_format(updates)
         self._convert_pci_stats_to_db_format(updates)
 
-        db_compute = db.compute_node_create(self._context, updates)
+        try:
+            db_compute = db.compute_node_create(self._context, updates)
+        except db_exc.DBDuplicateEntry:
+            target = 'compute node %s:%s' % (updates['hypervisor_hostname'],
+                                             updates['uuid'])
+            raise exception.DuplicateRecord(target=target)
         self._from_db_object(self._context, self, db_compute)
 
     @base.remotable
@@ -388,8 +394,11 @@ class ComputeNode(base.NovaPersistentObject, base.NovaObject):
                 # The uuid field is read-only so it should only be set when
                 # creating the compute node record for the first time. Ignore
                 # it otherwise.
-                if key == 'uuid' and 'uuid' in self:
-                    continue
+                if (key == 'uuid' and 'uuid' in self and
+                        resources[key] != self.uuid):
+                    raise exception.InvalidNodeConfiguration(
+                        reason='Attempt to overwrite node %s with %s!' % (
+                            self.uuid, resources[key]))
                 setattr(self, key, resources[key])
 
         # supported_instances has a different name in compute_node

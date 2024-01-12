@@ -12,8 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 import collections
+from unittest import mock
 
-import mock
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import timeutils
 from oslo_versionedobjects import fixture
@@ -371,7 +371,6 @@ notification_object_data = {
     'AggregateNotification': '1.0-a73147b93b520ff0061865849d3dfa56',
     'AggregatePayload': '1.1-1eb9adcc4440d8627de6ec37c6398746',
     'AuditPeriodPayload': '1.0-2b429dd307b8374636703b843fa3f9cb',
-    'BandwidthPayload': '1.0-ee2616a7690ab78406842a2b68e34130',
     'BlockDevicePayload': '1.0-29751e1b6d41b1454e36768a1e764df8',
     'CellMappingPayload': '2.0-8acd412eb4edff1cd2ecb9867feeb243',
     'ComputeTaskNotification': '1.0-a73147b93b520ff0061865849d3dfa56',
@@ -387,7 +386,7 @@ notification_object_data = {
     # ImageMetaProps, so when you see a fail here for that reason, you must
     # *also* bump the version of ImageMetaPropsPayload. See its docstring for
     # more information.
-    'ImageMetaPropsPayload': '1.8-080bdcba9b96122eab57bf39d47348f7',
+    'ImageMetaPropsPayload': '1.13-24345c28a6463e85e12902d43af0ecf2',
     'InstanceActionNotification': '1.0-a73147b93b520ff0061865849d3dfa56',
     'InstanceActionPayload': '1.8-4fa3da9cbf0761f1f700ae578f36dc2f',
     'InstanceActionRebuildNotification':
@@ -410,14 +409,14 @@ notification_object_data = {
         '1.0-a73147b93b520ff0061865849d3dfa56',
     'InstanceActionSnapshotPayload': '1.9-c3e0bbaaefafdfa2f8e6e504c2c9b12c',
     'InstanceExistsNotification': '1.0-a73147b93b520ff0061865849d3dfa56',
-    'InstanceExistsPayload': '1.2-e082c02438ee57164829afaeee3bf7f8',
+    'InstanceExistsPayload': '2.0-802d380c61cba2edb905c45052c612b0',
     'InstanceNUMACellPayload': '1.2-a367add3378c71c21c817ab2b23db3bf',
     'InstanceNUMATopologyPayload': '1.0-247361b152047c18ae9ad1da2544a3c9',
     'InstancePCIRequestPayload': '1.1-bda86a95ef04bdc27789342466b81bb5',
     'InstancePCIRequestsPayload': '1.0-6751cffe0c0fabd212aad624f672429a',
     'InstanceStateUpdatePayload': '1.0-07e111c0fa0f6db0f79b0726d593e3da',
     'InstanceUpdateNotification': '1.0-a73147b93b520ff0061865849d3dfa56',
-    'InstanceUpdatePayload': '1.9-0295e45efc2c6ba98fbca77bbddf882d',
+    'InstanceUpdatePayload': '2.0-6ad65963b4ef57210544651e1077ac97',
     'IpPayload': '1.0-8ecf567a99e516d4af094439a7632d34',
     'KeypairNotification': '1.0-a73147b93b520ff0061865849d3dfa56',
     'KeypairPayload': '1.0-6daebbbde0e1bf35c1556b1ecd9385c1',

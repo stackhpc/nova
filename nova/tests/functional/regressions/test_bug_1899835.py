@@ -10,7 +10,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import mock
+from unittest import mock
 
 from nova import context
 from nova import objects
@@ -84,7 +84,7 @@ class TestVolumeDisconnectDuringPreLiveMigrationRollback(base.ServersTestBase):
                 self.computes['dest'].driver, '_disconnect_volume'),
             mock.patch(
                 'nova.volume.cinder.API.attachment_create',
-                side_effect=test.TestingException)
+                side_effect=test.TestingException, autospec=False)
         ) as (
             mock_dest_connector, mock_dest_connect, mock_dest_disconnect,
             mock_attachment_create

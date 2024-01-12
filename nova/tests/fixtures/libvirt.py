@@ -18,10 +18,10 @@ import sys
 import textwrap
 import time
 import typing as ty
+from unittest import mock
 
 import fixtures
 from lxml import etree
-import mock
 from oslo_log import log as logging
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_utils import versionutils
@@ -31,6 +31,7 @@ from nova.objects import fields as obj_fields
 from nova.tests.fixtures import libvirt_data as fake_libvirt_data
 from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt import driver as libvirt_driver
+from nova.virt.libvirt import host
 
 
 # Allow passing None to the various connect methods
@@ -275,6 +276,7 @@ class FakePCIDevice(object):
             <product id='0x%(prod_id)s'>%(prod_name)s</product>
             <vendor id='0x%(vend_id)s'>%(vend_name)s</vendor>
         %(capability)s
+        %(vpd_capability)s
             <iommuGroup number='%(iommu_group)d'>
               <address domain='0x0000' bus='%(bus)#02x' slot='%(slot)#02x' function='0x%(function)d'/>
             </iommuGroup>
@@ -293,13 +295,22 @@ class FakePCIDevice(object):
         <availableInstances>%(instances)s</availableInstances>
         </type>""".strip())  # noqa
 
+    vpd_cap_templ = textwrap.dedent("""
+        <capability type='vpd'>
+        <name>%(name)s</name>
+        %(fields)s
+        </capability>""".strip())
+    vpd_fields_templ = textwrap.dedent("""
+        <fields access='%(access)s'>%(section_fields)s</fields>""".strip())
+    vpd_field_templ = """<%(field_name)s>%(field_value)s</%(field_name)s>"""
+
     is_capable_of_mdevs = False
 
     def __init__(
         self, dev_type, bus, slot, function, iommu_group, numa_node, *,
         vf_ratio=None, multiple_gpu_types=False, generic_types=False,
         parent=None, vend_id=None, vend_name=None, prod_id=None,
-        prod_name=None, driver_name=None,
+        prod_name=None, driver_name=None, vpd_fields=None, mac_address=None,
     ):
         """Populate pci devices
 
@@ -321,6 +332,8 @@ class FakePCIDevice(object):
         :param prod_id: (str) The product ID.
         :param prod_name: (str) The product name.
         :param driver_name: (str) The driver name.
+        :param mac_address: (str) The MAC of the device.
+            Used in case of SRIOV PFs
         """
 
         self.dev_type = dev_type
@@ -339,6 +352,9 @@ class FakePCIDevice(object):
         self.prod_id = prod_id
         self.prod_name = prod_name
         self.driver_name = driver_name
+        self.mac_address = mac_address
+
+        self.vpd_fields = vpd_fields
 
         self.generate_xml()
 
@@ -352,7 +368,9 @@ class FakePCIDevice(object):
             assert not self.vf_ratio, 'vf_ratio does not apply for PCI devices'
 
         if self.dev_type in ('PF', 'VF'):
-            assert self.vf_ratio, 'require vf_ratio for PFs and VFs'
+            assert (
+                self.vf_ratio is not None
+            ), 'require vf_ratio for PFs and VFs'
 
         if self.dev_type == 'VF':
             assert self.parent, 'require parent for VFs'
@@ -447,6 +465,7 @@ class FakePCIDevice(object):
             'prod_name': prod_name,
             'driver': driver,
             'capability': capability,
+            'vpd_capability': self.format_vpd_cap(),
             'iommu_group': self.iommu_group,
             'numa_node': self.numa_node,
             'parent': parent,
@@ -457,8 +476,36 @@ class FakePCIDevice(object):
         if self.numa_node == -1:
             self.pci_device = self.pci_device.replace("<numa node='-1'/>", "")
 
+    def format_vpd_cap(self):
+        if not self.vpd_fields:
+            return ''
+        fields = []
+        for access_type in ('readonly', 'readwrite'):
+            section_fields = []
+            for field_name, field_value in self.vpd_fields.get(
+                    access_type, {}).items():
+                section_fields.append(self.vpd_field_templ % {
+                    'field_name': field_name,
+                    'field_value': field_value,
+                })
+            if section_fields:
+                fields.append(
+                    self.vpd_fields_templ % {
+                        'access': access_type,
+                        'section_fields': '\n'.join(section_fields),
+                    }
+                )
+        return self.vpd_cap_templ % {
+            'name': self.vpd_fields.get('name', ''),
+            'fields': '\n'.join(fields)
+        }
+
     def XMLDesc(self, flags):
         return self.pci_device
+
+    @property
+    def address(self):
+        return "0000:%02x:%02x.%1x" % (self.bus, self.slot, self.function)
 
 
 # TODO(stephenfin): Remove all of these HostFooDevicesInfo objects in favour of
@@ -487,7 +534,7 @@ class HostPCIDevicesInfo(object):
         """
         self.devices = {}
 
-        if not (num_vfs or num_pfs) and not num_mdevcap:
+        if not (num_vfs or num_pfs or num_pci) and not num_mdevcap:
             return
 
         if num_vfs and not num_pfs:
@@ -572,7 +619,7 @@ class HostPCIDevicesInfo(object):
         self, dev_type, bus, slot, function, iommu_group, numa_node,
         vf_ratio=None, multiple_gpu_types=False, generic_types=False,
         parent=None, vend_id=None, vend_name=None, prod_id=None,
-        prod_name=None, driver_name=None,
+        prod_name=None, driver_name=None, vpd_fields=None, mac_address=None,
     ):
         pci_dev_name = _get_libvirt_nodedev_name(bus, slot, function)
 
@@ -593,7 +640,10 @@ class HostPCIDevicesInfo(object):
             vend_name=vend_name,
             prod_id=prod_id,
             prod_name=prod_name,
-            driver_name=driver_name)
+            driver_name=driver_name,
+            vpd_fields=vpd_fields,
+            mac_address=mac_address,
+        )
         self.devices[pci_dev_name] = dev
         return dev
 
@@ -611,6 +661,13 @@ class HostPCIDevicesInfo(object):
     def get_all_mdev_capable_devices(self):
         return [dev for dev in self.devices
                 if self.devices[dev].is_capable_of_mdevs]
+
+    def get_pci_address_mac_mapping(self):
+        return {
+            device.address: device.mac_address
+            for dev_addr, device in self.devices.items()
+            if device.mac_address
+        }
 
 
 class FakeMdevDevice(object):
@@ -868,7 +925,7 @@ def disable_event_thread(self):
     problematic because it means we've got a floating thread calling
     sleep(1) over the life of the unit test. Seems harmless? It's not,
     because we sometimes want to test things like retry loops that
-    should have specific sleep paterns. An unlucky firing of the
+    should have specific sleep patterns. An unlucky firing of the
     libvirt thread will cause a test failure.
 
     """
@@ -907,6 +964,7 @@ class libvirtError(Exception):
     Alternatively, you can use the `make_libvirtError` convenience function to
     allow you to specify these attributes in one shot.
     """
+
     def __init__(self, defmsg, conn=None, dom=None, net=None, pool=None,
                  vol=None):
         Exception.__init__(self, defmsg)
@@ -1376,21 +1434,31 @@ class Domain(object):
                     'Test attempts to add more than 8 PCI devices. This is '
                     'not supported by the fake libvirt implementation.')
             nic['func'] = func
+            if nic['type'] in ('ethernet',):
+                # this branch covers kernel ovs interfaces
+                nics += '''<interface type='%(type)s'>
+          <mac address='%(mac)s'/>
+          <target dev='tap274487d1-6%(func)s'/>
+          <address type='pci' domain='0x0000' bus='0x00' slot='0x03'
+                   function='0x%(func)s'/>
+        </interface>''' % nic
+            elif nic['type'] in ('vdpa',):
+                # this branch covers hardware offloaded ovs with vdpa
+                nics += '''<interface type='%(type)s'>
+          <mac address='%(mac)s'/>
+          <source dev='%(source)s'/>
+          <address type='pci' domain='0x0000' bus='0x00' slot='0x03'
+                   function='0x%(func)s'/>
+        </interface>''' % nic
             # this branch covers most interface types with a source
             # such as linux bridge interfaces.
-            if 'source' in nic:
+            elif 'source' in nic:
                 nics += '''<interface type='%(type)s'>
           <mac address='%(mac)s'/>
           <source %(type)s='%(source)s'/>
           <target dev='tap274487d1-6%(func)s'/>
           <address type='pci' domain='0x0000' bus='0x00' slot='0x03'
                    function='0x%(func)s'/>
-        </interface>''' % nic
-            elif nic['type'] in ('ethernet',):
-                # this branch covers kernel ovs interfaces
-                nics += '''<interface type='%(type)s'>
-          <mac address='%(mac)s'/>
-          <target dev='tap274487d1-6%(func)s'/>
         </interface>''' % nic
             else:
                 # This branch covers the macvtap vnic-type.
@@ -1922,6 +1990,16 @@ class Connection(object):
     _domain_capability_features_with_SEV_unsupported = \
         _domain_capability_features_with_SEV.replace('yes', 'no')
 
+    _domain_capability_features_with_SEV_max_guests = '''  <features>
+    <gic supported='no'/>
+    <sev supported='yes'>
+      <cbitpos>47</cbitpos>
+      <reducedPhysBits>1</reducedPhysBits>
+      <maxGuests>100</maxGuests>
+      <maxESGuests>15</maxESGuests>
+    </sev>
+  </features>'''
+
     def getCapabilities(self):
         """Return spoofed capabilities."""
         numa_topology = self.host_info.numa_topology
@@ -1975,6 +2053,12 @@ class Connection(object):
         # and I don't think it adds much value to replicate it here.
 
         return VIR_CPU_COMPARE_IDENTICAL
+
+    def compareHypervisorCPU(
+        self, emulator, arch, machine, virttype,
+        xml, flags
+    ):
+        return self.compareCPU(xml, flags)
 
     def getCPUStats(self, cpuNum, flag):
         if cpuNum < 2:
@@ -2073,10 +2157,10 @@ class Connection(object):
 
 def openAuth(uri, auth, flags=0):
 
-    if type(auth) != list:
+    if type(auth) is not list:
         raise Exception("Expected a list for 'auth' parameter")
 
-    if type(auth[0]) != list:
+    if type(auth[0]) is not list:
         raise Exception("Expected a function in 'auth[0]' parameter")
 
     if not callable(auth[1]):
@@ -2137,8 +2221,18 @@ _EventAddHandleFunc = FakeHandler
 class LibvirtFixture(fixtures.Fixture):
     """Performs global setup/stubbing for all libvirt tests.
     """
+
     def __init__(self, stub_os_vif=True):
         self.stub_os_vif = stub_os_vif
+        self.pci_address_to_mac_map = collections.defaultdict(
+            lambda: '52:54:00:1e:59:c6')
+
+    def update_sriov_mac_address_mapping(self, pci_address_to_mac_map):
+        self.pci_address_to_mac_map.update(pci_address_to_mac_map)
+
+    def fake_get_mac_by_pci_address(self, pci_addr, pf_interface=False):
+        res = self.pci_address_to_mac_map[pci_addr]
+        return res
 
     def setUp(self):
         super().setUp()
@@ -2151,27 +2245,39 @@ class LibvirtFixture(fixtures.Fixture):
 
         self.useFixture(
             fixtures.MockPatch('nova.virt.libvirt.utils.get_fs_info'))
-        self.useFixture(
-            fixtures.MockPatch('nova.compute.utils.get_machine_ips'))
+        self.mock_get_machine_ips = self.useFixture(
+            fixtures.MockPatch('nova.compute.utils.get_machine_ips')).mock
 
         # libvirt driver needs to call out to the filesystem to get the
         # parent_ifname for the SRIOV VFs.
+        self.mock_get_ifname_by_pci_address = self.useFixture(
+            fixtures.MockPatch(
+                "nova.pci.utils.get_ifname_by_pci_address",
+                return_value="fake_pf_interface_name",
+            )
+        ).mock
+
         self.useFixture(fixtures.MockPatch(
-            'nova.pci.utils.get_ifname_by_pci_address',
-            return_value='fake_pf_interface_name'))
+            'nova.pci.utils.get_mac_by_pci_address',
+            side_effect=self.fake_get_mac_by_pci_address))
 
         # libvirt calls out to sysfs to get the vfs ID during macvtap plug
-        self.useFixture(fixtures.MockPatch(
-            'nova.pci.utils.get_vf_num_by_pci_address', return_value=1))
+        self.mock_get_vf_num_by_pci_address = self.useFixture(
+            fixtures.MockPatch(
+                'nova.pci.utils.get_vf_num_by_pci_address', return_value=1
+            )
+        ).mock
 
         # libvirt calls out to privsep to set the mac and vlan of a macvtap
-        self.useFixture(fixtures.MockPatch(
-            'nova.privsep.linux_net.set_device_macaddr_and_vlan'))
+        self.mock_set_device_macaddr_and_vlan = self.useFixture(
+            fixtures.MockPatch(
+                'nova.privsep.linux_net.set_device_macaddr_and_vlan')).mock
 
         # libvirt calls out to privsep to set the port state during macvtap
         # plug
-        self.useFixture(fixtures.MockPatch(
-            'nova.privsep.linux_net.set_device_macaddr'))
+        self.mock_set_device_macaddr = self.useFixture(
+            fixtures.MockPatch(
+                'nova.privsep.linux_net.set_device_macaddr')).mock
 
         # Don't assume that the system running tests has a valid machine-id
         self.useFixture(fixtures.MockPatch(
@@ -2186,8 +2292,17 @@ class LibvirtFixture(fixtures.Fixture):
         # Ensure tests perform the same on all host architectures
         fake_uname = os_uname(
             'Linux', '', '5.4.0-0-generic', '', obj_fields.Architecture.X86_64)
-        self.useFixture(
-            fixtures.MockPatch('os.uname', return_value=fake_uname))
+        self.mock_uname = self.useFixture(
+            fixtures.MockPatch('os.uname', return_value=fake_uname)).mock
+
+        real_exists = os.path.exists
+
+        def fake_exists(path):
+            if path == host.SEV_KERNEL_PARAM_FILE:
+                return False
+            return real_exists(path)
+
+        self.useFixture(fixtures.MonkeyPatch('os.path.exists', fake_exists))
 
         # ...and on all machine types
         fake_loaders = [

@@ -118,6 +118,7 @@ Related options:
 * ``disk_prefix``: depends on this
 * ``cpu_mode``: depends on this
 * ``cpu_models``: depends on this
+* ``tb_cache_size``: depends on this
 """),
     cfg.StrOpt('connection_uri',
                default='',
@@ -321,13 +322,14 @@ Please refer to the libvirt documentation for further details.
                default=500,
                min=100,
                help="""
-Maximum permitted downtime, in milliseconds, for live migration
-switchover.
+Target maximum period of time Nova will try to keep the instance paused
+during the last part of the memory copy, in *milliseconds*.
 
-Will be rounded up to a minimum of 100ms. You can increase this value
-if you want to allow live-migrations to complete faster, or avoid
-live-migration timeout errors by allowing the guest to be paused for
-longer during the live-migration switch over.
+Minimum downtime is 100ms. You can increase this value if you want to allow
+live-migrations to complete faster, or avoid live-migration timeout errors
+by allowing the guest to be paused for longer during the live-migration switch
+over. This value may be exceeded if there is any reduction on the transfer rate
+after the VM is paused.
 
 Related options:
 
@@ -339,7 +341,7 @@ Related options:
                help="""
 Number of incremental steps to reach max downtime value.
 
-Will be rounded up to a minimum of 3 steps.
+Minimum number of steps is 3.
 """),
     cfg.IntOpt('live_migration_downtime_delay',
                default=75,
@@ -452,7 +454,7 @@ support built into QEMU.
 
 Prerequisite: TLS environment is configured correctly on all relevant
 Compute nodes.  This means, Certificate Authority (CA), server, client
-certificates, their corresponding keys, and their file permisssions are
+certificates, their corresponding keys, and their file permissions are
 in place, and are validated.
 
 Notes:
@@ -704,7 +706,7 @@ the source of entropy on the host.  Since libvirt 1.3.4, any path (that
 returns random numbers when read) is accepted.  The recommended source
 of entropy is ``/dev/urandom`` -- it is non-blocking, therefore
 relatively fast; and avoids the limitations of ``/dev/random``, which is
-a legacy interface.  For more details (and comparision between different
+a legacy interface.  For more details (and comparison between different
 RNG sources), refer to the "Usage" section in the Linux kernel API
 documentation for ``[u]random``:
 http://man7.org/linux/man-pages/man4/urandom.4.html and
@@ -852,14 +854,15 @@ The option may be reused for other equivalent technologies in the
 future.  If the machine does not support memory encryption, the option
 will be ignored and inventory will be set to 0.
 
-If the machine does support memory encryption, *for now* a value of
-``None`` means an effectively unlimited inventory, i.e. no limit will
-be imposed by Nova on the number of SEV guests which can be launched,
-even though the underlying hardware will enforce its own limit.
-However it is expected that in the future, auto-detection of the
-inventory from the hardware will become possible, at which point
-``None`` will cause auto-detection to automatically impose the correct
-limit.
+If the machine does support memory encryption and this option is not set,
+the driver detects maximum number of SEV guests from the libvirt API which
+is available since v8.0.0. Setting this option overrides the detected limit,
+unless the given value is not larger than the detected limit.
+
+On the other hand, if an older version of libvirt is used, ``None`` means
+an effectively unlimited inventory, i.e. no limit will be imposed by Nova
+on the number of SEV guests which can be launched, even though the underlying
+hardware will enforce its own limit.
 
 .. note::
 
@@ -898,6 +901,43 @@ detach.
 Related options:
 
 * :oslo.config:option:`libvirt.device_detach_attempts`
+
+"""),
+    cfg.IntOpt('tb_cache_size',
+                min=0,
+                help="""
+Qemu>=5.0.0 bumped the default tb-cache size to 1GiB(from 32MiB) and this
+made it difficult to run multiple guest VMs on systems running with lower
+memory. With Libvirt>=8.0.0 this config option can be used to configure
+lower tb-cache size.
+
+Set it to > 0 to configure tb-cache for guest VMs.
+
+Related options:
+
+* ``compute_driver`` (libvirt)
+* ``virt_type`` (qemu)
+"""),
+
+    cfg.StrOpt('migration_inbound_addr',
+                       default='$my_ip',
+                       help="""
+The address used as the migration address for this host.
+
+This option indicates the IP address, hostname, or FQDN which should be used as
+the target for cold migration, resize, and evacuate traffic when moving to this
+hypervisor. This metadata is then used by the source of the migration traffic
+to construct the commands used to copy data (e.g. disk image) to the
+destination.
+
+An included "%s" is replaced with the hostname of the migration target
+hypervisor.
+
+
+Related options:
+
+* ``my_ip``
+* ``live_migration_inbound_addr``
 
 """),
 ]
@@ -986,6 +1026,7 @@ slowly to be useful. Actual errors will be reported by Glance and noticed
 according to the poll interval.
 
 Related options:
+
 * images_type - must be set to ``rbd``
 * images_rbd_glance_store_name - must be set to a store name
 * images_rbd_glance_copy_poll_interval - controls the failure time-to-notice
@@ -1476,6 +1517,23 @@ Related options:
 """),
 ]
 
+libvirt_cpu_mgmt_opts = [
+    cfg.BoolOpt('cpu_power_management',
+                default=False,
+                help='Use libvirt to manage CPU cores performance.'),
+    cfg.StrOpt('cpu_power_management_strategy',
+               choices=['cpu_state', 'governor'],
+               default='cpu_state',
+               help='Tuning strategy to reduce CPU power consumption when '
+                    'unused'),
+    cfg.StrOpt('cpu_power_governor_low',
+               default='powersave',
+               help='Governor to use in order '
+                    'to reduce CPU power consumption'),
+    cfg.StrOpt('cpu_power_governor_high',
+             default='performance',
+             help='Governor to use in order to have best CPU performance'),
+]
 
 ALL_OPTS = list(itertools.chain(
     libvirt_general_opts,
@@ -1497,6 +1555,7 @@ ALL_OPTS = list(itertools.chain(
     libvirt_volume_nvmeof_opts,
     libvirt_pmem_opts,
     libvirt_vtpm_opts,
+    libvirt_cpu_mgmt_opts,
 ))
 
 

@@ -108,6 +108,7 @@ class TestImageMetaProps(test.NoDBTestCase):
                  'hw_video_model': 'vga',
                  'hw_video_ram': '512',
                  'hw_qemu_guest_agent': 'yes',
+                 'hw_locked_memory': 'true',
                  'trait:CUSTOM_TRUSTED': 'required',
                  # Fill sane values for the rest here
                  }
@@ -116,6 +117,7 @@ class TestImageMetaProps(test.NoDBTestCase):
         self.assertEqual('vga', virtprops.hw_video_model)
         self.assertEqual(512, virtprops.hw_video_ram)
         self.assertTrue(virtprops.hw_qemu_guest_agent)
+        self.assertTrue(virtprops.hw_locked_memory)
         self.assertIsNotNone(virtprops.traits_required)
         self.assertIn('CUSTOM_TRUSTED', virtprops.traits_required)
 
@@ -285,6 +287,28 @@ class TestImageMetaProps(test.NoDBTestCase):
         self.assertEqual([set([0, 1, 2, 3])],
                          virtprops.hw_numa_cpus)
 
+    def test_locked_memory_prop(self):
+        props = {'hw_locked_memory': 'true'}
+        virtprops = objects.ImageMetaProps.from_dict(props)
+        self.assertTrue(virtprops.hw_locked_memory)
+
+    def test_obj_make_compatible_hw_locked_memory(self):
+        """Check 'hw_locked_memory' compatibility."""
+        # assert that 'hw_locked_memory' is supported
+        # on a suitably new version
+        obj = objects.ImageMetaProps(
+            hw_locked_memory='true',
+        )
+        primitive = obj.obj_to_primitive('1.33')
+        self.assertIn('hw_locked_memory',
+            primitive['nova_object.data'])
+        self.assertTrue(primitive['nova_object.data']['hw_locked_memory'])
+
+        # and is absent on older versions
+        primitive = obj.obj_to_primitive('1.32')
+        self.assertNotIn('hw_locked_memory',
+                         primitive['nova_object.data'])
+
     def test_get_unnumbered_trait_fields(self):
         """Tests that only valid un-numbered required traits are parsed from
         the properties.
@@ -348,6 +372,53 @@ class TestImageMetaProps(test.NoDBTestCase):
             obj.hw_disk_bus = bus
             self.assertRaises(exception.ObjectActionError,
                               obj.obj_to_primitive, '1.0')
+
+    def test_obj_make_compatible_hw_ephemeral_encryption(self):
+        """Check 'hw_ephemeral_encryption(_format)' compatibility."""
+        # assert that 'hw_ephemeral_encryption' and
+        # 'hw_ephemeral_encryption_format' is supported
+        # on a suitably new version
+        new_fields = (
+            'hw_ephemeral_encryption',
+            'hw_ephemeral_encryption_format'
+        )
+        eph_format = objects.fields.BlockDeviceEncryptionFormatType.LUKS
+        obj = objects.ImageMetaProps(
+            hw_ephemeral_encryption='yes',
+            hw_ephemeral_encryption_format=eph_format,
+        )
+        primitive = obj.obj_to_primitive('1.32')
+        for field in new_fields:
+            self.assertIn(field, primitive['nova_object.data'])
+        self.assertTrue(
+            primitive['nova_object.data']['hw_ephemeral_encryption'])
+        self.assertEqual(
+            eph_format,
+            primitive['nova_object.data']['hw_ephemeral_encryption_format'])
+
+        # and is absent on older versions
+        primitive = obj.obj_to_primitive('1.31')
+        for field in new_fields:
+            self.assertNotIn(field, primitive['nova_object.data'])
+
+    def test_obj_make_compatible_hw_emulation(self):
+        """Check 'hw_emulation_architecture' compatibility."""
+        # assert that 'hw_emulation_architecture' is supported
+        # on a suitably new version
+        obj = objects.ImageMetaProps(
+            hw_emulation_architecture=objects.fields.Architecture.AARCH64,
+        )
+        primitive = obj.obj_to_primitive('1.31')
+        self.assertIn('hw_emulation_architecture',
+            primitive['nova_object.data'])
+        self.assertEqual(
+            objects.fields.Architecture.AARCH64,
+            primitive['nova_object.data']['hw_emulation_architecture'])
+
+        # and is absent on older versions
+        primitive = obj.obj_to_primitive('1.29')
+        self.assertNotIn('hw_emulation_architecture',
+                         primitive['nova_object.data'])
 
     def test_obj_make_compatible_input_bus(self):
         """Check 'hw_input_bus' compatibility."""
@@ -467,3 +538,19 @@ class TestImageMetaProps(test.NoDBTestCase):
             hw_pci_numa_affinity_policy=fields.PCINUMAAffinityPolicy.SOCKET)
         self.assertRaises(exception.ObjectActionError,
                           obj.obj_to_primitive, '1.27')
+
+    def test_obj_make_compatible_viommu_model(self):
+        """Check 'hw_viommu_model' compatibility."""
+        # assert that 'hw_viommu_model' is supported on a suitably new version
+        obj = objects.ImageMetaProps(
+            hw_viommu_model=objects.fields.VIOMMUModel.VIRTIO,
+        )
+        primitive = obj.obj_to_primitive('1.34')
+        self.assertIn('hw_viommu_model', primitive['nova_object.data'])
+        self.assertEqual(
+            objects.fields.VIOMMUModel.VIRTIO,
+            primitive['nova_object.data']['hw_viommu_model'])
+
+        # and is absent on older versions
+        primitive = obj.obj_to_primitive('1.33')
+        self.assertNotIn('hw_viommu_model', primitive['nova_object.data'])

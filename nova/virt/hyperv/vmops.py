@@ -477,7 +477,7 @@ class VMOps(object):
                 reason=_("Hyper-V does not support CPU pinning."),
                 instance_id=instance.uuid)
 
-        # validate that the requested NUMA topology is not asymetric.
+        # validate that the requested NUMA topology is not asymmetric.
         # e.g.: it should be like: (X cpus, X cpus, Y cpus), where X == Y.
         # same with memory.
         for cell in instance_topology.cells:
@@ -747,7 +747,7 @@ class VMOps(object):
             # should be disconnected even if the VM doesn't exist anymore,
             # so they are not leaked.
             self.unplug_vifs(instance, network_info)
-            self._volumeops.disconnect_volumes(block_device_info)
+            self._volumeops.disconnect_volumes(block_device_info, force=True)
 
             if destroy_disks:
                 self._delete_disk_files(instance_name)

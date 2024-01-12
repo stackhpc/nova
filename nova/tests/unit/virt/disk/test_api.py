@@ -14,8 +14,8 @@
 #    under the License.
 
 import tempfile
+from unittest import mock
 
-import mock
 from oslo_concurrency import processutils
 from oslo_utils import units
 
@@ -40,6 +40,7 @@ class FakeMount(object):
 
 
 class APITestCase(test.NoDBTestCase):
+    @mock.patch('nova.virt.disk.vfs.guestfs.VFSGuestFS', new=mock.Mock())
     def test_can_resize_need_fs_type_specified(self):
         imgfile = tempfile.NamedTemporaryFile()
         self.addCleanup(imgfile.close)

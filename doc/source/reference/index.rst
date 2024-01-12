@@ -24,8 +24,7 @@ The following is a dive into some of the internals in nova.
   compute instances
 * :doc:`/reference/threading`: The concurrency model used in nova, which is
   based on eventlet, and may not be familiar to everyone.
-* :doc:`/reference/notifications`: How the notifications subsystem works in
-  nova, and considerations when adding notifications.
+* :doc:`/reference/notifications`: The notifications available in nova.
 * :doc:`/reference/update-provider-tree`: A detailed explanation of the
   ``ComputeDriver.update_provider_tree`` method.
 * :doc:`/reference/upgrade-checks`: A guide to writing automated upgrade
@@ -45,7 +44,7 @@ The following is a dive into some of the internals in nova.
 * :doc:`/reference/libvirt-distro-support-matrix`: Libvirt virt driver OS
   distribution support matrix
 
-.. # NOTE(amotoki): toctree needs to be placed at the end of the secion to
+.. # NOTE(amotoki): toctree needs to be placed at the end of the section to
    # keep the document structure in the PDF doc.
 .. toctree::
    :hidden:
@@ -74,7 +73,7 @@ Debugging
 * :doc:`/reference/gmr`: Inspired by Amiga, a way to trigger a very
   comprehensive dump of a running service for deep debugging.
 
-.. # NOTE(amotoki): toctree needs to be placed at the end of the secion to
+.. # NOTE(amotoki): toctree needs to be placed at the end of the section to
    # keep the document structure in the PDF doc.
 .. toctree::
    :hidden:
@@ -92,19 +91,17 @@ these documents will move into the "Internals" section.
 If you want to get involved in shaping the future of nova's architecture,
 these are a great place to start reading up on the current plans.
 
-* :doc:`/user/cells`: How cells v2 is evolving
 * :doc:`/reference/policy-enforcement`: How we want policy checks on API actions
   to work in the future
-* :doc:`/reference/stable-api`: What stable api means to nova
+* :doc:`/reference/stable-api`: What stable API means to nova
 * :doc:`/reference/scheduler-evolution`: Motivation behind the scheduler /
   placement evolution
 
-.. # NOTE(amotoki): toctree needs to be placed at the end of the secion to
+.. # NOTE(amotoki): toctree needs to be placed at the end of the section to
    # keep the document structure in the PDF doc.
 .. toctree::
    :hidden:
 
-   /user/cells
    policy-enforcement
    stable-api
    scheduler-evolution
@@ -115,7 +112,7 @@ Additional Information
 * :doc:`/reference/glossary`: A quick reference guide to some of the terms you
   might encounter working on or using nova.
 
-.. # NOTE(amotoki): toctree needs to be placed at the end of the secion to
+.. # NOTE(amotoki): toctree needs to be placed at the end of the section to
    # keep the document structure in the PDF doc.
 .. toctree::
    :hidden:

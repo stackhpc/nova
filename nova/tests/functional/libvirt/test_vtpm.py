@@ -13,7 +13,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import mock
+from unittest import mock
 
 from castellan.common.objects import passphrase
 from castellan.key_manager import key_manager
@@ -128,7 +128,7 @@ class VTPMServersTest(base.ServersTestBase):
         # the presence of users on the host, none of which makes sense here
         _p = mock.patch(
             'nova.virt.libvirt.driver.LibvirtDriver._check_vtpm_support')
-        self.mock_conn = _p.start()
+        _p.start()
         self.addCleanup(_p.stop)
 
         self.key_mgr = crypto._get_key_manager()

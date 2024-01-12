@@ -14,15 +14,20 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
 import ddt
-import mock
 from oslo_db.sqlalchemy import enginefacade
+from oslo_limit import fixture as limit_fixture
+from oslo_utils.fixture import uuidsentinel as uuids
 
 from nova.compute import api as compute
 import nova.conf
 from nova import context
 from nova.db.main import models
 from nova import exception
+from nova.limit import local as local_limit
+from nova.limit import placement as placement_limit
 from nova import objects
 from nova import quota
 from nova import test
@@ -57,6 +62,7 @@ class QuotaIntegrationTestCase(test.TestCase):
         super(QuotaIntegrationTestCase, self).setUp()
         self.flags(instances=2,
                    cores=4,
+                   ram=16384,
                    group='quota')
 
         self.user_id = 'admin'
@@ -97,7 +103,7 @@ class QuotaIntegrationTestCase(test.TestCase):
         # _instances_cores_ram_count().
         inst_map = objects.InstanceMapping(
             self.context, instance_uuid=inst.uuid, project_id=inst.project_id,
-            cell_mapping=cell1)
+            user_id=inst.user_id, cell_mapping=cell1)
         inst_map.create()
         return inst
 
@@ -109,15 +115,15 @@ class QuotaIntegrationTestCase(test.TestCase):
             self.compute_api.create(
                 self.context, min_count=1, max_count=1,
                 flavor=self.flavor, image_href=image_uuid)
-        except exception.QuotaError as e:
+        except exception.OverQuota as e:
             expected_kwargs = {'code': 413,
-                               'req': '1, 1',
-                               'used': '8, 2',
-                               'allowed': '4, 2',
-                               'overs': 'cores, instances'}
+                               'req': '1, 1, 2048',
+                               'used': '8, 2, 16384',
+                               'allowed': '4, 2, 16384',
+                               'overs': 'cores, instances, ram'}
             self.assertEqual(expected_kwargs, e.kwargs)
         else:
-            self.fail('Expected QuotaError exception')
+            self.fail('Expected OverQuota exception')
 
     def test_too_many_cores(self):
         self._create_instance()
@@ -126,7 +132,7 @@ class QuotaIntegrationTestCase(test.TestCase):
             self.compute_api.create(
                 self.context, min_count=1, max_count=1, flavor=self.flavor,
                 image_href=image_uuid)
-        except exception.QuotaError as e:
+        except exception.OverQuota as e:
             expected_kwargs = {'code': 413,
                                'req': '1',
                                'used': '4',
@@ -134,7 +140,7 @@ class QuotaIntegrationTestCase(test.TestCase):
                                'overs': 'cores'}
             self.assertEqual(expected_kwargs, e.kwargs)
         else:
-            self.fail('Expected QuotaError exception')
+            self.fail('Expected OverQuota exception')
 
     def test_many_cores_with_unlimited_quota(self):
         # Setting cores quota to unlimited:
@@ -150,7 +156,7 @@ class QuotaIntegrationTestCase(test.TestCase):
             metadata['key%s' % i] = 'value%s' % i
         image_uuid = 'cedef40a-ed67-4d10-800e-17455edce175'
         self.assertRaises(
-            exception.QuotaError, self.compute_api.create,
+            exception.OverQuota, self.compute_api.create,
             self.context, min_count=1, max_count=1, flavor=self.flavor,
             image_href=image_uuid, metadata=metadata)
 
@@ -170,40 +176,126 @@ class QuotaIntegrationTestCase(test.TestCase):
         files = []
         for i in range(CONF.quota.injected_files):
             files.append(('/my/path%d' % i, 'config = test\n'))
-        self._create_with_injected_files(files)  # no QuotaError
+        self._create_with_injected_files(files)  # no OverQuota
 
     def test_too_many_injected_files(self):
         files = []
         for i in range(CONF.quota.injected_files + 1):
             files.append(('/my/path%d' % i, 'my\ncontent%d\n' % i))
-        self.assertRaises(exception.QuotaError,
+        self.assertRaises(exception.OverQuota,
                           self._create_with_injected_files, files)
 
     def test_max_injected_file_content_bytes(self):
         max = CONF.quota.injected_file_content_bytes
         content = ''.join(['a' for i in range(max)])
         files = [('/test/path', content)]
-        self._create_with_injected_files(files)  # no QuotaError
+        self._create_with_injected_files(files)  # no OverQuota
 
     def test_too_many_injected_file_content_bytes(self):
         max = CONF.quota.injected_file_content_bytes
         content = ''.join(['a' for i in range(max + 1)])
         files = [('/test/path', content)]
-        self.assertRaises(exception.QuotaError,
+        self.assertRaises(exception.OverQuota,
                           self._create_with_injected_files, files)
 
     def test_max_injected_file_path_bytes(self):
         max = CONF.quota.injected_file_path_length
         path = ''.join(['a' for i in range(max)])
         files = [(path, 'config = quotatest')]
-        self._create_with_injected_files(files)  # no QuotaError
+        self._create_with_injected_files(files)  # no OverQuota
 
     def test_too_many_injected_file_path_bytes(self):
         max = CONF.quota.injected_file_path_length
         path = ''.join(['a' for i in range(max + 1)])
         files = [(path, 'config = quotatest')]
-        self.assertRaises(exception.QuotaError,
+        self.assertRaises(exception.OverQuota,
                           self._create_with_injected_files, files)
+
+    def _test_with_server_group_members(self):
+        # use a known image uuid to avoid ImageNotFound errors
+        image_uuid = nova_fixtures.GlanceFixture.image4['id']
+
+        instance_group = objects.InstanceGroup(self.context,
+                                               policy="anti-affinity")
+        instance_group.name = "foo"
+        instance_group.project_id = self.context.project_id
+        instance_group.user_id = self.context.user_id
+        instance_group.uuid = uuids.instance_group
+        instance_group.create()
+
+        self.addCleanup(instance_group.destroy)
+
+        self.compute_api.create(
+            self.context, flavor=self.flavor,
+            image_href=image_uuid,
+            scheduler_hints={'group': uuids.instance_group},
+            check_server_group_quota=True)
+
+        exc = self.assertRaises(exception.OverQuota, self.compute_api.create,
+                                self.context,
+                                flavor=self.flavor,
+                                image_href=image_uuid,
+                                scheduler_hints={
+                                    'group': uuids.instance_group},
+                                check_server_group_quota=True)
+        return exc
+
+    def test_with_server_group_members(self):
+        self.flags(server_group_members=1, group="quota")
+        exc = self._test_with_server_group_members()
+        self.assertEqual("Quota exceeded, too many servers in group", str(exc))
+
+
+class UnifiedLimitsIntegrationTestCase(QuotaIntegrationTestCase):
+    """Test that API and DB resources enforce properly with unified limits.
+
+    Note: coverage for instances, cores, ram, and disk is located under
+    nova/tests/functional/. We don't attempt to test it here as the
+    PlacementFixture is needed to provide resource usages and it is only
+    available in the functional tests environment.
+
+    Note that any test that will succeed in creating a server also needs to be
+    able to use the PlacementFixture as cores, ram, and disk quota are enforced
+    while booting a server. These tests are also located under
+    nova/tests/functional/.
+    """
+
+    def setUp(self):
+        super(UnifiedLimitsIntegrationTestCase, self).setUp()
+        self.flags(driver="nova.quota.UnifiedLimitsDriver", group="quota")
+        reglimits = {local_limit.SERVER_METADATA_ITEMS: 128,
+                     local_limit.INJECTED_FILES: 5,
+                     local_limit.INJECTED_FILES_CONTENT: 10 * 1024,
+                     local_limit.INJECTED_FILES_PATH: 255,
+                     local_limit.KEY_PAIRS: 100,
+                     local_limit.SERVER_GROUPS: 10,
+                     local_limit.SERVER_GROUP_MEMBERS: 10,
+                     'servers': 10,
+                     'class:VCPU': 20,
+                     'class:MEMORY_MB': 50 * 1024,
+                     'class:DISK_GB': 100}
+        self.useFixture(limit_fixture.LimitFixture(reglimits, {}))
+
+    def test_too_many_instances(self):
+        pass
+
+    def test_too_many_cores(self):
+        pass
+
+    def test_no_injected_files(self):
+        pass
+
+    def test_max_injected_files(self):
+        pass
+
+    def test_max_injected_file_content_bytes(self):
+        pass
+
+    def test_max_injected_file_path_bytes(self):
+        pass
+
+    def test_with_server_group_members(self):
+        pass
 
 
 @enginefacade.transaction_context_provider
@@ -339,6 +431,19 @@ class QuotaEngineTestCase(test.TestCase):
     def test_init_override_obj(self):
         quota_obj = quota.QuotaEngine(quota_driver=FakeDriver)
         self.assertEqual(quota_obj._driver, FakeDriver)
+
+    def test_init_with_flag_set(self):
+        quota_obj = quota.QuotaEngine()
+        self.assertIsInstance(quota_obj._driver, quota.DbQuotaDriver)
+
+        self.flags(group="quota", driver="nova.quota.NoopQuotaDriver")
+        self.assertIsInstance(quota_obj._driver, quota.NoopQuotaDriver)
+
+        self.flags(group="quota", driver="nova.quota.UnifiedLimitsDriver")
+        self.assertIsInstance(quota_obj._driver, quota.UnifiedLimitsDriver)
+
+        self.flags(group="quota", driver="nova.quota.DbQuotaDriver")
+        self.assertIsInstance(quota_obj._driver, quota.DbQuotaDriver)
 
     def _get_quota_engine(self, driver, resources=None):
         resources = resources or [
@@ -1869,6 +1974,133 @@ class NoopQuotaDriverTestCase(test.TestCase):
                                                  quota.QUOTAS._resources,
                                                  'test_project')
         self.assertEqual(self.expected_settable_quotas, result)
+
+
+class UnifiedLimitsDriverTestCase(NoopQuotaDriverTestCase):
+    def setUp(self):
+        super(UnifiedLimitsDriverTestCase, self).setUp()
+        self.driver = quota.UnifiedLimitsDriver()
+        # Set this so all limits get a different value but we also test as much
+        # as possible with the default config
+        reglimits = {local_limit.SERVER_METADATA_ITEMS: 128,
+                     local_limit.INJECTED_FILES: 5,
+                     local_limit.INJECTED_FILES_CONTENT: 10 * 1024,
+                     local_limit.INJECTED_FILES_PATH: 255,
+                     local_limit.KEY_PAIRS: 100,
+                     local_limit.SERVER_GROUPS: 12,
+                     local_limit.SERVER_GROUP_MEMBERS: 10}
+        self.useFixture(limit_fixture.LimitFixture(reglimits, {}))
+
+        self.expected_without_dict = {
+            'cores': 2,
+            'fixed_ips': -1,
+            'floating_ips': -1,
+            'injected_file_content_bytes': 10240,
+            'injected_file_path_bytes': 255,
+            'injected_files': 5,
+            'instances': 1,
+            'key_pairs': 100,
+            'metadata_items': 128,
+            'ram': 0,
+            'security_group_rules': -1,
+            'security_groups': -1,
+            'server_group_members': 10,
+            'server_groups': 12,
+        }
+        self.expected_without_usages = {
+            'cores': {'limit': 2},
+            'fixed_ips': {'limit': -1},
+            'floating_ips': {'limit': -1},
+            'injected_file_content_bytes': {'limit': 10240},
+            'injected_file_path_bytes': {'limit': 255},
+            'injected_files': {'limit': 5},
+            'instances': {'limit': 1},
+            'key_pairs': {'limit': 100},
+            'metadata_items': {'limit': 128},
+            'ram': {'limit': 3},
+            'security_group_rules': {'limit': -1},
+            'security_groups': {'limit': -1},
+            'server_group_members': {'limit': 10},
+            'server_groups': {'limit': 12}
+        }
+        self.expected_with_usages = {
+            'cores': {'in_use': 5, 'limit': 2},
+            'fixed_ips': {'in_use': 0, 'limit': -1},
+            'floating_ips': {'in_use': 0, 'limit': -1},
+            'injected_file_content_bytes': {'in_use': 0, 'limit': 10240},
+            'injected_file_path_bytes': {'in_use': 0, 'limit': 255},
+            'injected_files': {'in_use': 0, 'limit': 5},
+            'instances': {'in_use': 4, 'limit': 1},
+            'key_pairs': {'in_use': 0, 'limit': 100},
+            'metadata_items': {'in_use': 0, 'limit': 128},
+            'ram': {'in_use': 6, 'limit': 3},
+            'security_group_rules': {'in_use': 0, 'limit': -1},
+            'security_groups': {'in_use': 0, 'limit': -1},
+            'server_group_members': {'in_use': 0, 'limit': 10},
+            'server_groups': {'in_use': 9, 'limit': 12}
+        }
+
+    @mock.patch.object(placement_limit, "get_legacy_default_limits")
+    def test_get_defaults(self, mock_default):
+        # zero for ram simulates no registered limit for ram
+        mock_default.return_value = {"instances": 1, "cores": 2, "ram": 0}
+        result = self.driver.get_defaults(None, quota.QUOTAS._resources)
+        self.assertEqual(self.expected_without_dict, result)
+        mock_default.assert_called_once_with()
+
+    @mock.patch.object(placement_limit, "get_legacy_default_limits")
+    def test_get_class_quotas(self, mock_default):
+        mock_default.return_value = {"instances": 1, "cores": 2, "ram": 0}
+        result = self.driver.get_class_quotas(
+            None, quota.QUOTAS._resources, 'test_class')
+        self.assertEqual(self.expected_without_dict, result)
+        mock_default.assert_called_once_with()
+
+    @mock.patch.object(placement_limit, "get_legacy_counts")
+    @mock.patch.object(placement_limit, "get_legacy_project_limits")
+    @mock.patch.object(objects.InstanceGroupList, "get_counts")
+    def test_get_project_quotas(self, mock_count, mock_proj, mock_kcount):
+        mock_proj.return_value = {"instances": 1, "cores": 2, "ram": 3}
+        mock_kcount.return_value = {"instances": 4, "cores": 5, "ram": 6}
+        mock_count.return_value = {'project': {'server_groups': 9}}
+        result = self.driver.get_project_quotas(
+            None, quota.QUOTAS._resources, 'test_project')
+        self.assertEqual(self.expected_with_usages, result)
+        mock_count.assert_called_once_with(None, "test_project")
+
+    @mock.patch.object(placement_limit, "get_legacy_project_limits")
+    @mock.patch.object(objects.InstanceGroupList, "get_counts")
+    def test_get_project_quotas_no_usages(self, mock_count, mock_proj):
+        mock_proj.return_value = {"instances": 1, "cores": 2, "ram": 3}
+        result = self.driver.get_project_quotas(
+            None, quota.QUOTAS._resources, 'test_project', usages=False)
+        self.assertEqual(self.expected_without_usages, result)
+        # ensure usages not fetched when not required
+        self.assertEqual(0, mock_count.call_count)
+        mock_proj.assert_called_once_with("test_project")
+
+    @mock.patch.object(placement_limit, "get_legacy_counts")
+    @mock.patch.object(placement_limit, "get_legacy_project_limits")
+    @mock.patch.object(objects.InstanceGroupList, "get_counts")
+    def test_get_user_quotas(self, mock_count, mock_proj, mock_kcount):
+        mock_proj.return_value = {"instances": 1, "cores": 2, "ram": 3}
+        mock_kcount.return_value = {"instances": 4, "cores": 5, "ram": 6}
+        mock_count.return_value = {'project': {'server_groups': 9}}
+        result = self.driver.get_user_quotas(
+            None, quota.QUOTAS._resources, 'test_project', 'fake_user')
+        self.assertEqual(self.expected_with_usages, result)
+        mock_count.assert_called_once_with(None, "test_project")
+
+    @mock.patch.object(placement_limit, "get_legacy_project_limits")
+    @mock.patch.object(objects.InstanceGroupList, "get_counts")
+    def test_get_user_quotas_no_usages(self, mock_count, mock_proj):
+        mock_proj.return_value = {"instances": 1, "cores": 2, "ram": 3}
+        result = self.driver.get_user_quotas(
+            None, quota.QUOTAS._resources, 'test_project', 'fake_user',
+            usages=False)
+        self.assertEqual(self.expected_without_usages, result)
+        # ensure usages not fetched when not required
+        self.assertEqual(0, mock_count.call_count)
 
 
 @ddt.ddt

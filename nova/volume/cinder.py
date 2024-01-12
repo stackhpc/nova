@@ -25,7 +25,6 @@ import sys
 import urllib
 
 from cinderclient import api_versions as cinder_api_versions
-from cinderclient import apiclient as cinder_apiclient
 from cinderclient import client as cinder_client
 from cinderclient import exceptions as cinder_exception
 from keystoneauth1 import exceptions as keystone_exception
@@ -92,12 +91,14 @@ def _get_auth(context):
     # from them generated from 'context.get_admin_context'
     # which only set is_admin=True but is without token.
     # So add load_auth_plugin when this condition appear.
+    user_auth = None
     if context.is_admin and not context.auth_token:
         if not _ADMIN_AUTH:
             _ADMIN_AUTH = _load_auth_plugin(CONF)
-        return _ADMIN_AUTH
-    else:
-        return service_auth.get_auth_plugin(context)
+        user_auth = _ADMIN_AUTH
+
+    # When user_auth = None, user_auth will be extracted from the context.
+    return service_auth.get_auth_plugin(context, user_auth=user_auth)
 
 
 # NOTE(efried): Bug #1752152
@@ -413,6 +414,7 @@ def translate_cinder_exception(method):
 def translate_create_exception(method):
     """Transforms the exception for create but keeps its traceback intact.
     """
+
     def wrapper(self, ctx, size, *args, **kwargs):
         try:
             res = method(self, ctx, size, *args, **kwargs)
@@ -427,6 +429,7 @@ def translate_create_exception(method):
 def translate_volume_exception(method):
     """Transforms the exception for the volume but keeps its traceback intact.
     """
+
     def wrapper(self, ctx, volume_id, *args, **kwargs):
         try:
             res = method(self, ctx, volume_id, *args, **kwargs)
@@ -442,6 +445,7 @@ def translate_attachment_exception(method):
     """Transforms the exception for the attachment but keeps its traceback
     intact.
     """
+
     def wrapper(self, ctx, attachment_id, *args, **kwargs):
         try:
             res = method(self, ctx, attachment_id, *args, **kwargs)
@@ -456,6 +460,7 @@ def translate_snapshot_exception(method):
     """Transforms the exception for the snapshot but keeps its traceback
        intact.
     """
+
     def wrapper(self, ctx, snapshot_id, *args, **kwargs):
         try:
             res = method(self, ctx, snapshot_id, *args, **kwargs)
@@ -467,6 +472,7 @@ def translate_snapshot_exception(method):
 
 def translate_mixed_exceptions(method):
     """Transforms exceptions that can come from both volumes and snapshots."""
+
     def wrapper(self, ctx, res_id, *args, **kwargs):
         try:
             res = method(self, ctx, res_id, *args, **kwargs)
@@ -567,7 +573,8 @@ class API(object):
     @translate_volume_exception
     @retrying.retry(stop_max_attempt_number=5,
                     retry_on_exception=lambda e:
-                    type(e) == cinder_apiclient.exceptions.InternalServerError)
+                    (isinstance(e, cinder_exception.ClientException) and
+                     e.code == 500))
     def detach(self, context, volume_id, instance_uuid=None,
                attachment_id=None):
         client = cinderclient(context)
@@ -632,7 +639,8 @@ class API(object):
     @translate_volume_exception
     @retrying.retry(stop_max_attempt_number=5,
                     retry_on_exception=lambda e:
-                    type(e) == cinder_apiclient.exceptions.InternalServerError)
+                    (isinstance(e, cinder_exception.ClientException) and
+                     e.code == 500))
     def terminate_connection(self, context, volume_id, connector):
         return cinderclient(context).volumes.terminate_connection(volume_id,
                                                                   connector)
@@ -762,7 +770,7 @@ class API(object):
         """Create a volume attachment. This requires microversion >= 3.44.
 
         The attachment_create call was introduced in microversion 3.27. We
-        need 3.44 as minmum here as we need attachment_complete to finish the
+        need 3.44 as minimum here as we need attachment_complete to finish the
         attaching process and it which was introduced in version 3.44.
 
         :param context: The nova request context.
@@ -831,7 +839,44 @@ class API(object):
                            'msg': str(ex),
                            'code': getattr(ex, 'code', None)})
 
+    def attachment_get_all(self, context, instance_id=None, volume_id=None):
+        """Get all attachments by instance id or volume id
+
+        :param context: The nova request context.
+        :param instance_id: UUID of the instance attachment to get.
+        :param volume_id: UUID of the volume attachment to get.
+        :returns: a list of cinderclient.v3.attachments.VolumeAttachment
+            objects.
+        """
+        if not instance_id and not volume_id:
+            raise exception.InvalidRequest(
+                "Either instance or volume id must be passed.")
+
+        search_opts = {}
+
+        if instance_id:
+            search_opts['instance_id'] = instance_id
+        if volume_id:
+            search_opts['volume_id'] = volume_id
+
+        try:
+            attachments = cinderclient(
+                context, '3.44', skip_version_check=True).attachments.list(
+                    search_opts=search_opts)
+        except cinder_exception.ClientException as ex:
+            with excutils.save_and_reraise_exception():
+                LOG.error('Get all attachment failed. '
+                          'Error: %(msg)s Code: %(code)s',
+                          {'msg': str(ex),
+                           'code': getattr(ex, 'code', None)})
+        return [_translate_attachment_ref(
+            each.to_dict()) for each in attachments]
+
     @translate_attachment_exception
+    @retrying.retry(stop_max_attempt_number=5,
+                    retry_on_exception=lambda e:
+                    (isinstance(e, cinder_exception.ClientException) and
+                     e.code in (500, 504)))
     def attachment_update(self, context, attachment_id, connector,
                           mountpoint=None):
         """Updates the connector on the volume attachment. An attachment
@@ -881,19 +926,24 @@ class API(object):
     @translate_attachment_exception
     @retrying.retry(stop_max_attempt_number=5,
                     retry_on_exception=lambda e:
-                    type(e) == cinder_apiclient.exceptions.InternalServerError)
+                    (isinstance(e, cinder_exception.ClientException) and
+                     e.code in (500, 504)))
     def attachment_delete(self, context, attachment_id):
         try:
             cinderclient(
                 context, '3.44', skip_version_check=True).attachments.delete(
                     attachment_id)
         except cinder_exception.ClientException as ex:
-            with excutils.save_and_reraise_exception():
-                LOG.error('Delete attachment failed for attachment '
-                          '%(id)s. Error: %(msg)s Code: %(code)s',
-                          {'id': attachment_id,
-                           'msg': str(ex),
-                           'code': getattr(ex, 'code', None)})
+            if ex.code == 404:
+                LOG.warning('Attachment %(id)s does not exist. Ignoring.',
+                            {'id': attachment_id})
+            else:
+                with excutils.save_and_reraise_exception():
+                    LOG.error('Delete attachment failed for attachment '
+                              '%(id)s. Error: %(msg)s Code: %(code)s',
+                              {'id': attachment_id,
+                               'msg': str(ex),
+                               'code': getattr(ex, 'code', None)})
 
     @translate_attachment_exception
     def attachment_complete(self, context, attachment_id):
@@ -917,3 +967,9 @@ class API(object):
                           {'id': attachment_id,
                            'msg': str(ex),
                            'code': getattr(ex, 'code', None)})
+
+    @translate_volume_exception
+    def reimage_volume(self, context, volume_id, image_id,
+                       reimage_reserved=False):
+        cinderclient(context, '3.68').volumes.reimage(
+            volume_id, image_id, reimage_reserved)

@@ -10,7 +10,7 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-import mock
+from unittest import mock
 
 from nova import test
 from nova.tests import fixtures as nova_fixtures
@@ -33,6 +33,7 @@ class ServerFaultTestCase(test.TestCase,
         self.useFixture(func_fixtures.PlacementFixture())
         self.useFixture(nova_fixtures.GlanceFixture(self))
         self.useFixture(nova_fixtures.RealPolicyFixture())
+        self.useFixture(nova_fixtures.CinderFixture(self))
 
         # Start the compute services.
         self.start_service('conductor')

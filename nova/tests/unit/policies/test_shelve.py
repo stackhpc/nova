@@ -10,8 +10,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
 import fixtures
-import mock
 from oslo_utils.fixture import uuidsentinel as uuids
 
 from nova.api.openstack.compute import shelve
@@ -43,63 +44,48 @@ class ShelveServerPolicyTest(base.BasePolicyTest):
             id=1, uuid=uuids.fake_id, project_id=self.project_id,
             user_id=user_id, vm_state=vm_states.ACTIVE)
         self.mock_get.return_value = self.instance
-
-        # Check that admin or and server owner is able to shelve/unshelve
-        # the server
-        self.admin_or_owner_authorized_contexts = [
+        # With legacy rule and no scope checks, all admin, project members
+        # project reader or other project role(because legacy rule allow server
+        # owner- having same project id and no role check) is able to shelve,
+        # unshelve the server.
+        self.project_action_authorized_contexts = [
             self.legacy_admin_context, self.system_admin_context,
             self.project_admin_context, self.project_member_context,
             self.project_reader_context, self.project_foo_context]
-        # Check that non-admin/owner is not able to shelve/unshelve
-        # the server
-        self.admin_or_owner_unauthorized_contexts = [
-            self.system_member_context, self.system_reader_context,
-            self.system_foo_context,
-            self.other_project_member_context,
-            self.other_project_reader_context,
-        ]
-        # Check that admin is able to shelve offload the server.
-        self.admin_authorized_contexts = [
+
+        # By default, legacy rule are enable and scope check is disabled.
+        # system admin, legacy admin, and project admin is able to shelve
+        # offload the server.
+        self.project_admin_authorized_contexts = [
             self.legacy_admin_context, self.system_admin_context,
             self.project_admin_context]
-        # Check that non-admin is not able to shelve offload the server.
-        self.admin_unauthorized_contexts = [
-            self.system_member_context, self.system_reader_context,
-            self.system_foo_context, self.project_member_context,
-            self.project_reader_context, self.project_foo_context,
-            self.other_project_member_context,
-            self.other_project_reader_context,
-        ]
 
     @mock.patch('nova.compute.api.API.shelve')
     def test_shelve_server_policy(self, mock_shelve):
         rule_name = policies.POLICY_ROOT % 'shelve'
-        self.common_policy_check(self.admin_or_owner_authorized_contexts,
-                                 self.admin_or_owner_unauthorized_contexts,
-                                 rule_name,
-                                 self.controller._shelve,
-                                 self.req, self.instance.uuid,
-                                 body={'shelve': {}})
+        self.common_policy_auth(self.project_action_authorized_contexts,
+                                rule_name,
+                                self.controller._shelve,
+                                self.req, self.instance.uuid,
+                                body={'shelve': {}})
 
     @mock.patch('nova.compute.api.API.unshelve')
     def test_unshelve_server_policy(self, mock_unshelve):
         rule_name = policies.POLICY_ROOT % 'unshelve'
-        self.common_policy_check(self.admin_or_owner_authorized_contexts,
-                                 self.admin_or_owner_unauthorized_contexts,
-                                 rule_name,
-                                 self.controller._unshelve,
-                                 self.req, self.instance.uuid,
-                                 body={'unshelve': {}})
+        self.common_policy_auth(self.project_action_authorized_contexts,
+                                rule_name,
+                                self.controller._unshelve,
+                                self.req, self.instance.uuid,
+                                body={'unshelve': {}})
 
     @mock.patch('nova.compute.api.API.shelve_offload')
     def test_shelve_offload_server_policy(self, mock_offload):
         rule_name = policies.POLICY_ROOT % 'shelve_offload'
-        self.common_policy_check(self.admin_authorized_contexts,
-                                 self.admin_unauthorized_contexts,
-                                 rule_name,
-                                 self.controller._shelve_offload,
-                                 self.req, self.instance.uuid,
-                                 body={'shelveOffload': {}})
+        self.common_policy_auth(self.project_admin_authorized_contexts,
+                                rule_name,
+                                self.controller._shelve_offload,
+                                self.req, self.instance.uuid,
+                                body={'shelveOffload': {}})
 
     def test_shelve_server_policy_failed_with_other_user(self):
         # Change the user_id in request context.
@@ -115,13 +101,29 @@ class ShelveServerPolicyTest(base.BasePolicyTest):
             exc.format_message())
 
     @mock.patch('nova.compute.api.API.shelve')
-    def test_shelve_sevrer_overridden_policy_pass_with_same_user(
+    def test_shelve_server_overridden_policy_pass_with_same_user(
         self, mock_shelve):
         rule_name = policies.POLICY_ROOT % 'shelve'
         self.policy.set_rules({rule_name: "user_id:%(user_id)s"})
         self.controller._shelve(self.req,
                                 fakes.FAKE_UUID,
                                 body={'shelve': {}})
+
+
+class ShelveServerNoLegacyNoScopePolicyTest(ShelveServerPolicyTest):
+    """Test shelve/unshelve server APIs policies with no legacy deprecated
+    rules and no scope checks which means new defaults only.
+
+    """
+    without_deprecated_rules = True
+
+    def setUp(self):
+        super(ShelveServerNoLegacyNoScopePolicyTest, self).setUp()
+        # With no legacy rule, only project admin or member will be
+        # able to shelve/unshelve the server and only project admin can
+        # shelve offload the server.
+        self.project_action_authorized_contexts = (
+            self.project_member_or_admin_with_no_scope_no_legacy)
 
 
 class ShelveServerScopeTypePolicyTest(ShelveServerPolicyTest):
@@ -137,41 +139,23 @@ class ShelveServerScopeTypePolicyTest(ShelveServerPolicyTest):
     def setUp(self):
         super(ShelveServerScopeTypePolicyTest, self).setUp()
         self.flags(enforce_scope=True, group="oslo_policy")
+        # Scope enable will not allow system admin to shelve/unshelve the
+        # server.
+        self.project_action_authorized_contexts = (
+            self.project_m_r_or_admin_with_scope_and_legacy)
+        self.project_admin_authorized_contexts = [
+            self.legacy_admin_context, self.project_admin_context]
 
 
-class ShelveServerNoLegacyPolicyTest(ShelveServerScopeTypePolicyTest):
+class ShelveServerScopeTypeNoLegacyPolicyTest(ShelveServerScopeTypePolicyTest):
     """Test Shelve Server APIs policies with system scope enabled,
     and no more deprecated rules.
     """
     without_deprecated_rules = True
 
     def setUp(self):
-        super(ShelveServerNoLegacyPolicyTest, self).setUp()
-
-        # Check that system admin or and owner is able to shelve/unshelve
-        # the server.
-        self.admin_or_owner_authorized_contexts = [
-            self.system_admin_context,
-            self.project_admin_context, self.project_member_context]
-        # Check that non-system/admin/owner is not able to shelve/unshelve
-        # the server.
-        self.admin_or_owner_unauthorized_contexts = [
-            self.legacy_admin_context, self.system_member_context,
-            self.system_reader_context, self.system_foo_context,
-            self.other_project_member_context, self.project_reader_context,
-            self.project_foo_context,
-            self.other_project_reader_context,
-        ]
-        # Check that system admin is able to shelve offload the server.
-        self.admin_authorized_contexts = [
-            self.system_admin_context
-        ]
-        # Check that non system admin is not able to shelve offload the server
-        self.admin_unauthorized_contexts = [
-            self.legacy_admin_context, self.project_admin_context,
-            self.system_member_context, self.system_reader_context,
-            self.system_foo_context, self.project_member_context,
-            self.project_reader_context, self.project_foo_context,
-            self.other_project_member_context,
-            self.other_project_reader_context,
-        ]
+        super(ShelveServerScopeTypeNoLegacyPolicyTest, self).setUp()
+        # With scope enable and no legacy rule, only project admin/member
+        # will be able to shelve/unshelve the server.
+        self.project_action_authorized_contexts = (
+            self.project_member_or_admin_with_scope_no_legacy)

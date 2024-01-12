@@ -20,7 +20,9 @@ Driver base-classes:
     types that support that contract
 """
 
+import itertools
 import sys
+import typing as ty
 
 import os_resource_classes as orc
 import os_traits
@@ -32,6 +34,7 @@ from nova import context as nova_context
 from nova.i18n import _
 from nova import objects
 from nova.virt import event as virtevent
+import nova.virt.node
 
 CONF = nova.conf.CONF
 LOG = logging.getLogger(__name__)
@@ -44,6 +47,7 @@ def get_block_device_info(instance, block_device_mapping):
     of a dict containing the following keys:
 
     - root_device_name: device name of the root disk
+    - image: An instance of DriverImageBlockDevice or None
     - ephemerals: a (potentially empty) list of DriverEphemeralBlockDevice
                   instances
     - swap: An instance of DriverSwapBlockDevice or None
@@ -52,18 +56,18 @@ def get_block_device_info(instance, block_device_mapping):
                             specialized subclasses.
     """
     from nova.virt import block_device as virt_block_device
-
-    block_device_info = {
+    return {
         'root_device_name': instance.root_device_name,
+        'image': virt_block_device.convert_local_images(
+            block_device_mapping),
         'ephemerals': virt_block_device.convert_ephemerals(
             block_device_mapping),
         'block_device_mapping':
-            virt_block_device.convert_all_volumes(*block_device_mapping)
+            virt_block_device.convert_all_volumes(*block_device_mapping),
+        'swap':
+            virt_block_device.get_swap(
+                virt_block_device.convert_swap(block_device_mapping))
     }
-    swap_list = virt_block_device.convert_swap(block_device_mapping)
-    block_device_info['swap'] = virt_block_device.get_swap(swap_list)
-
-    return block_device_info
 
 
 def block_device_info_get_root_device(block_device_info):
@@ -81,6 +85,14 @@ def swap_is_usable(swap):
     return swap and swap['device_name'] and swap['swap_size'] > 0
 
 
+def block_device_info_get_image(block_device_info):
+    block_device_info = block_device_info or {}
+    # get_disk_mapping() supports block_device_info=None and thus requires that
+    # we return a list here.
+    image = block_device_info.get('image') or []
+    return image
+
+
 def block_device_info_get_ephemerals(block_device_info):
     block_device_info = block_device_info or {}
     ephemerals = block_device_info.get('ephemerals') or []
@@ -91,6 +103,19 @@ def block_device_info_get_mapping(block_device_info):
     block_device_info = block_device_info or {}
     block_device_mapping = block_device_info.get('block_device_mapping') or []
     return block_device_mapping
+
+
+def block_device_info_get_encrypted_disks(
+    block_device_info: ty.Mapping[str, ty.Any],
+) -> ty.List['nova.virt.block_device.DriverBlockDevice']:
+    block_device_info = block_device_info or {}
+    return [
+        driver_bdm for driver_bdm in itertools.chain(
+            block_device_info.get('image', []),
+            block_device_info.get('ephemerals', []),
+        )
+        if driver_bdm.get('encrypted')
+    ]
 
 
 # NOTE(aspiers): When adding new capabilities, ensure they are
@@ -126,11 +151,21 @@ CAPABILITY_TRAITS_MAP = {
     "supports_secure_boot": os_traits.COMPUTE_SECURITY_UEFI_SECURE_BOOT,
     "supports_socket_pci_numa_affinity":
         os_traits.COMPUTE_SOCKET_PCI_NUMA_AFFINITY,
+    "supports_remote_managed_ports": os_traits.COMPUTE_REMOTE_MANAGED_PORTS,
+    "supports_ephemeral_encryption": os_traits.COMPUTE_EPHEMERAL_ENCRYPTION,
+    "supports_ephemeral_encryption_luks":
+        os_traits.COMPUTE_EPHEMERAL_ENCRYPTION_LUKS,
+    "supports_ephemeral_encryption_plain":
+        os_traits.COMPUTE_EPHEMERAL_ENCRYPTION_PLAIN,
+    "supports_address_space_passthrough":
+        os_traits.COMPUTE_ADDRESS_SPACE_PASSTHROUGH,
+    "supports_address_space_emulated":
+        os_traits.COMPUTE_ADDRESS_SPACE_EMULATED,
 }
 
 
 def _check_image_type_exclude_list(capability, supported):
-    """Enforce the exclusion list on image_type capabilites.
+    """Enforce the exclusion list on image_type capabilities.
 
     :param capability: The supports_image_type_foo capability being checked
     :param supported: The flag indicating whether the virt driver *can*
@@ -194,6 +229,14 @@ class ComputeDriver(object):
         "supports_vtpm": False,
         "supports_secure_boot": False,
         "supports_socket_pci_numa_affinity": False,
+        "supports_remote_managed_ports": False,
+        "supports_address_space_passthrough": False,
+        "supports_address_space_emulated": False,
+
+        # Ephemeral encryption support flags
+        "supports_ephemeral_encryption": False,
+        "supports_ephemeral_encryption_luks": False,
+        "supports_ephemeral_encryption_plain": False,
 
         # Image type support flags
         "supports_image_type_aki": False,
@@ -297,7 +340,8 @@ class ComputeDriver(object):
                 admin_password, allocations, bdms, detach_block_devices,
                 attach_block_devices, network_info=None,
                 evacuate=False, block_device_info=None,
-                preserve_ephemeral=False, accel_uuids=None):
+                preserve_ephemeral=False, accel_uuids=None,
+                reimage_boot_volume=False):
         """Destroy and re-make this instance.
 
         A 'rebuild' effectively purges all existing data from the system and
@@ -335,6 +379,7 @@ class ComputeDriver(object):
         :param preserve_ephemeral: True if the default ephemeral storage
                                    partition must be preserved on rebuild
         :param accel_uuids: Accelerator UUIDs.
+        :param reimage_boot_volume: Re-image the volume backed instance.
         """
         raise NotImplementedError()
 
@@ -573,7 +618,7 @@ class ComputeDriver(object):
                       disk_bus=None, device_type=None, encryption=None):
         """Attach the disk to the instance at mountpoint using info.
 
-        :raises TooManyDiskDevices: if the maxmimum allowed devices to attach
+        :raises TooManyDiskDevices: if the maximum allowed devices to attach
                                     to a single instance is exceeded.
         """
         raise NotImplementedError()
@@ -1008,7 +1053,7 @@ class ComputeDriver(object):
         node, as well as the inventory, aggregates, and traits associated with
         those resource providers.
 
-        Implementors of this interface are expected to set ``allocation_ratio``
+        Implementers of this interface are expected to set ``allocation_ratio``
         and ``reserved`` values for inventory records, which may be based on
         configuration options, e.g. ``[DEFAULT]/cpu_allocation_ratio``,
         depending on the driver and resource class. If not provided, allocation
@@ -1126,7 +1171,7 @@ class ComputeDriver(object):
         :param disk_info: instance disk information
         :param migrate_data: a LiveMigrateData object
         :returns: migrate_data modified by the driver
-        :raises TooManyDiskDevices: if the maxmimum allowed devices to attach
+        :raises TooManyDiskDevices: if the maximum allowed devices to attach
                                     to a single instance is exceeded.
         """
         raise NotImplementedError()
@@ -1557,6 +1602,11 @@ class ComputeDriver(object):
         """
         raise NotImplementedError()
 
+    def get_nodenames_by_uuid(self, refresh=False):
+        """Returns a dict of {uuid: nodename} for all managed nodes."""
+        nodename = self.get_available_nodes()[0]
+        return {nova.virt.node.get_local_node_uuid(): nodename}
+
     def node_is_available(self, nodename):
         """Return whether this compute service manages a particular node."""
         if nodename in self.get_available_nodes():
@@ -1675,7 +1725,7 @@ class ComputeDriver(object):
             The metadata of the image of the instance.
         :param nova.objects.BlockDeviceMapping root_bdm:
             The description of the root device.
-        :raises TooManyDiskDevices: if the maxmimum allowed devices to attach
+        :raises TooManyDiskDevices: if the maximum allowed devices to attach
                                     to a single instance is exceeded.
         """
         raise NotImplementedError()
@@ -1684,7 +1734,7 @@ class ComputeDriver(object):
                                           *block_device_lists):
         """Default the missing device names in the block device mapping.
 
-        :raises TooManyDiskDevices: if the maxmimum allowed devices to attach
+        :raises TooManyDiskDevices: if the maximum allowed devices to attach
                                     to a single instance is exceeded.
         """
         raise NotImplementedError()
@@ -1703,7 +1753,7 @@ class ComputeDriver(object):
                                  implementation if not set.
 
         :returns: The chosen device name.
-        :raises TooManyDiskDevices: if the maxmimum allowed devices to attach
+        :raises TooManyDiskDevices: if the maximum allowed devices to attach
                                     to a single instance is exceeded.
         """
         raise NotImplementedError()

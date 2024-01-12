@@ -19,11 +19,11 @@ import inspect
 import os
 import shutil
 import tempfile
+from unittest import mock
 
 from castellan import key_manager
 import ddt
 import fixtures
-import mock
 from oslo_concurrency import lockutils
 from oslo_config import fixture as config_fixture
 from oslo_service import loopingcall
@@ -163,7 +163,13 @@ class _ImageTestCase(object):
             self.assertEqual(fs.source_file, image.path)
 
     def test_libvirt_info(self):
-        image = self.image_class(self.INSTANCE, self.NAME)
+        disk_info = {
+            'bus': 'virtio',
+            'dev': '/dev/vda',
+            'type': 'cdrom',
+        }
+        image = self.image_class(
+            self.INSTANCE, self.NAME, disk_info_mapping=disk_info)
         extra_specs = {
             'quota:disk_read_bytes_sec': 10 * units.Mi,
             'quota:disk_read_iops_sec': 1 * units.Ki,
@@ -172,15 +178,9 @@ class _ImageTestCase(object):
             'quota:disk_total_bytes_sec': 30 * units.Mi,
             'quota:disk_total_iops_sec': 3 * units.Ki,
         }
-        disk_info = {
-            'bus': 'virtio',
-            'dev': '/dev/vda',
-            'type': 'cdrom',
-        }
 
         disk = image.libvirt_info(
-            disk_info, cache_mode="none", extra_specs=extra_specs,
-            boot_order="1")
+            cache_mode="none", extra_specs=extra_specs, boot_order="1")
 
         self.assertIsInstance(disk, vconfig.LibvirtConfigGuestDisk)
         self.assertEqual("/dev/vda", disk.target_dev)
@@ -205,16 +205,18 @@ class _ImageTestCase(object):
         get_disk_size.assert_called_once_with(image.path)
 
     def _test_libvirt_info_scsi_with_unit(self, disk_unit):
-        # The address should be set if bus is scsi and unit is set.
-        # Otherwise, it should not be set at all.
-        image = self.image_class(self.INSTANCE, self.NAME)
         disk_info = {
             'bus': 'scsi',
             'dev': '/dev/sda',
             'type': 'disk',
         }
+        # The address should be set if bus is scsi and unit is set.
+        # Otherwise, it should not be set at all.
+        image = self.image_class(
+            self.INSTANCE, self.NAME, disk_info_mapping=disk_info)
+
         disk = image.libvirt_info(
-            disk_info, cache_mode='none', extra_specs={}, disk_unit=disk_unit)
+            cache_mode='none', extra_specs={}, disk_unit=disk_unit)
         if disk_unit:
             self.assertEqual(0, disk.device_addr.controller)
             self.assertEqual(disk_unit, disk.device_addr.unit)
@@ -523,31 +525,13 @@ class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
         mock_exists.assert_has_calls(exist_calls)
 
     @mock.patch.object(imagebackend.utils, 'synchronized')
-    @mock.patch('nova.virt.libvirt.utils.create_cow_image')
-    @mock.patch.object(imagebackend.disk, 'extend')
-    @mock.patch('nova.privsep.path.utime')
-    def test_create_image(self, mock_utime, mock_extend, mock_create,
-                          mock_sync):
-        mock_sync.side_effect = lambda *a, **kw: self._fake_deco
-        fn = mock.MagicMock()
-        image = self.image_class(self.INSTANCE, self.NAME)
-
-        image.create_image(fn, self.TEMPLATE_PATH, None)
-
-        mock_create.assert_called_once_with(self.TEMPLATE_PATH, self.PATH)
-        fn.assert_called_once_with(target=self.TEMPLATE_PATH)
-        self.assertTrue(mock_sync.called)
-        self.assertFalse(mock_extend.called)
-        mock_utime.assert_called()
-
-    @mock.patch.object(imagebackend.utils, 'synchronized')
-    @mock.patch('nova.virt.libvirt.utils.create_cow_image')
-    @mock.patch.object(imagebackend.disk, 'extend')
+    @mock.patch('nova.virt.libvirt.utils.create_image')
     @mock.patch.object(os.path, 'exists', side_effect=[])
     @mock.patch.object(imagebackend.Image, 'verify_base_size')
     @mock.patch('nova.privsep.path.utime')
-    def test_create_image_with_size(self, mock_utime, mock_verify, mock_exist,
-                                    mock_extend, mock_create, mock_sync):
+    def test_create_image(
+        self, mock_utime, mock_verify, mock_exist, mock_create, mock_sync
+    ):
         mock_sync.side_effect = lambda *a, **kw: self._fake_deco
         fn = mock.MagicMock()
         mock_exist.side_effect = [False, True, False, False, False]
@@ -561,17 +545,15 @@ class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
         image.create_image(fn, self.TEMPLATE_PATH, self.SIZE)
 
         mock_verify.assert_called_once_with(self.TEMPLATE_PATH, self.SIZE)
-        mock_create.assert_called_once_with(self.TEMPLATE_PATH, self.PATH)
-        mock_extend.assert_called_once_with(
-            imgmodel.LocalFileImage(self.PATH, imgmodel.FORMAT_QCOW2),
-            self.SIZE)
+        mock_create.assert_called_once_with(
+             self.PATH, 'qcow2', self.SIZE, backing_file=self.TEMPLATE_PATH)
         fn.assert_called_once_with(target=self.TEMPLATE_PATH)
         mock_exist.assert_has_calls(exist_calls)
         self.assertTrue(mock_sync.called)
         mock_utime.assert_called()
 
     @mock.patch.object(imagebackend.utils, 'synchronized')
-    @mock.patch('nova.virt.libvirt.utils.create_cow_image')
+    @mock.patch('nova.virt.libvirt.utils.create_image')
     @mock.patch.object(imagebackend.disk, 'extend')
     @mock.patch.object(os.path, 'exists', side_effect=[])
     @mock.patch.object(imagebackend.Qcow2, 'get_disk_size')
@@ -596,7 +578,7 @@ class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
         self.assertFalse(mock_extend.called)
 
     @mock.patch.object(imagebackend.utils, 'synchronized')
-    @mock.patch('nova.virt.libvirt.utils.create_cow_image')
+    @mock.patch('nova.virt.libvirt.utils.create_image')
     @mock.patch('nova.virt.libvirt.utils.get_disk_backing_file')
     @mock.patch.object(imagebackend.disk, 'extend')
     @mock.patch.object(os.path, 'exists', side_effect=[])
@@ -635,7 +617,7 @@ class Qcow2TestCase(_ImageTestCase, test.NoDBTestCase):
         mock_utime.assert_called()
 
     @mock.patch.object(imagebackend.utils, 'synchronized')
-    @mock.patch('nova.virt.libvirt.utils.create_cow_image')
+    @mock.patch('nova.virt.libvirt.utils.create_image')
     @mock.patch('nova.virt.libvirt.utils.get_disk_backing_file')
     @mock.patch.object(imagebackend.disk, 'extend')
     @mock.patch.object(os.path, 'exists', side_effect=[])

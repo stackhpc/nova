@@ -40,15 +40,6 @@ its middleware, NoAuthMiddleware[V2_18], will be removed in a future release.
         help="""
 Determine the strategy to use for authentication.
 """),
-    cfg.BoolOpt("use_forwarded_for",
-        default=False,
-        deprecated_group="DEFAULT",
-        help="""
-When True, the 'X-Forwarded-For' header is treated as the canonical remote
-address. When False (the default), the 'remote_address' header is used.
-
-You should only enable this if you have an HTML sanitizing proxy.
-"""),
 ]
 
 metadata_opts = [
@@ -221,8 +212,11 @@ service.
         help="""
 Domain name used to configure FQDN for instances.
 
-Configure a fully-qualified domain name for instance hostnames. If unset, only
-the hostname without a domain will be configured.
+Configure a fully-qualified domain name for instance hostnames. The value is
+suffixed to the instance hostname from the database to construct the hostname
+that appears in the metadata API. To disable this behavior (for example in
+order to correctly support microversion's 2.94 FQDN hostnames), set this to the
+empty string.
 
 Possible values:
 

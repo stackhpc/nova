@@ -18,6 +18,7 @@ Provides common functionality for integrated unit tests
 """
 
 import collections
+import datetime
 import random
 import re
 import string
@@ -42,6 +43,7 @@ from nova.tests import fixtures as nova_fixtures
 from nova.tests.functional.api import client as api_client
 from nova.tests.functional import fixtures as func_fixtures
 from nova import utils
+import typing as ty
 
 
 CONF = nova.conf.CONF
@@ -202,43 +204,36 @@ class InstanceHelperMixin:
             'actions: %s. Events in the last matching action: %s'
             % (event_name, actions, events))
 
-    # TODO(lyarwood): Rewrite this waiter to use os-volume_attachments
     def _wait_for_volume_attach(self, server_id, volume_id):
         timeout = 0.0
-        server = self.api.get_server(server_id)
-        attached_vols = [vol['id'] for vol in
-                         server['os-extended-volumes:volumes_attached']]
+        while timeout < 10.0:
+            try:
+                self.api.get_server_volume(server_id, volume_id)
+                return
+            except api_client.OpenStackApiNotFoundException:
+                time.sleep(.1)
+                timeout += .1
 
-        while volume_id not in attached_vols and timeout < 10.0:
-            time.sleep(.1)
-            timeout += .1
-            server = self.api.get_server(server_id)
-            attached_vols = [vol['id'] for vol in
-                             server['os-extended-volumes:volumes_attached']]
-
-        if volume_id not in attached_vols:
-            self.fail('Timed out waiting for volume %s to be attached to '
+        attached_vols = self.api.get_server_volumes(server_id)
+        self.fail('Timed out waiting for volume %s to be attached to '
                       'server %s. Currently attached volumes: %s' %
                       (volume_id, server_id, attached_vols))
 
-    # TODO(lyarwood): Rewrite this waiter to use os-volume_attachments
     def _wait_for_volume_detach(self, server_id, volume_id):
         timeout = 0.0
-        server = self.api.get_server(server_id)
-        attached_vols = [vol['id'] for vol in
-                         server['os-extended-volumes:volumes_attached']]
 
-        while volume_id in attached_vols and timeout < 10.0:
-            time.sleep(.1)
-            timeout += .1
-            server = self.api.get_server(server_id)
-            attached_vols = [vol['id'] for vol in
-                             server['os-extended-volumes:volumes_attached']]
+        while timeout < 10.0:
+            try:
+                self.api.get_server_volume(server_id, volume_id)
+                time.sleep(.1)
+                timeout += .1
+            except api_client.OpenStackApiNotFoundException:
+                return
 
-        if volume_id in attached_vols:
-            self.fail('Timed out waiting for volume %s to be detached from '
-                      'server %s. Currently attached volumes: %s' %
-                      (volume_id, server_id, attached_vols))
+        attached_vols = self.api.get_server_volumes(server_id)
+        self.fail('Timed out waiting for volume %s to be detached from '
+                  'server %s. Currently attached volumes: %s' %
+                  (volume_id, server_id, attached_vols))
 
     def _assert_resize_migrate_action_fail(self, server, action, error_in_tb):
         """Waits for the conductor_migrate_server action event to fail for
@@ -253,6 +248,27 @@ class InstanceHelperMixin:
             server, action, 'conductor_migrate_server')
         self.assertIn(error_in_tb, event['traceback'])
         return event
+
+    def _assert_build_request_success(self, server_request):
+        server = self.api.post_server({'server': server_request})
+        self._wait_for_state_change(server, 'ACTIVE')
+        return server['id']
+
+    def _assert_build_request_schedule_failure(self, server_request):
+        server = self.api.post_server({'server': server_request})
+        self._wait_for_state_change(server, 'ERROR')
+
+    def _assert_bad_build_request_error(self, server_request):
+        ex = self.assertRaises(
+            api_client.OpenStackApiException, self.api.post_server,
+            {'server': server_request})
+        self.assertEqual(400, ex.response.status_code)
+
+    def _assert_build_request_error(self, server_request):
+        ex = self.assertRaises(
+            api_client.OpenStackApiException, self.api.post_server,
+            {'server': server_request})
+        self.assertEqual(500, ex.response.status_code)
 
     def _wait_for_migration_status(self, server, expected_statuses):
         """Waits for a migration record with the given statuses to be found
@@ -379,6 +395,32 @@ class InstanceHelperMixin:
 
         return flavor['id']
 
+    def _create_image(self, metadata):
+        image = {
+            'id': 'c456eb30-91d7-4f43-8f46-2efd9eccd744',
+            'name': 'fake-image-custom-property',
+            'created_at': datetime.datetime(2011, 1, 1, 1, 2, 3),
+            'updated_at': datetime.datetime(2011, 1, 1, 1, 2, 3),
+            'deleted_at': None,
+            'deleted': False,
+            'status': 'active',
+            'is_public': False,
+            'container_format': 'raw',
+            'disk_format': 'raw',
+            'size': '25165824',
+            'min_ram': 0,
+            'min_disk': 0,
+            'protected': False,
+            'visibility': 'public',
+            'tags': ['tag1', 'tag2'],
+            'properties': {
+                'kernel_id': 'nokernel',
+                'ramdisk_id': 'nokernel',
+            },
+        }
+        image['properties'].update(metadata)
+        return self.glance.create(None, image)
+
     def _build_server(self, name=None, image_uuid=None, flavor_id=None,
                       networks=None, az=None, host=None):
         """Build a request for the server create API.
@@ -448,7 +490,15 @@ class InstanceHelperMixin:
         """
         # if forcing the server onto a host, we have to use the admin API
         if not api:
-            api = self.api if not az else getattr(self, 'admin_api', self.api)
+            api = self.api if not az and not host else getattr(
+                self, 'admin_api', self.api)
+
+        if host and not api.microversion:
+            api.microversion = '2.74'
+            # with 2.74 networks param needs to use 'none' instead of None
+            # if no network is needed
+            if networks is None:
+                networks = 'none'
 
         body = self._build_server(
             name, image_uuid, flavor_id, networks, az, host)
@@ -539,8 +589,8 @@ class InstanceHelperMixin:
         self.api.post_server_action(
             server['id'],
             {'os-migrateLive': {'host': None, 'block_migration': 'auto'}})
-        self._wait_for_state_change(server, server_expected_state)
         self._wait_for_migration_status(server, [migration_expected_state])
+        return self._wait_for_state_change(server, server_expected_state)
 
     _live_migrate_server = _live_migrate
 
@@ -576,7 +626,7 @@ class InstanceHelperMixin:
 
     def _evacuate_server(
             self, server, extra_post_args=None, expected_host=None,
-            expected_state='ACTIVE', expected_task_state=NOT_SPECIFIED,
+            expected_state='SHUTOFF', expected_task_state=NOT_SPECIFIED,
             expected_migration_status='done'):
         """Evacuate a server."""
         api = getattr(self, 'admin_api', self.api)
@@ -605,9 +655,45 @@ class InstanceHelperMixin:
         self.api.post_server_action(server['id'], {'os-start': None})
         return self._wait_for_state_change(server, 'ACTIVE')
 
-    def _stop_server(self, server):
+    def _stop_server(self, server, wait_for_stop=True):
         self.api.post_server_action(server['id'], {'os-stop': None})
-        return self._wait_for_state_change(server, 'SHUTOFF')
+        if wait_for_stop:
+            return self._wait_for_state_change(server, 'SHUTOFF')
+        return server
+
+    def _snapshot_server(self, server, snapshot_name):
+        """Create server snapshot."""
+        self.api.post_server_action(
+            server['id'],
+            {'createImage': {'name': snapshot_name}}
+        )
+
+    def _attach_volumes(self, server, vol_ids: ty.List[str]):
+        # attach volumes to server
+        # these attachments are done by nova api, that means
+        # nova know about these attachments and so they are valid ones.
+
+        for vol_id in vol_ids:
+            self.api.post_server_volume(
+                server['id'], {'volumeAttachment': {'volumeId': vol_id}})
+
+        for vol_id in vol_ids:
+            # wait for each vol to get attached
+            self._wait_for_volume_attach(server['id'], vol_id)
+
+        # here server is already in an active state
+        # this is just to refresh server object
+        # so attached volumes can be shown in server
+        return self._wait_for_state_change(server, expected_status='ACTIVE')
+
+    def _create_vol_attachments_by_cinder(
+            self, volume_id, server, new_attachments=1):
+        # these attachments are done by cinder api,
+        # and nova is not aware of them.
+
+        for _ in range(new_attachments):
+            self.cinder.create_vol_attachment(
+                volume_id, server['id'])
 
 
 class PlacementHelperMixin:
@@ -628,12 +714,16 @@ class PlacementHelperMixin:
             '/resource_providers', version='1.14'
         ).body['resource_providers']
 
-    def _get_all_rp_uuids_in_a_tree(self, in_tree_rp_uuid):
+    def _get_all_rps_in_a_tree(self, in_tree_rp_uuid):
         rps = self.placement.get(
             '/resource_providers?in_tree=%s' % in_tree_rp_uuid,
             version='1.20',
         ).body['resource_providers']
-        return [rp['uuid'] for rp in rps]
+        return rps
+
+    def _get_all_rp_uuids_in_a_tree(self, in_tree_rp_uuid):
+        return [
+            rp['uuid'] for rp in self._get_all_rps_in_a_tree(in_tree_rp_uuid)]
 
     def _post_resource_provider(self, rp_name):
         return self.placement.post(
@@ -840,6 +930,20 @@ class PlacementHelperMixin:
             1, len(migrations),
             'Test expected a single migration but found %i' % len(migrations))
         return migrations[0].uuid
+
+    def _reserve_placement_resource(self, rp_name, rc_name, reserved):
+        rp_uuid = self._get_provider_uuid_by_name(rp_name)
+        inv = self.placement.get(
+            '/resource_providers/%s/inventories/%s' % (rp_uuid, rc_name),
+            version='1.26'
+        ).body
+        inv["reserved"] = reserved
+        result = self.placement.put(
+            '/resource_providers/%s/inventories/%s' % (rp_uuid, rc_name),
+            version='1.26', body=inv
+        ).body
+        self.assertEqual(reserved, result["reserved"])
+        return result
 
 
 class PlacementInstanceHelperMixin(InstanceHelperMixin, PlacementHelperMixin):
@@ -1195,6 +1299,10 @@ class _IntegratedTestBase(test.TestCase, PlacementInstanceHelperMixin):
     def _setup_conductor_service(self):
         return self.start_service('conductor')
 
+    def _stop_computes(self):
+        for compute in self.computes.values():
+            compute.stop()
+
     def _setup_services(self):
         # NOTE(danms): Set the global MQ connection to that of our first cell
         # for any cells-ignorant code. Normally this is defaulted in the tests
@@ -1203,8 +1311,11 @@ class _IntegratedTestBase(test.TestCase, PlacementInstanceHelperMixin):
             self.flags(transport_url=self.cell_mappings['cell1'].transport_url)
 
         self.conductor = self._setup_conductor_service()
+        self.addCleanup(self.conductor.stop)
         self.scheduler = self._setup_scheduler_service()
+        self.addCleanup(self.scheduler.stop)
         self.compute = self._setup_compute_service()
+        self.addCleanup(self._stop_computes)
 
         self.api_fixture = self.useFixture(
             nova_fixtures.OSAPIFixture(
@@ -1249,6 +1360,7 @@ class ProviderUsageBaseTestCase(test.TestCase, PlacementInstanceHelperMixin):
         self.policy = self.useFixture(nova_fixtures.RealPolicyFixture())
         self.neutron = self.useFixture(nova_fixtures.NeutronFixture(self))
         self.glance = self.useFixture(nova_fixtures.GlanceFixture(self))
+        self.useFixture(nova_fixtures.CinderFixture(self))
         self.placement = self.useFixture(func_fixtures.PlacementFixture()).api
         self.useFixture(nova_fixtures.AllServicesCurrent())
 

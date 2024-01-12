@@ -15,10 +15,10 @@
 #    under the License.
 
 import datetime
+from unittest import mock
 import urllib
 
 import fixtures
-import mock
 from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
 from oslo_utils.fixture import uuidsentinel as uuids
@@ -933,6 +933,7 @@ class VolumeAttachTestsV249(test.NoDBTestCase):
 
 class VolumeAttachTestsV260(test.NoDBTestCase):
     """Negative tests for attaching a multiattach volume with version 2.60."""
+
     def setUp(self):
         super(VolumeAttachTestsV260, self).setUp()
         self.controller = volumes_v21.VolumeAttachmentController()
@@ -1888,8 +1889,7 @@ class AssistedSnapshotDeleteTestCaseV21(test.NoDBTestCase):
                 req, '5')
 
     def _test_assisted_delete_instance_conflict(self, api_error):
-        # unset the stub on volume_snapshot_delete from setUp
-        self.mock_volume_snapshot_delete.stop()
+        self.mock_volume_snapshot_delete.side_effect = api_error
         params = {
             'delete_info': jsonutils.dumps({'volume_id': '1'}),
         }
@@ -1898,10 +1898,9 @@ class AssistedSnapshotDeleteTestCaseV21(test.NoDBTestCase):
                 urllib.parse.urlencode(params),
                 version=self.microversion)
         req.method = 'DELETE'
-        with mock.patch.object(compute_api.API, 'volume_snapshot_delete',
-                               side_effect=api_error):
-            self.assertRaises(
-                webob.exc.HTTPBadRequest, self.controller.delete, req, '5')
+
+        self.assertRaises(
+            webob.exc.HTTPBadRequest, self.controller.delete, req, '5')
 
     def test_assisted_delete_instance_invalid_state(self):
         api_error = exception.InstanceInvalidState(

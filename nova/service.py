@@ -148,7 +148,7 @@ class Service(service.Service):
         # See https://bugs.python.org/issue6721 for more information.
         # With python 3.7, it would be possible for oslo.db to make use of the
         # os.register_at_fork() method to reinitialize its lock. Until we
-        # require python 3.7 as a mininum version, we must handle the situation
+        # require python 3.7 as a minimum version, we must handle the situation
         # outside of oslo.db.
         context.CELL_CACHE = {}
 
@@ -156,11 +156,11 @@ class Service(service.Service):
         LOG.info('Starting %(topic)s node (version %(version)s)',
                   {'topic': self.topic, 'version': verstr})
         self.basic_config_check()
-        self.manager.init_host()
-        self.model_disconnected = False
         ctxt = context.get_admin_context()
         self.service_ref = objects.Service.get_by_host_and_binary(
             ctxt, self.host, self.binary)
+        self.manager.init_host(self.service_ref)
+        self.model_disconnected = False
         if self.service_ref:
             _update_service_ref(self.service_ref)
 
@@ -174,7 +174,7 @@ class Service(service.Service):
                 self.service_ref = objects.Service.get_by_host_and_binary(
                     ctxt, self.host, self.binary)
 
-        self.manager.pre_start_hook()
+        self.manager.pre_start_hook(self.service_ref)
 
         if self.backdoor_port is not None:
             self.manager.backdoor_port = self.backdoor_port
@@ -261,7 +261,13 @@ class Service(service.Service):
         # up before it allows the service to be created. The
         # raise_if_old_compute() depends on the RPC to be up and does not
         # implement its own retry mechanism to connect to the conductor.
-        utils.raise_if_old_compute()
+        try:
+            utils.raise_if_old_compute()
+        except exception.TooOldComputeService as e:
+            if CONF.workarounds.disable_compute_service_check_for_ffu:
+                LOG.warning(str(e))
+            else:
+                raise
 
         return service_obj
 
@@ -418,7 +424,7 @@ class WSGIService(service.Service):
         # See https://bugs.python.org/issue6721 for more information.
         # With python 3.7, it would be possible for oslo.db to make use of the
         # os.register_at_fork() method to reinitialize its lock. Until we
-        # require python 3.7 as a mininum version, we must handle the situation
+        # require python 3.7 as a minimum version, we must handle the situation
         # outside of oslo.db.
         context.CELL_CACHE = {}
 
@@ -432,14 +438,15 @@ class WSGIService(service.Service):
                 service_ref = _create_service_ref(self, ctxt)
             except (exception.ServiceTopicExists,
                     exception.ServiceBinaryExists):
-                # NOTE(danms): If we race to create a record wth a sibling,
+                # NOTE(danms): If we race to create a record with a sibling,
                 # don't fail here.
                 service_ref = objects.Service.get_by_host_and_binary(
                     ctxt, self.host, self.binary)
 
+        self.service_ref = service_ref
         if self.manager:
             self.manager.init_host()
-            self.manager.pre_start_hook()
+            self.manager.pre_start_hook(self.service_ref)
             if self.backdoor_port is not None:
                 self.manager.backdoor_port = self.backdoor_port
         self.server.start()

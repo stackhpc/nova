@@ -9,15 +9,22 @@ Availability Zones
     zones, refer to the :doc:`user guide </user/availability-zones>`.
 
 Availability Zones are an end-user visible logical abstraction for partitioning
-a cloud without knowing the physical infrastructure. Availability zones are not
-modeled in the database; rather, they are defined by attaching specific
-metadata information to an :doc:`aggregate </admin/aggregates>` The addition of
-this specific metadata to an aggregate makes the aggregate visible from an
-end-user perspective and consequently allows users to schedule instances to a
-specific set of hosts, the ones belonging to the aggregate.
+a cloud without knowing the physical infrastructure. They can be used to
+partition a cloud on arbitrary factors, such as location (country, datacenter,
+rack), network layout and/or power source.
 
-However, despite their similarities, there are a few additional differences to
-note when comparing availability zones and host aggregates:
+.. note::
+
+   Availability Zones should not be assumed to map to fault domains and provide
+   no intrinsic HA benefit by themselves.
+
+Availability zones are not modeled in the database; rather, they are defined by
+attaching specific metadata information to an
+:doc:`aggregate </admin/aggregates>` The addition of this specific metadata to
+an aggregate makes the aggregate visible from an end-user perspective and
+consequently allows users to schedule instances to a specific set of hosts, the
+ones belonging to the aggregate. There are a few additional differences to note
+when comparing availability zones and host aggregates:
 
 - A host can be part of multiple aggregates but it can only be in one
   availability zone.
@@ -32,7 +39,7 @@ note when comparing availability zones and host aggregates:
       The use of the default availability zone name in requests can be very
       error-prone. Since the user can see the list of availability zones, they
       have no way to know whether the default availability zone name (currently
-      ``nova``) is provided because an host belongs to an aggregate whose AZ
+      ``nova``) is provided because a host belongs to an aggregate whose AZ
       metadata key is set to ``nova``, or because there is at least one host
       not belonging to any aggregate.  Consequently, it is highly recommended
       for users to never ever ask for booting an instance by specifying an
@@ -62,10 +69,9 @@ Availability Zones with Placement
 
 In order to use placement to honor availability zone requests, there must be
 placement aggregates that match the membership and UUID of nova host aggregates
-that you assign as availability zones. The same key in aggregate metadata used
-by the `AvailabilityZoneFilter` filter controls this function, and is enabled by
-setting :oslo.config:option:`scheduler.query_placement_for_availability_zone`
-to ``True``. As of 24.0.0 (Xena), this is the default.
+that you assign as availability zones. An aggregate metadata key is used
+to controls this function. As of 28.0.0 (Bobcat), this is the only way to
+schedule instances to availability-zones.
 
 .. code-block:: console
 
@@ -100,22 +106,52 @@ to ``True``. As of 24.0.0 (Xena), this is the default.
 
   $ openstack aggregate set --property availability_zone=az002 myaz
 
-  $ openstack --os-placement-api-version=1.2 resource provider aggregate set --aggregate 019e2189-31b3-49e1-aff2-b220ebd91c24 815a5634-86fb-4e1e-8824-8a631fee3e06
-
-Without the above configuration, the `AvailabilityZoneFilter` filter must be
-enabled in :oslo.config:option:`filter_scheduler.enabled_filters` to retain
-proper behavior.
-
 Implications for moving servers
 -------------------------------
 
 There are several ways to move a server to another host: evacuate, resize,
 cold migrate, live migrate, and unshelve. Move operations typically go through
-the scheduler to pick the target host *unless* a target host is specified and
-the request forces the server to that host by bypassing the scheduler. Only
-evacuate and live migrate can forcefully bypass the scheduler and move a
-server to a specified host and even then it is highly recommended to *not*
-force and bypass the scheduler.
+the scheduler to pick the target host.
+
+Prior to API microversion 2.68, using older openstackclient (pre-5.5.0) and
+novaclient, it was possible to specify a target host and the request forces
+the server to that host by bypassing the scheduler. Only evacuate and live
+migrate can forcefully bypass the scheduler and move a server to specified host
+and even then it is highly recommended to *not* force and bypass a scheduler.
+
+- live migrate with force host (works with older openstackclients(pre-5.5.0):
+
+.. code-block:: console
+
+  $ openstack server migrate --live <host> <server>
+
+- live migrate without forcing:
+
+.. code-block:: console
+
+  $ openstack server migrate --live-migration --host <host> <server>
+
+While support for 'server evacuate' command to openstackclient was added
+in 5.5.3 and there it never exposed ability to force an evacuation, but
+it was previously possible with novaclient.
+
+- evacuate with force host:
+
+.. code-block:: console
+
+  $ nova evacuate --force <server> <host>
+
+- evacuate without forcing using novaclient:
+
+.. code-block:: console
+
+  $ nova evacuate
+
+- evacuate without forcing using openstackclient:
+
+.. code-block:: console
+
+  $ openstack server evacuate --host <host> <server>
 
 With respect to availability zones, a server is restricted to a zone if:
 
@@ -140,18 +176,7 @@ With respect to availability zones, a server is restricted to a zone if:
    for details.
 
 If the server was not created in a specific zone then it is free to be moved
-to other zones, i.e. the :ref:`AvailabilityZoneFilter <AvailabilityZoneFilter>`
-is a no-op.
-
-Knowing this, it is dangerous to force a server to another host with evacuate
-or live migrate if the server is restricted to a zone and is then forced to
-move to a host in another zone, because that will create an inconsistency in
-the internal tracking of where that server should live and may require manually
-updating the database for that server. For example, if a user creates a server
-in zone A and then the admin force live migrates the server to zone B, and then
-the user resizes the server, the scheduler will try to move it back to zone A
-which may or may not work, e.g. if the admin deleted or renamed zone A in the
-interim.
+to other zones.
 
 Resource affinity
 ~~~~~~~~~~~~~~~~~

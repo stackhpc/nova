@@ -135,6 +135,10 @@ class GlanceConnectionFailed(NovaException):
         "%(reason)s")
 
 
+class KeystoneConnectionFailed(NovaException):
+    msg_fmt = _("Connection to keystone host failed: %(reason)s")
+
+
 class CinderConnectionFailed(NovaException):
     msg_fmt = _("Connection to cinder host failed: %(reason)s")
 
@@ -157,7 +161,7 @@ class Forbidden(NovaException):
 
 class NotSupported(NovaException):
     # This exception use return code as 400 and can be used
-    # directly or as base exception for operations whihc are not
+    # directly or as base exception for operations which are not
     # supported in Nova. Any feature that is not yet implemented
     # but plan to implement in future (example: Cyborg
     # integration operations), should use this exception as base
@@ -173,6 +177,11 @@ class ForbiddenWithAccelerators(NotSupported):
 
 class ForbiddenPortsWithAccelerator(NotSupported):
     msg_fmt = _("Feature not supported with Ports that have accelerators.")
+
+
+class ForbiddenWithRemoteManagedPorts(NotSupported):
+    msg_fmt = _("This feature is not supported when remote-managed ports"
+                " are in use.")
 
 
 class AdminRequired(Forbidden):
@@ -196,6 +205,21 @@ class ImageNotAuthorized(NovaException):
 class Invalid(NovaException):
     msg_fmt = _("Bad Request - Invalid Parameters")
     code = 400
+
+
+class InvalidVIOMMUMachineType(Invalid):
+    msg_fmt = _("vIOMMU is not supported by Current machine type %(mtype)s "
+                "(Architecture: %(arch)s).")
+
+
+class InvalidVIOMMUArchitecture(Invalid):
+    msg_fmt = _("vIOMMU required either x86 or AArch64 architecture, "
+                "but given architecture %(arch)s.")
+
+
+class InstanceQuiesceFailed(Invalid):
+    msg_fmt = _("Failed to quiesce instance: %(reason)s")
+    code = 409
 
 
 class InvalidConfiguration(Invalid):
@@ -731,6 +755,10 @@ class InvalidImageRef(Invalid):
     msg_fmt = _("Invalid image href %(image_href)s.")
 
 
+class InvalidImagePropertyName(Invalid):
+    msg_fmt = _("Invalid image property name %(image_property_name)s.")
+
+
 class AutoDiskConfigDisabledByImage(Invalid):
     msg_fmt = _("Requested image %(image)s "
                 "has automatic disk resize disabled.")
@@ -993,10 +1021,6 @@ class QuotaClassExists(NovaException):
     msg_fmt = _("Quota class %(class_name)s exists for resource %(resource)s")
 
 
-class OverQuota(NovaException):
-    msg_fmt = _("Quota exceeded for resources: %(overs)s")
-
-
 class SecurityGroupNotFound(NotFound):
     msg_fmt = _("Security group %(security_group_id)s not found.")
 
@@ -1233,29 +1257,26 @@ class MaxRetriesExceeded(NoValidHost):
     msg_fmt = _("Exceeded maximum number of retries. %(reason)s")
 
 
-class QuotaError(NovaException):
-    msg_fmt = _("Quota exceeded: code=%(code)s")
-    # NOTE(cyeoh): 413 should only be used for the ec2 API
-    # The error status code for out of quota for the nova api should be
-    # 403 Forbidden.
+class OverQuota(NovaException):
+    msg_fmt = _("Quota exceeded for resources: %(overs)s")
     code = 413
     safe = True
 
 
-class TooManyInstances(QuotaError):
+class TooManyInstances(OverQuota):
     msg_fmt = _("Quota exceeded for %(overs)s: Requested %(req)s,"
                 " but already used %(used)s of %(allowed)s %(overs)s")
 
 
-class FloatingIpLimitExceeded(QuotaError):
+class FloatingIpLimitExceeded(OverQuota):
     msg_fmt = _("Maximum number of floating IPs exceeded")
 
 
-class MetadataLimitExceeded(QuotaError):
+class MetadataLimitExceeded(OverQuota):
     msg_fmt = _("Maximum number of metadata items exceeds %(allowed)d")
 
 
-class OnsetFileLimitExceeded(QuotaError):
+class OnsetFileLimitExceeded(OverQuota):
     msg_fmt = _("Personality file limit exceeded")
 
 
@@ -1267,16 +1288,24 @@ class OnsetFileContentLimitExceeded(OnsetFileLimitExceeded):
     msg_fmt = _("Personality file content exceeds maximum %(allowed)s")
 
 
-class KeypairLimitExceeded(QuotaError):
-    msg_fmt = _("Maximum number of key pairs exceeded")
+class KeypairLimitExceeded(OverQuota):
+    msg_fmt = _("Quota exceeded, too many key pairs.")
 
 
-class SecurityGroupLimitExceeded(QuotaError):
+class SecurityGroupLimitExceeded(OverQuota):
     msg_fmt = _("Maximum number of security groups or rules exceeded")
 
 
-class PortLimitExceeded(QuotaError):
+class PortLimitExceeded(OverQuota):
     msg_fmt = _("Maximum number of ports exceeded")
+
+
+class ServerGroupLimitExceeded(OverQuota):
+    msg_fmt = _("Quota exceeded, too many server groups.")
+
+
+class GroupMemberLimitExceeded(OverQuota):
+    msg_fmt = _("Quota exceeded, too many servers in group")
 
 
 class AggregateNotFound(NotFound):
@@ -1422,6 +1451,11 @@ class InstanceEvacuateNotSupported(Invalid):
     msg_fmt = _('Instance evacuate is not supported.')
 
 
+class InstanceEvacuateNotSupportedTargetState(Invalid):
+    msg_fmt = _("Target state '%(target_state)s' for instance evacuate "
+                "is not supported.")
+
+
 class DBNotAllowed(NovaException):
     msg_fmt = _('%(binary)s attempted direct database access which is '
                 'not allowed by policy')
@@ -1450,6 +1484,11 @@ class UnsupportedRescueImage(Invalid):
     msg_fmt = _("Requested rescue image '%(image)s' is not supported")
 
 
+class UnsupportedRPCVersion(Invalid):
+    msg_fmt = _("Unsupported RPC version for %(api)s. "
+                "Required >= %(required)s")
+
+
 class Base64Exception(NovaException):
     msg_fmt = _("Invalid Base 64 data for file %(path)s")
 
@@ -1461,6 +1500,15 @@ class BuildAbortException(NovaException):
 class RescheduledException(NovaException):
     msg_fmt = _("Build of instance %(instance_uuid)s was re-scheduled: "
                 "%(reason)s")
+
+
+class RescheduledByPolicyException(RescheduledException):
+    msg_fmt = _("Build of instance %(instance_uuid)s was re-scheduled: "
+                "%(reason)s")
+
+
+class GroupAffinityViolation(NovaException):
+    msg_fmt = _("%(policy)s instance group policy was violated")
 
 
 class InstanceFaultRollback(NovaException):
@@ -1556,13 +1604,23 @@ class PciRequestAliasNotDefined(NovaException):
     msg_fmt = _("PCI alias %(alias)s is not defined")
 
 
-class PciConfigInvalidWhitelist(Invalid):
-    msg_fmt = _("Invalid PCI devices Whitelist config: %(reason)s")
+class PciConfigInvalidSpec(Invalid):
+    msg_fmt = _("Invalid [pci]device_spec config: %(reason)s")
 
 
 class PciRequestFromVIFNotFound(NotFound):
     msg_fmt = _("Failed to locate PCI request associated with the given VIF "
                 "PCI address: %(pci_slot)s on compute node: %(node_id)s")
+
+
+class PciDeviceRemoteManagedNotPresent(NovaException):
+    msg_fmt = _('Invalid PCI Whitelist: A device specified as "remote_managed"'
+                ' is not actually present on the host')
+
+
+class PciDeviceInvalidPFRemoteManaged(NovaException):
+    msg_fmt = _('Invalid PCI Whitelist: PFs must not have the "remote_managed"'
+                'tag, device address: %(address)s')
 
 
 # Cannot be templated, msg needs to be constructed when raised.
@@ -1652,9 +1710,15 @@ class MismatchVolumeAZException(Invalid):
 
 
 class UnshelveInstanceInvalidState(InstanceInvalidState):
-    msg_fmt = _('Specifying an availability zone when unshelving server '
-                '%(instance_uuid)s with status "%(state)s" is not supported. '
-                'The server status must be SHELVED_OFFLOADED.')
+    msg_fmt = _('Specifying an availability zone or a host when unshelving '
+                'server "%(instance_uuid)s" with status "%(state)s" is not '
+                'supported. The server status must be SHELVED_OFFLOADED.')
+    code = 409
+
+
+class UnshelveHostNotInAZ(Invalid):
+    msg_fmt = _('Host "%(host)s" is not in the availability zone '
+                '"%(availability_zone)s".')
     code = 409
 
 
@@ -1831,6 +1895,17 @@ class MemoryPageSizeNotSupported(Invalid):
     msg_fmt = _("Page size %(pagesize)s is not supported by the host.")
 
 
+class LockMemoryForbidden(Forbidden):
+    msg_fmt = _("locked_memory value in image or flavor is forbidden when "
+                "mem_page_size is not set.")
+
+
+class FlavorImageLockedMemoryConflict(NovaException):
+    msg_fmt = _("locked_memory value in image (%(image)s) and flavor "
+                "(%(flavor)s) conflict. A consistent value is expected if "
+                "both specified.")
+
+
 class CPUPinningInvalid(Invalid):
     msg_fmt = _("CPU set to pin %(requested)s must be a subset of "
                 "free CPU set %(available)s")
@@ -1859,11 +1934,6 @@ class ImageCPUPinningForbidden(Forbidden):
 class ImageCPUThreadPolicyForbidden(Forbidden):
     msg_fmt = _("Image property 'hw_cpu_thread_policy' is not permitted to "
                 "override CPU thread pinning policy set against the flavor")
-
-
-class ImagePMUConflict(Forbidden):
-    msg_fmt = _("Image property 'hw_pmu' is not permitted to "
-                "override the PMU policy set in the flavor")
 
 
 class UnsupportedPolicyException(Invalid):
@@ -1918,6 +1988,10 @@ class UEFINotSupported(Invalid):
 
 class SecureBootNotSupported(Invalid):
     msg_fmt = _("Secure Boot is not supported by host")
+
+
+class FirmwareSMMNotSupported(Invalid):
+    msg_fmt = _("This firmware doesn't require (support) SMM")
 
 
 class TriggerCrashDumpNotSupported(Invalid):
@@ -2048,6 +2122,16 @@ class ResourceProviderUpdateConflict(PlacementAPIConflict):
                 "provider %(uuid)s (generation %(generation)d): %(error)s")
 
 
+class PlacementReshapeConflict(PlacementAPIConflict):
+    """A 409 caused by generation mismatch from attempting to reshape a
+    provider tree.
+    """
+    msg_fmt = _(
+        "A conflict was encountered attempting to reshape a provider tree: "
+        "$(error)s"
+    )
+
+
 class InvalidResourceClass(Invalid):
     msg_fmt = _("Resource class '%(resource_class)s' invalid.")
 
@@ -2109,11 +2193,6 @@ class InvalidNetworkNUMAAffinity(Invalid):
 
 class InvalidPCINUMAAffinity(Invalid):
     msg_fmt = _("Invalid PCI NUMA affinity configured: %(policy)s")
-
-
-class PowerVMAPIFailed(NovaException):
-    msg_fmt = _("PowerVM API failed to complete for instance=%(inst_name)s.  "
-                "%(reason)s")
 
 
 class TraitRetrievalFailed(NovaException):
@@ -2291,28 +2370,6 @@ class HealPortAllocationException(NovaException):
     msg_fmt = _("Healing port allocation failed.")
 
 
-class MoreThanOneResourceProviderToHealFrom(HealPortAllocationException):
-    msg_fmt = _("More than one matching resource provider %(rp_uuids)s is "
-                "available for healing the port allocation for port "
-                "%(port_id)s for instance %(instance_uuid)s. This script "
-                "does not have enough information to select the proper "
-                "resource provider from which to heal.")
-
-
-class NoResourceProviderToHealFrom(HealPortAllocationException):
-    msg_fmt = _("No matching resource provider is "
-                "available for healing the port allocation for port "
-                "%(port_id)s for instance %(instance_uuid)s. There are no "
-                "resource providers with matching traits %(traits)s in the "
-                "provider tree of the resource provider %(node_uuid)s ."
-                "This probably means that the neutron QoS configuration is "
-                "wrong. Consult with "
-                "https://docs.openstack.org/neutron/latest/admin/"
-                "config-qos-min-bw.html for information on how to configure "
-                "neutron. If the configuration is fixed the script can be run "
-                "again.")
-
-
 class UnableToQueryPorts(HealPortAllocationException):
     msg_fmt = _("Unable to query ports for instance %(instance_uuid)s: "
                 "%(error)s")
@@ -2384,8 +2441,9 @@ class AcceleratorRequestOpFailed(NovaException):
 class AcceleratorRequestBindingFailed(NovaException):
     msg_fmt = _("Failed to bind accelerator requests: %(msg)s")
 
-    def __init__(self, arqs, **kwargs):
-        super().__init__(message=self.msg_fmt, **kwargs)
+    def __init__(self, message=None, arqs=None, **kwargs):
+        super(AcceleratorRequestBindingFailed, self).__init__(
+            message=message, **kwargs)
         self.arqs = arqs or []
 
 
@@ -2424,3 +2482,51 @@ class ProviderConfigException(NovaException):
     """
     msg_fmt = _("An error occurred while processing "
                 "a provider config file: %(error)s")
+
+
+class PlacementPciException(NovaException):
+    msg_fmt = _(
+        "Failed to gather or report PCI resources to Placement: %(error)s")
+
+
+class PlacementPciDependentDeviceException(PlacementPciException):
+    msg_fmt = _(
+        "Configuring both %(parent_dev)s and %(children_devs)s in "
+        "[pci]device_spec is not supported. Either the parent PF or its "
+        "children VFs can be configured."
+    )
+
+
+class PlacementPciMixedResourceClassException(PlacementPciException):
+    msg_fmt = _(
+        "VFs from the same PF cannot be configured with different "
+        "'resource_class' values in [pci]device_spec. We got %(new_rc)s "
+        "for %(new_dev)s and %(current_rc)s for %(current_devs)s."
+    )
+
+
+class PlacementPciMixedTraitsException(PlacementPciException):
+    msg_fmt = _(
+        "VFs from the same PF cannot be configured with different set "
+        "of 'traits' in [pci]device_spec. We got %(new_traits)s for "
+        "%(new_dev)s and %(current_traits)s for %(current_devs)s."
+    )
+
+
+class ReimageException(NovaException):
+    msg_fmt = _("Reimaging volume failed.")
+
+
+class InvalidNodeConfiguration(NovaException):
+    msg_fmt = _('Invalid node identity configuration: %(reason)s')
+
+
+class DuplicateRecord(NovaException):
+    msg_fmt = _('Unable to create duplicate record for %(target)s')
+
+
+class NotSupportedComputeForEvacuateV295(NotSupported):
+    msg_fmt = _("Starting with microversion 2.95, evacuate API will stop "
+                "instance on destination. To evacuate before upgrades are "
+                "complete please use an older microversion. Required version "
+                "for compute %(expected), current version %(currently)s")

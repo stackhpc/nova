@@ -77,6 +77,7 @@ class TargetDBSetupTask(base.TaskBase):
     This is needed before any work can be done with the instance in the target
     cell, like validating the selected target compute host.
     """
+
     def __init__(self, context, instance, source_migration,
                  target_cell_context):
         """Initialize this task.
@@ -697,7 +698,7 @@ class CrossCellMigrationTask(base.TaskBase):
         LOG.debug('Making sure neutron is new enough for cross-cell resize.')
         # Check that the port binding-extended API extension is available in
         # neutron because if it's not we can just fail fast.
-        if not self.network_api.supports_port_binding_extension(self.context):
+        if not self.network_api.has_port_binding_extension(self.context):
             raise exception.MigrationPreCheckError(
                 reason=_("Required networking service API extension '%s' "
                          "not found.") %
@@ -1162,7 +1163,7 @@ class RevertResizeTask(base.TaskBase):
                 setattr(source_obj, field, getattr(target_obj, field))
 
     def _update_bdms_in_source_cell(self, source_cell_context):
-        """Update BlockDeviceMapppings in the source cell database.
+        """Update BlockDeviceMappings in the source cell database.
 
         It is possible to attach/detach volumes to/from a resized instance,
         which would create/delete BDM records in the target cell, so we have

@@ -49,7 +49,7 @@ For End Users
 As an end user of nova, you'll use nova to create and manage servers with
 either tools or the API directly.
 
-.. # NOTE(amotoki): toctree needs to be placed at the end of the secion to
+.. # NOTE(amotoki): toctree needs to be placed at the end of the section to
    # keep the document structure in the PDF doc.
 .. toctree::
    :hidden:
@@ -96,8 +96,8 @@ resources will help you get started with consuming the API directly.
 
 Nova can be configured to emit notifications over RPC.
 
-* :ref:`Versioned Notifications <versioned_notification_samples>`: This
-  provides the list of existing versioned notifications with sample payloads.
+* :doc:`Versioned Notifications </admin/notifications>`: This
+  provides information on the notifications emitted by nova.
 
 Other end-user guides can be found under :doc:`/user/index`.
 
@@ -107,15 +107,15 @@ For Operators
 Architecture Overview
 ---------------------
 
-* :doc:`Nova architecture </user/architecture>`: An overview of how all the parts in
+* :doc:`Nova architecture </admin/architecture>`: An overview of how all the parts in
   nova fit together.
 
-.. # NOTE(amotoki): toctree needs to be placed at the end of the secion to
+.. # NOTE(amotoki): toctree needs to be placed at the end of the section to
    # keep the document structure in the PDF doc.
 .. toctree::
    :hidden:
 
-   user/architecture
+   admin/architecture
 
 Installation
 ------------
@@ -128,7 +128,7 @@ having installed :keystone-doc:`keystone <install/>`, :glance-doc:`glance
 :placement-doc:`placement <install/>`. Ensure that you follow their install
 guides first.
 
-.. # NOTE(amotoki): toctree needs to be placed at the end of the secion to
+.. # NOTE(amotoki): toctree needs to be placed at the end of the section to
    # keep the document structure in the PDF doc.
 .. toctree::
    :maxdepth: 2
@@ -153,20 +153,21 @@ the defaults from the :doc:`install guide </install/index>` will be sufficient.
   * :doc:`Feature Support full list </user/support-matrix>`: A detailed dive through
     features in each compute driver backend.
 
-* :doc:`Cells v2 Planning </user/cellsv2-layout>`: For large deployments, Cells v2
-  allows sharding of your compute environment. Upfront planning is key to a
-  successful Cells v2 layout.
+* :doc:`Cells v2 configuration </admin/cells>`: For large deployments, cells v2
+  cells allow sharding of your compute environment. Upfront planning is key to
+  a successful cells v2 layout.
+
 * :doc:`Running nova-api on wsgi <user/wsgi>`: Considerations for using a real
   WSGI container instead of the baked-in eventlet web server.
 
-.. # NOTE(amotoki): toctree needs to be placed at the end of the secion to
+.. # NOTE(amotoki): toctree needs to be placed at the end of the section to
    # keep the document structure in the PDF doc.
 .. toctree::
    :hidden:
 
    user/feature-classification
    user/support-matrix
-   user/cellsv2-layout
+   admin/cells
    user/wsgi
 
 Maintenance
@@ -179,7 +180,7 @@ Once you are running nova, the following information is extremely useful.
 * :doc:`Flavors </user/flavors>`: What flavors are and why they are used.
 * :doc:`Upgrades </admin/upgrades>`: How nova is designed to be upgraded for minimal
   service impact, and the order you should do them in.
-* :doc:`Quotas </user/quotas>`: Managing project quotas in nova.
+* :doc:`Quotas </user/unified-limits>`: Managing project quotas in nova.
 * :doc:`Aggregates </admin/aggregates>`: Aggregates are a useful way of grouping
   hosts together for scheduling purposes.
 * :doc:`Scheduling </admin/scheduling>`: How the scheduler is
@@ -191,7 +192,7 @@ Once you are running nova, the following information is extremely useful.
   instances (either via metadata server or config drive) for your specific
   purposes.
 
-.. # NOTE(amotoki): toctree needs to be placed at the end of the secion to
+.. # NOTE(amotoki): toctree needs to be placed at the end of the section to
    # keep the document structure in the PDF doc.
 .. toctree::
    :hidden:
@@ -199,7 +200,7 @@ Once you are running nova, the following information is extremely useful.
    admin/index
    user/flavors
    admin/upgrades
-   user/quotas
+   user/unified-limits
    admin/vendordata
 
 Reference Material
@@ -210,7 +211,7 @@ Reference Material
 * :doc:`Configuration Guide <configuration/index>`: Information on configuring
   the system, including role-based access control policy rules.
 
-.. # NOTE(amotoki): toctree needs to be placed at the end of the secion to
+.. # NOTE(amotoki): toctree needs to be placed at the end of the section to
    # keep the document structure in the PDF doc.
 .. toctree::
    :hidden:
@@ -229,7 +230,7 @@ For Contributors
   both current and future looking parts of our architecture.
   These are collected here.
 
-.. # NOTE(amotoki): toctree needs to be placed at the end of the secion to
+.. # NOTE(amotoki): toctree needs to be placed at the end of the section to
    # keep the document structure in the PDF doc.
 .. toctree::
    :hidden:

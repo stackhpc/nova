@@ -17,11 +17,11 @@ import datetime
 from io import StringIO
 import sys
 import textwrap
+from unittest import mock
 import warnings
 
 import ddt
 import fixtures
-import mock
 from oslo_db import exception as db_exc
 from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel
@@ -39,7 +39,6 @@ from nova.scheduler.client import report
 from nova import test
 from nova.tests import fixtures as nova_fixtures
 from nova.tests.unit import fake_requests
-
 
 CONF = conf.CONF
 
@@ -494,6 +493,26 @@ Archiving....stopped
                                                      mock_db_archive):
         result = self.commands.archive_deleted_rows(20, verbose=True,
                                                     purge=True)
+        mock_db_archive.assert_called_once_with(
+            test.MatchType(context.RequestContext), 20, before=None,
+            task_log=False)
+        output = self.output.getvalue()
+        # If nothing was archived, there should be no purge messages
+        self.assertIn('Nothing was archived.', output)
+        self.assertEqual(0, result)
+
+    @mock.patch.object(db, 'archive_deleted_rows')
+    @mock.patch.object(objects.CellMappingList, 'get_all')
+    def test_archive_deleted_rows_deleted_instances_no_rows(self, mock_get_all,
+                                                            mock_db_archive):
+        # Simulate a scenario where we didn't archive any rows (example:
+        # DBReferenceError was raised while processing the instances table) but
+        # the separate query for deleted_instance_uuids found rows.
+        mock_db_archive.return_value = (
+            {}, [uuidsentinel.instance1, uuidsentinel.instance2], 0)
+
+        result = self.commands.archive_deleted_rows(20, verbose=True)
+
         mock_db_archive.assert_called_once_with(
             test.MatchType(context.RequestContext), 20, before=None,
             task_log=False)
@@ -2376,6 +2395,7 @@ class TestNovaManagePlacement(test.NoDBTestCase):
     For more involved functional scenarios, use
     nova.tests.functional.test_nova_manage.
     """
+
     def setUp(self):
         super(TestNovaManagePlacement, self).setUp()
         self.output = StringIO()
@@ -2780,6 +2800,10 @@ class TestNovaManagePlacement(test.NoDBTestCase):
                       self.output.getvalue())
         self.assertIn("Conflict!", self.output.getvalue())
 
+    @mock.patch(
+        'nova.network.neutron.API.has_extended_resource_request_extension',
+        new=mock.Mock(return_value=False),
+    )
     def test_has_request_but_no_allocation(self):
         # False because there is a full resource_request and allocation set.
         self.assertFalse(
@@ -2795,7 +2819,10 @@ class TestNovaManagePlacement(test.NoDBTestCase):
                         ]
                     },
                     'binding:profile': {'allocation': uuidsentinel.rp1}
-                }))
+                },
+                mock.sentinel.neutron,
+            )
+        )
         # True because there is a full resource_request but no allocation set.
         self.assertTrue(
             self.cli._has_request_but_no_allocation(
@@ -2810,7 +2837,10 @@ class TestNovaManagePlacement(test.NoDBTestCase):
                         ]
                     },
                     'binding:profile': {}
-                }))
+                },
+                mock.sentinel.neutron,
+            )
+        )
         # True because there is a full resource_request but no allocation set.
         self.assertTrue(
             self.cli._has_request_but_no_allocation(
@@ -2825,73 +2855,89 @@ class TestNovaManagePlacement(test.NoDBTestCase):
                         ]
                     },
                     'binding:profile': None,
-                }))
-        # False because there are no resources in the resource_request.
-        self.assertFalse(
-            self.cli._has_request_but_no_allocation(
-                {
-                    'id': uuidsentinel.empty_resources,
-                    'resource_request': {
-                        'resources': {},
-                        'required': [
-                            'CUSTOM_VNIC_TYPE_NORMAL'
-                        ]
-                    },
-                    'binding:profile': {}
-                }))
-        # False because there are no resources in the resource_request.
-        self.assertFalse(
-            self.cli._has_request_but_no_allocation(
-                {
-                    'id': uuidsentinel.missing_resources,
-                    'resource_request': {
-                        'required': [
-                            'CUSTOM_VNIC_TYPE_NORMAL'
-                        ]
-                    },
-                    'binding:profile': {}
-                }))
-        # False because there are no required traits in the resource_request.
-        self.assertFalse(
-            self.cli._has_request_but_no_allocation(
-                {
-                    'id': uuidsentinel.empty_required,
-                    'resource_request': {
-                        'resources': {
-                            'NET_BW_EGR_KILOBIT_PER_SEC': 1000,
-                        },
-                        'required': []
-                    },
-                    'binding:profile': {}
-                }))
-        # False because there are no required traits in the resource_request.
-        self.assertFalse(
-            self.cli._has_request_but_no_allocation(
-                {
-                    'id': uuidsentinel.missing_required,
-                    'resource_request': {
-                        'resources': {
-                            'NET_BW_EGR_KILOBIT_PER_SEC': 1000,
-                        },
-                    },
-                    'binding:profile': {}
-                }))
-        # False because there are no resources or required traits in the
-        # resource_request.
-        self.assertFalse(
-            self.cli._has_request_but_no_allocation(
-                {
-                    'id': uuidsentinel.empty_resource_request,
-                    'resource_request': {},
-                    'binding:profile': {}
-                }))
+                },
+                mock.sentinel.neutron,
+            )
+        )
         # False because there is no resource_request.
         self.assertFalse(
             self.cli._has_request_but_no_allocation(
                 {
                     'id': uuidsentinel.missing_resource_request,
                     'binding:profile': {}
-                }))
+                },
+                mock.sentinel.neutron,
+            )
+        )
+
+    @mock.patch(
+        'nova.network.neutron.API.has_extended_resource_request_extension',
+        new=mock.Mock(return_value=True),
+    )
+    def test_has_request_but_no_allocation_extended(self):
+        # False because there is resource_request and allocation set.
+        self.assertFalse(
+            self.cli._has_request_but_no_allocation(
+                {
+                    'id': uuidsentinel.healed,
+                    'resource_request': {
+                        'request_groups': [
+                            {
+                                'id': uuidsentinel.group1,
+                                'resources': {
+                                    'NET_BW_EGR_KILOBIT_PER_SEC': 1000,
+                                },
+                                'required': [
+                                    'CUSTOM_VNIC_TYPE_NORMAL'
+                                ]
+                            },
+                        ],
+                    },
+                    'binding:profile': {
+                        'allocation': {uuidsentinel.group1: uuidsentinel.rp1}
+                    }
+                },
+                mock.sentinel.neutron,
+            )
+        )
+        # False because there no resource_request
+        self.assertFalse(
+            self.cli._has_request_but_no_allocation(
+                {
+                    'id': uuidsentinel.healed,
+                    'resource_request': None,
+                    'binding:profile': {
+                        'allocation': {uuidsentinel.group1: uuidsentinel.rp1}
+                    }
+                },
+                mock.sentinel.neutron,
+            )
+        )
+        # True because we have request but no allocation set
+        self.assertTrue(
+            self.cli._has_request_but_no_allocation(
+                {
+                    'id': uuidsentinel.healed,
+                    'resource_request': {
+                        'request_groups': [
+                            {
+                                'id': uuidsentinel.group1,
+                                'resources': {
+                                    'NET_BW_EGR_KILOBIT_PER_SEC': 1000,
+                                },
+                                'required': [
+                                    'CUSTOM_VNIC_TYPE_NORMAL'
+                                ]
+                            },
+                        ],
+                    },
+                    'binding:profile': {
+                        'allocation': {}
+                    }
+                },
+                mock.sentinel.neutron,
+            )
+        )
 
     def test_update_ports_only_updates_binding_profile(self):
         """Simple test to make sure that only the port's binding:profile is
@@ -2918,11 +2964,54 @@ class TestNovaManagePlacement(test.NoDBTestCase):
         neutron.update_port.assert_called_once_with(
             uuidsentinel.port_id, body=expected_update_body)
 
-    def test_audit_with_wrong_provider_uuid(self):
+    @mock.patch.object(manage.PlacementCommands,
+                       '_check_orphaned_allocations_for_provider')
+    @mock.patch('nova.scheduler.client.report.SchedulerReportClient.get')
+    def test_audit_with_provider_uuid(
+        self, get_resource_providers, check_orphaned_allocs,
+    ):
+        rps = [
+            {
+                "generation": 1,
+                "uuid": uuidsentinel.rp1,
+                "links": None,
+                "name": "rp1",
+                "parent_provider_uuid": None,
+                "root_provider_uuid": uuidsentinel.rp1,
+            },
+        ]
+        get_resource_providers.return_value = fake_requests.FakeResponse(
+            200, content=jsonutils.dumps({"resource_providers": rps}))
+
+        # we found one orphaned allocation per RP and we had no faults
+        check_orphaned_allocs.side_effect = ((1, 0),)
+
+        ret = self.cli.audit(
+            verbose=True, delete=False,
+            provider_uuid=uuidsentinel.fake_uuid)
+
+        # We found orphaned allocations but we left them
+        self.assertEqual(3, ret)
+
+        get_resource_providers.assert_called_once_with(
+            f'/resource_providers?uuid={uuidsentinel.fake_uuid}',
+            global_request_id=mock.ANY,
+            version='1.14')
+
+        # Only the specified RP is checked
+        check_orphaned_allocs.assert_has_calls([
+            mock.call(mock.ANY, mock.ANY, mock.ANY, rps[0], False),
+        ])
+
+        output = self.output.getvalue()
+        self.assertIn('Processed 1 allocation', output)
+
+    def test_audit_with_invalid_provider_uuid(self):
         with mock.patch.object(
-                self.cli, '_get_resource_provider',
-                side_effect=exception.ResourceProviderNotFound(
-                    name_or_uuid=uuidsentinel.fake_uuid)):
+            self.cli, '_get_resource_provider',
+            side_effect=exception.ResourceProviderNotFound(
+                name_or_uuid=uuidsentinel.fake_uuid),
+        ):
             ret = self.cli.audit(
                 provider_uuid=uuidsentinel.fake_uuid)
         self.assertEqual(127, ret)
@@ -2977,6 +3066,11 @@ class TestNovaManagePlacement(test.NoDBTestCase):
             # Nothing was found
             expected_ret = 0
         self.assertEqual(expected_ret, ret)
+
+        get_resource_providers.assert_called_once_with(
+            '/resource_providers',
+            global_request_id=mock.ANY,
+            version='1.14')
 
         call1 = mock.call(mock.ANY, mock.ANY, mock.ANY, rps[0], delete)
         call2 = mock.call(mock.ANY, mock.ANY, mock.ANY, rps[1], delete)
@@ -3085,7 +3179,7 @@ class VolumeAttachmentCommandsTestCase(test.NoDBTestCase):
         }
 
     @mock.patch.object(manage, 'format_dict')
-    @mock.patch('nova.objects.BlockDeviceMapping.get_by_volume')
+    @mock.patch('nova.objects.BlockDeviceMapping.get_by_volume_and_instance')
     @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid')
     def test_show(self, mock_get_im, mock_get_bdm, mock_format_dict):
         """Test the 'show' command."""
@@ -3120,7 +3214,7 @@ class VolumeAttachmentCommandsTestCase(test.NoDBTestCase):
         mock_format_dict.assert_called_once_with(bdm)
 
     @mock.patch('oslo_serialization.jsonutils.dumps')
-    @mock.patch('nova.objects.BlockDeviceMapping.get_by_volume')
+    @mock.patch('nova.objects.BlockDeviceMapping.get_by_volume_and_instance')
     @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid')
     def test_show_json(self, mock_get_im, mock_get_bdm, mock_dump):
         """Test the 'show' command with --json."""
@@ -3155,7 +3249,7 @@ class VolumeAttachmentCommandsTestCase(test.NoDBTestCase):
         mock_dump.assert_called_once_with(bdm)
 
     @mock.patch.object(manage, 'format_dict')
-    @mock.patch('nova.objects.BlockDeviceMapping.get_by_volume')
+    @mock.patch('nova.objects.BlockDeviceMapping.get_by_volume_and_instance')
     @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid')
     def test_show_connection_info(
         self, mock_get_im, mock_get_bdm, mock_format_dict
@@ -3199,7 +3293,7 @@ class VolumeAttachmentCommandsTestCase(test.NoDBTestCase):
         mock_format_dict.assert_called_once_with(
             fake_connection_info)
 
-    @mock.patch('nova.objects.BlockDeviceMapping.get_by_volume')
+    @mock.patch('nova.objects.BlockDeviceMapping.get_by_volume_and_instance')
     @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid')
     def test_show_connection_info_json(self, mock_get_im, mock_get_bdm):
         """Test the 'show' command with --json and --connection_info."""
@@ -3274,7 +3368,7 @@ class VolumeAttachmentCommandsTestCase(test.NoDBTestCase):
             mock.sentinel.context, uuidsentinel.instance)
         self.assertEqual(2, ret)
 
-    @mock.patch('nova.objects.BlockDeviceMapping.get_by_volume')
+    @mock.patch('nova.objects.BlockDeviceMapping.get_by_volume_and_instance')
     @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid')
     def test_show_bdm_not_found(self, mock_get_im, mock_get_bdm):
         """Test the 'show' command with a missing bdm."""
@@ -3925,3 +4019,262 @@ class LibvirtCommandsTestCase(test.NoDBTestCase):
         output = self.output.getvalue()
         self.assertEqual(3, ret)
         self.assertIn(uuidsentinel.instance, output)
+
+
+class ImagePropertyCommandsTestCase(test.NoDBTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.output = StringIO()
+        self.useFixture(fixtures.MonkeyPatch('sys.stdout', self.output))
+        self.commands = manage.ImagePropertyCommands()
+
+    @mock.patch('nova.objects.Instance.get_by_uuid')
+    @mock.patch('nova.context.target_cell')
+    @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid',
+                new=mock.Mock(cell_mapping=mock.sentinel.cm))
+    @mock.patch('nova.context.get_admin_context',
+                new=mock.Mock(return_value=mock.sentinel.ctxt))
+    def test_show_image_properties(
+        self, mock_target_cell, mock_get_instance
+    ):
+        mock_target_cell.return_value.__enter__.return_value = \
+            mock.sentinel.cctxt
+        mock_get_instance.return_value = objects.Instance(
+            uuid=uuidsentinel.instance,
+            vm_state=obj_fields.InstanceState.STOPPED,
+            system_metadata={
+                'image_hw_disk_bus': 'virtio',
+            }
+        )
+        ret = self.commands.show(
+            instance_uuid=uuidsentinel.instance,
+            image_property='hw_disk_bus')
+        self.assertEqual(0, ret, 'return code')
+        self.assertIn('virtio', self.output.getvalue(), 'command output')
+
+    @mock.patch('nova.objects.Instance.get_by_uuid')
+    @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid',
+                new=mock.Mock())
+    @mock.patch('nova.context.get_admin_context',
+                new=mock.Mock(return_value=mock.sentinel.ctxt))
+    def test_show_image_properties_instance_not_found(
+        self,
+        mock_get_instance
+    ):
+        mock_get_instance.side_effect = exception.InstanceNotFound(
+            instance_id=uuidsentinel.instance)
+        ret = self.commands.show(
+            instance_uuid=uuidsentinel.instance,
+            image_property='hw_disk_bus')
+        self.assertEqual(2, ret, 'return code')
+
+    @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid')
+    @mock.patch('nova.context.get_admin_context',
+                new=mock.Mock(return_value=mock.sentinel.ctxt))
+    def test_show_image_properties_instance_mapping_not_found(
+        self,
+        mock_get_instance_mapping
+    ):
+        mock_get_instance_mapping.side_effect = \
+            exception.InstanceMappingNotFound(
+                uuid=uuidsentinel.instance)
+        ret = self.commands.show(
+            instance_uuid=uuidsentinel.instance,
+            image_property='hw_disk_bus')
+        self.assertEqual(2, ret, 'return code')
+
+    @mock.patch('nova.objects.Instance.get_by_uuid')
+    @mock.patch('nova.context.target_cell')
+    @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid',
+                new=mock.Mock(cell_mapping=mock.sentinel.cm))
+    @mock.patch('nova.context.get_admin_context',
+                new=mock.Mock(return_value=mock.sentinel.ctxt))
+    def test_show_image_properties_image_property_not_found(
+        self, mock_target_cell, mock_get_instance
+    ):
+        mock_target_cell.return_value.__enter__.return_value = \
+            mock.sentinel.cctxt
+        mock_get_instance.return_value = objects.Instance(
+            uuid=uuidsentinel.instance,
+            vm_state=obj_fields.InstanceState.STOPPED,
+            system_metadata={
+                'image_hw_disk_bus': 'virtio',
+            }
+        )
+        ret = self.commands.show(
+            instance_uuid=uuidsentinel.instance,
+            image_property='foo')
+        self.assertEqual(3, ret, 'return code')
+
+    @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid')
+    @mock.patch('nova.context.get_admin_context',
+                new=mock.Mock(return_value=mock.sentinel.ctxt))
+    def test_show_image_properties_unknown_failure(
+        self,
+        mock_get_instance_mapping,
+    ):
+        mock_get_instance_mapping.side_effect = Exception()
+        ret = self.commands.show(
+            instance_uuid=uuidsentinel.instance,
+            image_property='hw_disk_bus')
+        self.assertEqual(1, ret, 'return code')
+
+    @mock.patch('nova.objects.Instance.get_by_uuid')
+    @mock.patch('nova.context.target_cell')
+    @mock.patch('nova.objects.Instance.save')
+    @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid',
+                new=mock.Mock(cell_mapping=mock.sentinel.cm))
+    @mock.patch('nova.context.get_admin_context',
+                new=mock.Mock(return_value=mock.sentinel.ctxt))
+    def test_set_image_properties(
+        self, mock_instance_save, mock_target_cell, mock_get_instance
+    ):
+        mock_target_cell.return_value.__enter__.return_value = \
+            mock.sentinel.cctxt
+        instance = objects.Instance(
+            uuid=uuidsentinel.instance,
+            vm_state=obj_fields.InstanceState.STOPPED,
+            system_metadata={
+                'image_hw_disk_bus': 'virtio',
+            }
+        )
+        mock_get_instance.return_value = instance
+        ret = self.commands.set(
+            instance_uuid=uuidsentinel.instance,
+            image_properties=['hw_cdrom_bus=sata']
+        )
+        self.assertEqual(0, ret, 'return code')
+        self.assertIn('image_hw_cdrom_bus', instance.system_metadata)
+        self.assertEqual(
+            'sata',
+            instance.system_metadata.get('image_hw_cdrom_bus'),
+            'image_hw_cdrom_bus'
+        )
+        self.assertEqual(
+            'virtio',
+            instance.system_metadata.get('image_hw_disk_bus'),
+            'image_hw_disk_bus'
+        )
+        mock_instance_save.assert_called_once()
+
+    @mock.patch('nova.objects.Instance.get_by_uuid')
+    @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid',
+                new=mock.Mock())
+    @mock.patch('nova.context.get_admin_context',
+                new=mock.Mock(return_value=mock.sentinel.ctxt))
+    def test_set_image_properties_instance_not_found(self, mock_get_instance):
+        mock_get_instance.side_effect = exception.InstanceNotFound(
+            instance_id=uuidsentinel.instance)
+        ret = self.commands.set(
+            instance_uuid=uuidsentinel.instance,
+            image_properties=['hw_disk_bus=virtio'])
+        self.assertEqual(2, ret, 'return code')
+
+    @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid')
+    @mock.patch('nova.context.get_admin_context',
+                new=mock.Mock(return_value=mock.sentinel.ctxt))
+    def test_set_image_properties_instance_mapping_not_found(
+        self,
+        mock_get_instance_mapping
+    ):
+        mock_get_instance_mapping.side_effect = \
+            exception.InstanceMappingNotFound(
+                uuid=uuidsentinel.instance)
+        ret = self.commands.set(
+            instance_uuid=uuidsentinel.instance,
+            image_properties=['hw_disk_bus=virtio'])
+        self.assertEqual(2, ret, 'return code')
+
+    @mock.patch('nova.objects.Instance.get_by_uuid')
+    @mock.patch('nova.context.target_cell')
+    @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid',
+                new=mock.Mock(cell_mapping=mock.sentinel.cm))
+    @mock.patch('nova.context.get_admin_context',
+                new=mock.Mock(return_value=mock.sentinel.ctxt))
+    def test_set_image_properties_instance_invalid_state(
+        self, mock_target_cell, mock_get_instance
+    ):
+        mock_target_cell.return_value.__enter__.return_value = \
+            mock.sentinel.cctxt
+        mock_get_instance.return_value = objects.Instance(
+            uuid=uuidsentinel.instance,
+            vm_state=obj_fields.InstanceState.ACTIVE,
+            system_metadata={
+                'image_hw_disk_bus': 'virtio',
+            }
+        )
+        ret = self.commands.set(
+            instance_uuid=uuidsentinel.instance,
+            image_properties=['hw_cdrom_bus=sata']
+        )
+        self.assertEqual(3, ret, 'return code')
+
+    @mock.patch('nova.objects.Instance.get_by_uuid')
+    @mock.patch('nova.context.target_cell')
+    @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid',
+                new=mock.Mock(cell_mapping=mock.sentinel.cm))
+    @mock.patch('nova.context.get_admin_context',
+                new=mock.Mock(return_value=mock.sentinel.ctxt))
+    def test_set_image_properties_invalid_input(
+        self, mock_target_cell, mock_get_instance
+    ):
+        mock_target_cell.return_value.__enter__.return_value = \
+            mock.sentinel.cctxt
+        mock_get_instance.return_value = objects.Instance(
+            uuid=uuidsentinel.instance,
+            vm_state=obj_fields.InstanceState.SHELVED,
+            system_metadata={
+                'image_hw_disk_bus': 'virtio',
+            }
+        )
+        ret = self.commands.set(
+            instance_uuid=uuidsentinel.instance,
+            image_properties=['hw_cdrom_bus'])
+        self.assertEqual(4, ret, 'return code')
+
+    @mock.patch('nova.objects.Instance.get_by_uuid')
+    @mock.patch('nova.context.target_cell')
+    @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid',
+                new=mock.Mock(cell_mapping=mock.sentinel.cm))
+    @mock.patch('nova.context.get_admin_context',
+                new=mock.Mock(return_value=mock.sentinel.ctxt))
+    def test_set_image_properties_invalid_property_name(
+        self, mock_target_cell, mock_get_instance
+    ):
+        mock_target_cell.return_value.__enter__.return_value = \
+            mock.sentinel.cctxt
+        mock_get_instance.return_value = objects.Instance(
+            uuid=uuidsentinel.instance,
+            vm_state=obj_fields.InstanceState.SHELVED_OFFLOADED,
+            system_metadata={
+                'image_hw_disk_bus': 'virtio',
+            }
+        )
+        ret = self.commands.set(
+            instance_uuid=uuidsentinel.instance,
+            image_properties=['foo=bar'])
+        self.assertEqual(5, ret, 'return code')
+
+    @mock.patch('nova.objects.Instance.get_by_uuid')
+    @mock.patch('nova.context.target_cell')
+    @mock.patch('nova.objects.InstanceMapping.get_by_instance_uuid',
+                new=mock.Mock(cell_mapping=mock.sentinel.cm))
+    @mock.patch('nova.context.get_admin_context',
+                new=mock.Mock(return_value=mock.sentinel.ctxt))
+    def test_set_image_properties_invalid_property_value(
+        self, mock_target_cell, mock_get_instance
+    ):
+        mock_target_cell.return_value.__enter__.return_value = \
+            mock.sentinel.cctxt
+        mock_get_instance.return_value = objects.Instance(
+            uuid=uuidsentinel.instance,
+            vm_state=obj_fields.InstanceState.STOPPED,
+            system_metadata={
+                'image_hw_disk_bus': 'virtio',
+            }
+        )
+        ret = self.commands.set(
+            instance_uuid=uuidsentinel.instance,
+            image_properties=['hw_disk_bus=bar'])
+        self.assertEqual(6, ret, 'return code')

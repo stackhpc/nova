@@ -29,6 +29,7 @@ import shutil
 import tempfile
 
 import eventlet
+from eventlet import tpool
 from keystoneauth1 import loading as ks_loading
 import netaddr
 from openstack import connection
@@ -78,6 +79,17 @@ SM_SKIP_KEYS = (
 _FILE_CACHE = {}
 
 _SERVICE_TYPES = service_types.ServiceTypes()
+
+DEFAULT_GREEN_POOL = None
+
+
+def _get_default_green_pool():
+    global DEFAULT_GREEN_POOL
+    if DEFAULT_GREEN_POOL is None:
+        DEFAULT_GREEN_POOL = eventlet.greenpool.GreenPool(
+            CONF.default_green_pool_size
+        )
+    return DEFAULT_GREEN_POOL
 
 
 # NOTE(mikal): this seems to have to stay for now to handle os-brick
@@ -484,6 +496,7 @@ class UndoManager(object):
     """Provides a mechanism to facilitate rolling back a series of actions
     when an exception is raised.
     """
+
     def __init__(self):
         self.undo_stack = []
 
@@ -630,15 +643,12 @@ def _serialize_profile_info():
     return trace_info
 
 
-def spawn(func, *args, **kwargs):
-    """Passthrough method for eventlet.spawn.
-
-    This utility exists so that it can be stubbed for testing without
-    interfering with the service spawns.
-
-    It will also grab the context from the threadlocal store and add it to
-    the store on the new thread.  This allows for continuity in logging the
-    context when using this method to spawn a new thread.
+def pass_context(runner, func, *args, **kwargs):
+    """Generalised passthrough method
+    It will grab the context from the threadlocal store and add it to
+    the store on the runner.  This allows for continuity in logging the
+    context when using this method to spawn a new thread through the
+    runner function
     """
     _context = common_context.get_current()
     profiler_info = _serialize_profile_info()
@@ -653,11 +663,11 @@ def spawn(func, *args, **kwargs):
             profiler.init(**profiler_info)
         return func(*args, **kwargs)
 
-    return eventlet.spawn(context_wrapper, *args, **kwargs)
+    return runner(context_wrapper, *args, **kwargs)
 
 
-def spawn_n(func, *args, **kwargs):
-    """Passthrough method for eventlet.spawn_n.
+def spawn(func, *args, **kwargs):
+    """Passthrough method for eventlet.spawn.
 
     This utility exists so that it can be stubbed for testing without
     interfering with the service spawns.
@@ -666,25 +676,27 @@ def spawn_n(func, *args, **kwargs):
     the store on the new thread.  This allows for continuity in logging the
     context when using this method to spawn a new thread.
     """
-    _context = common_context.get_current()
-    profiler_info = _serialize_profile_info()
 
-    @functools.wraps(func)
-    def context_wrapper(*args, **kwargs):
-        # NOTE: If update_store is not called after spawn_n it won't be
-        # available for the logger to pull from threadlocal storage.
-        if _context is not None:
-            _context.update_store()
-        if profiler_info and profiler:
-            profiler.init(**profiler_info)
-        func(*args, **kwargs)
+    return pass_context(_get_default_green_pool().spawn, func, *args, **kwargs)
 
-    eventlet.spawn_n(context_wrapper, *args, **kwargs)
+
+def spawn_n(func, *args, **kwargs):
+    """Passthrough method for eventlet.greenpool.spawn_n.
+
+    This utility exists so that it can be stubbed for testing without
+    interfering with the service spawns.
+
+    It will also grab the context from the threadlocal store and add it to
+    the store on the new thread.  This allows for continuity in logging the
+    context when using this method to spawn a new thread.
+    """
+
+    pass_context(_get_default_green_pool().spawn_n, func, *args, **kwargs)
 
 
 def tpool_execute(func, *args, **kwargs):
     """Run func in a native thread"""
-    eventlet.tpool.execute(func, *args, **kwargs)
+    return pass_context(tpool.execute, func, *args, **kwargs)
 
 
 def is_none_string(val):

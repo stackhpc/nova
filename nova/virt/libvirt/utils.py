@@ -22,6 +22,7 @@ import grp
 import os
 import pwd
 import re
+import tempfile
 import typing as ty
 import uuid
 
@@ -102,63 +103,124 @@ CPU_TRAITS_MAPPING = {
     'xop': os_traits.HW_CPU_X86_XOP
 }
 
+
+def make_reverse_cpu_traits_mapping() -> ty.Dict[str, str]:
+    traits_cpu_mapping = dict()
+    for k, v in CPU_TRAITS_MAPPING.items():
+        if isinstance(v, tuple):
+            for trait in v:
+                traits_cpu_mapping[trait] = k
+        else:
+            traits_cpu_mapping[v] = k
+    return traits_cpu_mapping
+
+
 # Reverse CPU_TRAITS_MAPPING
-TRAITS_CPU_MAPPING = {v: k for k, v in CPU_TRAITS_MAPPING.items()}
+TRAITS_CPU_MAPPING = make_reverse_cpu_traits_mapping()
 
 # global directory for emulated TPM
 VTPM_DIR = '/var/lib/libvirt/swtpm/'
 
 
+class EncryptionOptions(ty.TypedDict):
+    secret: str
+    format: str
+
+
 def create_image(
-    disk_format: str, path: str, size: ty.Union[str, int],
+    path: str,
+    disk_format: str,
+    disk_size: ty.Optional[ty.Union[str, int]],
+    backing_file: ty.Optional[str] = None,
+    encryption: ty.Optional[EncryptionOptions] = None
 ) -> None:
-    """Create a disk image
-
-    :param disk_format: Disk image format (as known by qemu-img)
+    """Disk image creation with qemu-img
     :param path: Desired location of the disk image
-    :param size: Desired size of disk image. May be given as an int or
-                 a string. If given as an int, it will be interpreted
-                 as bytes. If it's a string, it should consist of a number
-                 with an optional suffix ('K' for Kibibytes,
-                 M for Mebibytes, 'G' for Gibibytes, 'T' for Tebibytes).
-                 If no suffix is given, it will be interpreted as bytes.
+    :param disk_format: Disk image format (as known by qemu-img)
+    :param disk_size: Desired size of disk image. May be given as an int or
+        a string. If given as an int, it will be interpreted as bytes. If it's
+        a string, it should consist of a number with an optional suffix ('K'
+        for Kibibytes, M for Mebibytes, 'G' for Gibibytes, 'T' for Tebibytes).
+        If no suffix is given, it will be interpreted as bytes.
+        Can be None in the case of a COW image.
+    :param backing_file: (Optional) Backing file to use.
+    :param encryption: (Optional) Dict detailing various encryption attributes
+        such as the format and passphrase.
     """
-    processutils.execute('qemu-img', 'create', '-f', disk_format, path, size)
+    cmd = [
+        'env', 'LC_ALL=C', 'LANG=C', 'qemu-img', 'create', '-f', disk_format
+    ]
 
-
-def create_cow_image(
-    backing_file: ty.Optional[str], path: str, size: ty.Optional[int] = None,
-) -> None:
-    """Create COW image
-
-    Creates a COW image with the given backing file
-
-    :param backing_file: Existing image on which to base the COW image
-    :param path: Desired location of the COW image
-    """
-    base_cmd = ['qemu-img', 'create', '-f', 'qcow2']
-    cow_opts = []
     if backing_file:
         base_details = images.qemu_img_info(backing_file)
-        cow_opts += ['backing_file=%s' % backing_file]
-        cow_opts += ['backing_fmt=%s' % base_details.file_format]
-    else:
-        base_details = None
-    # Explicitly inherit the value of 'cluster_size' property of a qcow2
-    # overlay image from its backing file. This can be useful in cases
-    # when people create a base image with a non-default 'cluster_size'
-    # value or cases when images were created with very old QEMU
-    # versions which had a different default 'cluster_size'.
-    if base_details and base_details.cluster_size is not None:
-        cow_opts += ['cluster_size=%s' % base_details.cluster_size]
-    if size is not None:
-        cow_opts += ['size=%s' % size]
-    if cow_opts:
+        cow_opts = [
+            f'backing_file={backing_file}',
+            f'backing_fmt={base_details.file_format}'
+        ]
+        # Explicitly inherit the value of 'cluster_size' property of a qcow2
+        # overlay image from its backing file. This can be useful in cases when
+        # people create a base image with a non-default 'cluster_size' value or
+        # cases when images were created with very old QEMU versions which had
+        # a different default 'cluster_size'.
+        if base_details.cluster_size is not None:
+            cow_opts += [f'cluster_size={base_details.cluster_size}']
+
         # Format as a comma separated list
         csv_opts = ",".join(cow_opts)
-        cow_opts = ['-o', csv_opts]
-    cmd = base_cmd + cow_opts + [path]
-    processutils.execute(*cmd)
+        cmd += ['-o', csv_opts]
+
+    # Disk size can be None in the case of a COW image
+    disk_size_arg = [str(disk_size)] if disk_size is not None else []
+
+    if encryption:
+        with tempfile.NamedTemporaryFile(mode='tr+', encoding='utf-8') as f:
+            # Write out the passphrase secret to a temp file
+            f.write(encryption['secret'])
+
+            # Ensure the secret is written to disk, we can't .close() here as
+            # that removes the file when using NamedTemporaryFile
+            f.flush()
+
+            # The basic options include the secret and encryption format
+            encryption_opts = [
+                '--object', f"secret,id=sec,file={f.name}",
+                '-o', 'encrypt.key-secret=sec',
+                '-o', f"encrypt.format={encryption['format']}",
+            ]
+            # Supported luks options:
+            #  cipher-alg=<str>       - Name of cipher algorithm and key length
+            #  cipher-mode=<str>      - Name of encryption cipher mode
+            #  hash-alg=<str>         - Name of hash algorithm to use for PBKDF
+            #  iter-time=<num>        - Time to spend in PBKDF in milliseconds
+            #  ivgen-alg=<str>        - Name of IV generator algorithm
+            #  ivgen-hash-alg=<str>   - Name of IV generator hash algorithm
+            #
+            # NOTE(melwitt): Sensible defaults (that match the qemu defaults)
+            # are hardcoded at this time for simplicity and consistency when
+            # instances are migrated. Configuration of luks options could be
+            # added in a future release.
+            encryption_options = {
+                'cipher-alg': 'aes-256',
+                'cipher-mode': 'xts',
+                'hash-alg': 'sha256',
+                'iter-time': 2000,
+                'ivgen-alg': 'plain64',
+                'ivgen-hash-alg': 'sha256',
+            }
+
+            for option, value in encryption_options.items():
+                encryption_opts += [
+                    '-o',
+                    f'encrypt.{option}={value}',
+                ]
+
+            # We need to execute the command while the NamedTemporaryFile still
+            # exists
+            cmd += encryption_opts + [path] + disk_size_arg
+            processutils.execute(*cmd)
+    else:
+        cmd += [path] + disk_size_arg
+        processutils.execute(*cmd)
 
 
 def create_ploop_image(
@@ -216,8 +278,8 @@ def copy_image(
     dest: str,
     host: ty.Optional[str] = None,
     receive: bool = False,
-    on_execute: ty.Callable = None,
-    on_completion: ty.Callable = None,
+    on_execute: ty.Optional[ty.Callable] = None,
+    on_completion: ty.Optional[ty.Callable] = None,
     compression: bool = True,
 ) -> None:
     """Copy a disk image to an existing directory
@@ -526,6 +588,9 @@ def get_cpu_model_from_arch(arch: str) -> str:
         mode = 'qemu32'
     elif arch == obj_fields.Architecture.PPC64LE:
         mode = 'POWER8'
+    # TODO(chateaulav): Testing of emulated archs ongoing
+    # elif arch == obj_fields.Architecture.MIPSEL:
+    #     mode = '24Kf-mips-cpu'
     # NOTE(kevinz): In aarch64, cpu model 'max' will offer the capabilities
     # that all the stuff it can currently emulate, both for "TCG" and "KVM"
     elif arch == obj_fields.Architecture.AARCH64:
@@ -568,6 +633,7 @@ def get_default_machine_type(arch: str) -> ty.Optional[str]:
     default_mtypes = {
         obj_fields.Architecture.ARMV7: "virt",
         obj_fields.Architecture.AARCH64: "virt",
+        obj_fields.Architecture.PPC64LE: "pseries",
         obj_fields.Architecture.S390: "s390-ccw-virtio",
         obj_fields.Architecture.S390X: "s390-ccw-virtio",
         obj_fields.Architecture.I686: "pc",
@@ -577,17 +643,31 @@ def get_default_machine_type(arch: str) -> ty.Optional[str]:
 
 
 def mdev_name2uuid(mdev_name: str) -> str:
-    """Convert an mdev name (of the form mdev_<uuid_with_underscores>) to a
-    uuid (of the form 8-4-4-4-12).
+    """Convert an mdev name (of the form mdev_<uuid_with_underscores> or
+    mdev_<uuid_with_underscores>_<pciaddress>) to a uuid
+    (of the form 8-4-4-4-12).
+
+    :param mdev_name: the name of the mdev to parse the UUID from
+    :returns: string containing the uuid
     """
-    return str(uuid.UUID(mdev_name[5:].replace('_', '-')))
+    mdev_uuid = mdev_name[5:].replace('_', '-')
+    # Unconditionally remove the PCI address from the name
+    mdev_uuid = mdev_uuid[:36]
+    return str(uuid.UUID(mdev_uuid))
 
 
-def mdev_uuid2name(mdev_uuid: str) -> str:
-    """Convert an mdev uuid (of the form 8-4-4-4-12) to a name (of the form
-    mdev_<uuid_with_underscores>).
+def mdev_uuid2name(mdev_uuid: str, parent: ty.Optional[str] = None) -> str:
+    """Convert an mdev uuid (of the form 8-4-4-4-12) and optionally its parent
+    device to a name (of the form mdev_<uuid_with_underscores>[_<pciid>]).
+
+    :param mdev_uuid: the uuid of the mediated device
+    :param parent: the parent device id for the mediated device
+    :returns: name of the mdev to reference in libvirt
     """
-    return "mdev_" + mdev_uuid.replace('-', '_')
+    name = "mdev_" + mdev_uuid.replace('-', '_')
+    if parent and parent.startswith('pci_'):
+        name = name + parent[4:]
+    return name
 
 
 def get_flags_by_flavor_specs(flavor: 'objects.Flavor') -> ty.Set[str]:
