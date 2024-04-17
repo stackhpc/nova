@@ -160,7 +160,7 @@ def do_image_deep_inspection(img, image_href, path):
         # No inspector was found
         LOG.warning('Unable to perform deep image inspection on type %r',
                     img['disk_format'])
-        if disk_format == 'ami':
+        if disk_format in ('ami', 'aki', 'ari'):
             # A lot of things can be in a UEC, although it is typically a raw
             # filesystem. We really have nothing we can do other than treat it
             # like a 'raw', which is what qemu-img will detect a filesystem as
