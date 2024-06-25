@@ -27879,10 +27879,15 @@ class LibvirtDriverTestCase(test.NoDBTestCase, TraitsComparisonMixin):
         self.assertTrue(hv.synic)
         self.assertTrue(hv.reset)
         self.assertTrue(hv.frequencies)
-        self.assertTrue(hv.reenlightenment)
+        # NOTE(jie) reenlightenment will cause instances live-migration
+        # failure, so don't enable it now. See bug 2046549.
+        self.assertFalse(hv.reenlightenment)
         self.assertTrue(hv.tlbflush)
         self.assertTrue(hv.ipi)
-        self.assertTrue(hv.evmcs)
+        # NOTE(artom) evmcs only works on Intel hosts, so we can't enable it
+        # unconditionally. Until we become smarter about it, just don't enable
+        # it at all. See bug 2009280.
+        self.assertFalse(hv.evmcs)
 
 
 class LibvirtVolumeUsageTestCase(test.NoDBTestCase):
