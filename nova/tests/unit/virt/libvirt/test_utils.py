@@ -117,11 +117,15 @@ class LibvirtUtilsTestCase(test.NoDBTestCase):
     @mock.patch('os.path.exists', return_value=True)
     @mock.patch('oslo_concurrency.processutils.execute')
     @mock.patch('nova.virt.images.qemu_img_info')
-    def test_create_cow_image(self, mock_info, mock_execute, mock_exists):
+    @mock.patch('nova.image.format_inspector.detect_file_format')
+    def test_create_cow_image(self, mock_detect, mock_info, mock_execute,
+                              mock_exists):
         mock_execute.return_value = ('stdout', None)
         mock_info.return_value = mock.Mock(
             file_format=mock.sentinel.backing_fmt,
-            cluster_size=mock.sentinel.cluster_size)
+            cluster_size=mock.sentinel.cluster_size,
+            backing_file=None)
+        mock_detect.return_value.safety_check.return_value = True
         libvirt_utils.create_cow_image(mock.sentinel.backing_path,
                                        mock.sentinel.new_path)
         mock_info.assert_called_once_with(mock.sentinel.backing_path)
@@ -131,6 +135,7 @@ class LibvirtUtilsTestCase(test.NoDBTestCase):
                 mock.sentinel.backing_path, mock.sentinel.backing_fmt,
                 mock.sentinel.cluster_size),
              mock.sentinel.new_path)])
+        mock_detect.return_value.safety_check.assert_called_once_with()
 
     @ddt.unpack
     @ddt.data({'fs_type': 'some_fs_type',
