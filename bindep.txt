@@ -55,3 +55,5 @@ pcre-devel [platform:rpm test]
 # runtime and in unit tests. Net result is the same that lsscsi will be
 # installed for any nova installation.
 lsscsi
+# NOTE(priteau): Install qemu-img for format inspector tests
+qemu-utils [platform:dpkg test]
