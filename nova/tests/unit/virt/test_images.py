@@ -303,6 +303,24 @@ class QemuTestCase(test.NoDBTestCase):
 
     @mock.patch.object(images, 'IMAGE_API')
     @mock.patch.object(images, 'qemu_img_info')
+    def test_fetch_inspect_aki(self, imginfo, glance):
+        glance.get.return_value = {'disk_format': 'aki'}
+        self.assertRaises(exception.ImageUnacceptable,
+                          images.fetch_to_raw, None, 'href123', '/no.path')
+        # Make sure 'aki was translated into 'raw' before we call qemu-img
+        imginfo.assert_called_once_with('/no.path.part', format='raw')
+
+    @mock.patch.object(images, 'IMAGE_API')
+    @mock.patch.object(images, 'qemu_img_info')
+    def test_fetch_inspect_ari(self, imginfo, glance):
+        glance.get.return_value = {'disk_format': 'ari'}
+        self.assertRaises(exception.ImageUnacceptable,
+                          images.fetch_to_raw, None, 'href123', '/no.path')
+        # Make sure 'aki was translated into 'raw' before we call qemu-img
+        imginfo.assert_called_once_with('/no.path.part', format='raw')
+
+    @mock.patch.object(images, 'IMAGE_API')
+    @mock.patch.object(images, 'qemu_img_info')
     def test_fetch_inspect_unknown_format(self, imginfo, glance):
         glance.get.return_value = {'disk_format': 'commodore-64-disk'}
         self.assertRaises(exception.ImageUnacceptable,
