@@ -585,6 +585,7 @@
         GLANCE_USE_IMPORT_WORKFLOW: True
         DEVSTACK_PARALLEL: True
         CEPH_MIN_CLIENT_VERSION: "mimic"
+        MYSQL_REDUCE_MEMORY: True
       # NOTE(danms): This job is pretty heavy as it is, so we disable some
       # services that are not relevant to the nova-glance-ceph scenario
       # that this job is intended to validate.
@@ -761,7 +762,3 @@
         - nova-emulation
         - tempest-integrated-compute-centos-9-stream:
             irrelevant-files: *nova-base-irrelevant-files
-    periodic:
-      jobs:
-        - tempest-centos8-stream-fips:
-            branches: master
