@@ -418,6 +418,16 @@ When this is enabled, it will skip version-checking of hypervisors
 during live migration.
 """),
     cfg.BoolOpt(
+        'disable_deep_image_inspection',
+        default=False,
+        help="""
+This disables the additional deep image inspection that the compute node does
+when downloading from glance. This includes backing-file, data-file, and
+known-features detection *before* passing the image to qemu-img. Generally,
+this inspection should be enabled for maximum safety, but this workaround
+option allows disabling it if there is a compatibility concern.
+"""),
+    cfg.BoolOpt(
         'skip_reserve_in_use_ironic_nodes',
         default=False,
         help="""
@@ -431,16 +441,6 @@ as a valid candidate when it is still being cleaned.
 Howerver, if you don't use automatic cleaning, it can cause an
 extra delay before and Ironic node is available for building a
 new Nova instance.
-"""),
-    cfg.BoolOpt(
-        'disable_deep_image_inspection',
-        default=False,
-        help="""
-This disables the additional deep image inspection that the compute node does
-when downloading from glance. This includes backing-file, data-file, and
-known-features detection *before* passing the image to qemu-img. Generally,
-this inspection should be enabled for maximum safety, but this workaround
-option allows disabling it if there is a compatibility concern.
 """),
 ]
 
