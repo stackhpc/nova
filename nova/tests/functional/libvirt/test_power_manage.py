@@ -10,9 +10,9 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from unittest import mock
-
 import fixtures
+
+from unittest import mock
 
 from nova import context as nova_context
 from nova import exception
@@ -240,7 +240,6 @@ class PowerManagementTests(PowerManagementTestsBase):
                                          cpu_cores=5, cpu_threads=2)
         self.compute1 = self.start_compute(host_info=self.host_info,
                                            hostname='compute1')
-
         # All cores are shutdown at startup, let's check.
         cpu_dedicated_set = hardware.get_cpu_dedicated_set()
         self._assert_cpu_set_state(cpu_dedicated_set, expected='offline')
@@ -266,6 +265,34 @@ class PowerManagementTests(PowerManagementTestsBase):
         cpu_dedicated_set = hardware.get_cpu_dedicated_set()
         unused_cpus = cpu_dedicated_set - instance_pcpus
         self._assert_cpu_set_state(unused_cpus, expected='offline')
+        return server
+
+    def test_delete_server(self):
+        server = self.test_create_server()
+        self._delete_server(server)
+        # Let's verify that the pinned CPUs are now offline
+        cpu_dedicated_set = hardware.get_cpu_dedicated_set()
+        self._assert_cpu_set_state(cpu_dedicated_set, expected='offline')
+
+    def test_delete_server_device_busy(self):
+        # This test verifies bug 2065927 is resolved.
+        server = self.test_create_server()
+        inst = objects.Instance.get_by_uuid(self.ctxt, server['id'])
+        instance_pcpus = inst.numa_topology.cpu_pinning
+        self._assert_cpu_set_state(instance_pcpus, expected='online')
+        with mock.patch(
+            'nova.filesystem.write_sys.__wrapped__',
+            side_effect=[
+                exception.DeviceBusy(file_path='fake'),
+                None]):
+
+            self._delete_server(server)
+        cpu_dedicated_set = hardware.get_cpu_dedicated_set()
+        # Verify that the unused CPUs are still offline
+        unused_cpus = cpu_dedicated_set - instance_pcpus
+        self._assert_cpu_set_state(unused_cpus, expected='offline')
+        # and the pinned CPUs are offline
+        self._assert_cpu_set_state(instance_pcpus, expected='offline')
 
     def test_create_server_with_emulator_threads_isolate(self):
         server = self._create_server(
