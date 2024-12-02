@@ -102,8 +102,8 @@ class VGPUTestBase(base.ServersTestBase):
                                                    parent=libvirt_parent)})
         return uuid
 
-    def start_compute(self, hostname):
-        hostname = super().start_compute(
+    def start_compute_with_vgpu(self, hostname):
+        hostname = self.start_compute(
             pci_info=fakelibvirt.HostPCIDevicesInfo(
                 num_pci=0, num_pfs=0, num_vfs=0, num_mdevcap=2,
             ),
@@ -121,6 +121,43 @@ class VGPUTestBase(base.ServersTestBase):
         # Since we haven't created any mdevs yet, we shouldn't find them
         self.assertEqual([], compute.driver._get_mediated_devices())
         return compute
+
+    def assert_mdev_usage(self, compute, expected_amount, instance=None,
+                          expected_rc=orc.VGPU, expected_rp_name=None):
+        """Verify the allocations for either a whole compute or just a
+           specific instance.
+           :param compute: the internal compute object
+           :param expected_amount: the expected amount of allocations
+           :param instance: if not None, a specific Instance to lookup instead
+                            of the whole compute allocations.
+           :param expected_rc: the expected resource class
+           :param expected_rp_name: the expected resource provider name if an
+                                    instance is provided.
+        """
+        total_usages = collections.defaultdict(int)
+        # We only want to get mdevs that are assigned to either all the
+        # instances or just one.
+        mdevs = compute.driver._get_all_assigned_mediated_devices(instance)
+        for mdev in mdevs:
+            mdev_name = libvirt_utils.mdev_uuid2name(mdev)
+            mdev_info = compute.driver._get_mediated_device_information(
+                mdev_name)
+            parent_name = mdev_info['parent']
+            parent_rp_name = compute.host + '_' + parent_name
+            parent_rp_uuid = self._get_provider_uuid_by_name(parent_rp_name)
+            parent_usage = self._get_provider_usages(parent_rp_uuid)
+            if (expected_rc in parent_usage and
+                parent_rp_name not in total_usages
+            ):
+                # We only set the total amount if we didn't had it already
+                total_usages[parent_rp_name] = parent_usage[expected_rc]
+            if expected_rp_name and instance is not None:
+                # If this is for an instance, all the mdevs should be in the
+                # same RP.
+                self.assertEqual(expected_rp_name, parent_rp_name)
+        self.assertEqual(expected_amount, len(mdevs))
+        self.assertEqual(expected_amount,
+                         sum(total_usages[k] for k in total_usages))
 
 
 class VGPUTests(VGPUTestBase):
@@ -145,8 +182,7 @@ class VGPUTests(VGPUTestBase):
         self.policy.set_rules({
             'os_compute_api:os-instance-actions:events': 'rule:admin_or_owner'
         }, overwrite=False)
-
-        self.compute1 = self.start_compute('host1')
+        self.compute1 = self.start_compute_with_vgpu('host1')
 
     def assert_vgpu_usage_for_compute(self, compute, expected):
         total_usages = collections.defaultdict(int)
@@ -188,7 +224,7 @@ class VGPUTests(VGPUTestBase):
 
     def test_resize_servers_with_vgpu(self):
         # Add another compute for the sake of resizing
-        self.compute2 = self.start_compute('host2')
+        self.compute2 = self.start_compute_with_vgpu('host2')
         server = self._create_server(
             image_uuid='155d900f-4e14-4e4c-a73d-069cbf4541e6',
             flavor_id=self.flavor, host=self.compute1.host,
@@ -310,7 +346,7 @@ class VGPUMultipleTypesTests(VGPUTestBase):
         # Prepare traits for later on
         self._create_trait('CUSTOM_NVIDIA_11')
         self._create_trait('CUSTOM_NVIDIA_12')
-        self.compute1 = self.start_compute('host1')
+        self.compute1 = self.start_compute_with_vgpu('host1')
 
     def test_create_servers_with_vgpu(self):
         self._create_server(
@@ -342,13 +378,12 @@ class VGPUMultipleTypesTests(VGPUTestBase):
 
     def test_create_servers_with_specific_type(self):
         # Regenerate the PCI addresses so both pGPUs now support nvidia-12
-        connection = self.computes[
-            self.compute1.host].driver._host.get_connection()
-        connection.pci_info = fakelibvirt.HostPCIDevicesInfo(
+        pci_info = fakelibvirt.HostPCIDevicesInfo(
             num_pci=0, num_pfs=0, num_vfs=0, num_mdevcap=2,
             multiple_gpu_types=True)
         # Make a restart to update the Resource Providers
-        self.compute1 = self.restart_compute_service(self.compute1)
+        self.compute1 = self.restart_compute_service(
+            self.compute1.host, pci_info=pci_info, keep_hypervisor_state=False)
         pgpu1_rp_uuid = self._get_provider_uuid_by_name(
             self.compute1.host + '_' + fakelibvirt.PGPU1_PCI_ADDR)
         pgpu2_rp_uuid = self._get_provider_uuid_by_name(
