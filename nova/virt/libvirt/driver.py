@@ -8216,15 +8216,21 @@ class LibvirtDriver(driver.ComputeDriver):
             except libvirt.libvirtError:
                 return []
 
-        net_devs = [
-            dev for dev in devices.values() if "net" in _safe_list_caps(dev)
-        ]
-        vdpa_devs = [
-            dev for dev in devices.values() if "vdpa" in _safe_list_caps(dev)
-        ]
-        pci_devs = {
-            name: dev for name, dev in devices.items()
-                    if "pci" in _safe_list_caps(dev)}
+        net_devs = []
+        vdpa_devs = []
+        pci_devs = {}
+        for name, dev in devices.items():
+            device_caps = _safe_list_caps(dev)
+            if "net" in device_caps:
+                net_devs.append(dev)
+            if "vdpa" in device_caps:
+                vdpa_devs.append(dev)
+            if "pci" in device_caps:
+                pci_devs[name] = dev
+
+            # Let other tasks work during libvirt connection task
+            greenthread.sleep(0)
+
         pci_info = [
             self._host._get_pcidev_info(
                 name, dev, net_devs,
