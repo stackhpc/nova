@@ -13,6 +13,7 @@
 import copy
 from unittest import mock
 
+from oslo_serialization import jsonutils
 from oslo_utils.fixture import uuidsentinel as uuids
 from oslo_versionedobjects import base as ovo_base
 import testtools
@@ -362,6 +363,7 @@ class _TestInstanceNUMATopology(object):
         fake_topo_obj = copy.deepcopy(fake_topo_obj_w_cell_v1_4)
         for cell in fake_topo_obj.cells:
             cell.cpu_policy = objects.fields.CPUAllocationPolicy.DEDICATED
+            cell.VERSION = '1.4'
 
         numa_topology = objects.InstanceNUMATopology.obj_from_db_obj(
             self.context, fake_instance_uuid, fake_topo_obj._to_json())
@@ -371,6 +373,194 @@ class _TestInstanceNUMATopology(object):
                 fake_topo_obj_w_cell_v1_4['cells']):
             self.assertEqual(set(), obj_cell.cpuset)
             self.assertEqual(topo_cell.cpuset, obj_cell.pcpuset)
+
+    def test_obj_from_db_obj_no_pinning(self):
+        """Test of creating 'InstanceNUMATopology' OVO object from the
+        database primitives, which has an old version 'InstanceNUMACell'
+        primitives.
+
+        Prior to version 1.5, 'InstanceNUMACell' saves the instance CPUs in
+        the 'cpuset' field, for both the pinned CPUs of a dedicated and the
+        un-pinned CPUs of a shared instances, after version 1.5, any pinned
+        CPUs of dedicated instance are moved to 'pcpuset'. this test verifies
+        the CPU movement for instance with a 'dedicated' allocation policy.
+
+        This test is for the case where the instance has no pinned CPUs but
+        the instance has a numa topology such as when hugepages are used.
+        See bug: https://bugs.launchpad.net/nova/+bug/2080556 for more details.
+        """
+        fake_topo_obj_w_cell_v1_4 = objects.InstanceNUMATopology(
+            instance_uuid=fake_instance_uuid,
+            cells=[
+                objects.InstanceNUMACell(
+                    id=0, cpuset=set([1, 2]), memory=512,
+                    pagesize=2048),
+                objects.InstanceNUMACell(
+                    id=1, cpuset=set([3, 4]), memory=512,
+                    pagesize=2048),
+            ])
+
+        fake_topo_obj = copy.deepcopy(fake_topo_obj_w_cell_v1_4)
+        for cell in fake_topo_obj.cells:
+            cell.cpu_policy = objects.fields.CPUAllocationPolicy.SHARED
+            cell.VERSION = '1.4'
+
+        numa_topology = objects.InstanceNUMATopology.obj_from_db_obj(
+            self.context, fake_instance_uuid, fake_topo_obj._to_json())
+
+        for obj_cell, topo_cell in zip(
+                numa_topology.cells,
+                fake_topo_obj_w_cell_v1_4['cells']):
+            self.assertEqual(topo_cell.cpuset, obj_cell.cpuset)
+            self.assertEqual(set(), obj_cell.pcpuset)
+
+    def test__migrate_legacy_dedicated_instance_cpuset_dedicate_1_4(self):
+        # Create a topology with a cell on latest version. Would be nice
+        # to create one the old 1.4 cell version directly but that is only
+        # possible indirectly as done below.
+        topo = objects.InstanceNUMATopology(
+            instance_uuid=fake_instance_uuid,
+            cells=[
+                objects.InstanceNUMACell(id=0, cpuset=set(), pcpuset={0, 1}),
+            ])
+        topo.cells[0].cpu_policy = objects.fields.CPUAllocationPolicy.DEDICATED
+
+        # Use the builtin backlevelling logic to pull it back to old cell
+        # version
+        topo_with_cell_1_4 = topo.obj_to_primitive(
+            target_version='1.3', version_manifest={'InstanceNUMACell': '1.4'})
+
+        # Just check that the backlevelling works, and we have a cell with
+        # version and data on 1.4 level
+        cell_1_4_primitive = topo_with_cell_1_4['nova_object.data']['cells'][0]
+        self.assertEqual('1.4', cell_1_4_primitive['nova_object.version'])
+        self.assertEqual(
+            (0, 1), cell_1_4_primitive['nova_object.data']['cpuset'])
+        self.assertNotIn('pcpuset', cell_1_4_primitive['nova_object.data'])
+
+        # Now simulate that such old data is loaded from the DB and migrated
+        # from 1.4 to 1.6 by the data migration
+        topo_loaded = objects.InstanceNUMATopology.obj_from_db_obj(
+            self.context, fake_instance_uuid,
+            jsonutils.dumps(topo_with_cell_1_4))
+
+        # In place data migration happens during load, cpuset data is moved to
+        # pcpuset
+        self.assertEqual(set(), topo_loaded.cells[0].cpuset)
+        self.assertEqual({0, 1}, topo_loaded.cells[0].pcpuset)
+        # and the version is updated to 1.6
+        self.assertEqual('1.6', topo_loaded.cells[0].VERSION)
+
+    def test__migrate_legacy_dedicated_instance_cpuset_shared_1_4(self):
+        # Create a topology with a cell on latest version. Would be nice
+        # to create one the old 1.4 cell version directly but that is only
+        # possible indirectly as done below.
+        topo = objects.InstanceNUMATopology(
+            instance_uuid=fake_instance_uuid,
+            cells=[
+                objects.InstanceNUMACell(id=0, cpuset={0, 1}, pcpuset=set()),
+            ])
+        topo.cells[0].cpu_policy = objects.fields.CPUAllocationPolicy.SHARED
+
+        # Use the builtin backlevelling logic to pull it back to old cell
+        # version
+        topo_with_cell_1_4 = topo.obj_to_primitive(
+            target_version='1.3', version_manifest={'InstanceNUMACell': '1.4'})
+
+        # Just check that the backlevelling works, and we have a cell with
+        # version and data on 1.4 level
+        cell_1_4_primitive = topo_with_cell_1_4['nova_object.data']['cells'][0]
+        self.assertEqual('1.4', cell_1_4_primitive['nova_object.version'])
+        self.assertEqual(
+            (0, 1), cell_1_4_primitive['nova_object.data']['cpuset'])
+        self.assertNotIn('pcpuset', cell_1_4_primitive['nova_object.data'])
+
+        # Now simulate that such old data is loaded from the DB and migrated
+        # from 1.4 to 1.6 by the data migration
+        topo_loaded = objects.InstanceNUMATopology.obj_from_db_obj(
+            self.context, fake_instance_uuid,
+            jsonutils.dumps(topo_with_cell_1_4))
+
+        # In place data migration did not move the data as the cpu_policy is
+        # shared
+        self.assertEqual({0, 1}, topo_loaded.cells[0].cpuset)
+        self.assertEqual(set(), topo_loaded.cells[0].pcpuset)
+        # but the version is updated to 1.6
+        self.assertEqual('1.6', topo_loaded.cells[0].VERSION)
+
+    def test__migrate_legacy_dedicated_instance_cpuset_dedicated_half_migrated(
+        self
+    ):
+        # Before the fix for https://bugs.launchpad.net/nova/+bug/2097360
+        # landed Nova only half migrated the InstanceNUMACell from 1.4 to 1.6
+        # by doing the data move but not updating the version string in the DB.
+        # This test case ensures that if such migration happened before the fix
+        # was deployed then Nova fixed the DB content on the next load as well.
+
+        # Create a topology with a cell on latest version. Would be nice
+        # to create one the old 1.4 cell version directly but that is only
+        # possible indirectly as done below.
+        topo = objects.InstanceNUMATopology(
+            instance_uuid=fake_instance_uuid,
+            cells=[
+                objects.InstanceNUMACell(id=0, cpuset=set(), pcpuset={0, 1}),
+            ])
+        topo.cells[0].cpu_policy = objects.fields.CPUAllocationPolicy.DEDICATED
+
+        # simulate the half done migration by pulling back the version string
+        # in the primitive form to 1.4 while keeping the data on 1.6 format.
+        topo_primitive = topo.obj_to_primitive()
+        cell_primitive = topo_primitive['nova_object.data']['cells'][0]
+        self.assertEqual('1.6', cell_primitive['nova_object.version'])
+        cell_primitive['nova_object.version'] = '1.4'
+
+        topo_loaded = objects.InstanceNUMATopology.obj_from_db_obj(
+            self.context, fake_instance_uuid, jsonutils.dumps(topo_primitive))
+
+        # the data did not change
+        self.assertEqual(set(), topo_loaded.cells[0].cpuset)
+        self.assertEqual({0, 1}, topo_loaded.cells[0].pcpuset)
+        # but the version is updated to 1.6
+        self.assertEqual('1.6', topo_loaded.cells[0].VERSION)
+
+    def test__migrate_legacy_dedicated_instance_cpuset_mixed_1_4(self):
+        # Before the fix for https://bugs.launchpad.net/nova/+bug/2097360
+        # landed Nova only half migrated the InstanceNUMACell from 1.4 to 1.6
+        # by doing the data move but not updating the version string in the DB.
+        # After this the instance is resized to flavor with mixed cpu_policy
+        # then there is a good chance that the DB has version string 1.4 but
+        # the data is on 1.6 format with the cpu_policy set to mixed.
+        # This test case ensures that if such situation happened before the fix
+        # was deployed then Nova fixed the DB content on the next load as well.
+
+        # Create a topology with a cell on latest version. Would be nice
+        # to create one the old 1.4 cell version directly but that is only
+        # possible indirectly as done below.
+        topo = objects.InstanceNUMATopology(
+            instance_uuid=fake_instance_uuid,
+            cells=[
+                objects.InstanceNUMACell(id=0, cpuset={0, 1}, pcpuset={2, 3}),
+            ])
+        topo.cells[0].cpu_policy = objects.fields.CPUAllocationPolicy.MIXED
+
+        # simulate the half done migration by pulling back the version string
+        # in the primitive form to 1.4 while keeping the data on 1.6 format.
+        topo_primitive = topo.obj_to_primitive()
+        cell_primitive = topo_primitive['nova_object.data']['cells'][0]
+        self.assertEqual('1.6', cell_primitive['nova_object.version'])
+        cell_primitive['nova_object.version'] = '1.4'
+
+        topo_loaded = objects.InstanceNUMATopology.obj_from_db_obj(
+            self.context, fake_instance_uuid, jsonutils.dumps(topo_primitive))
+
+        # the data did not change
+        self.assertEqual({0, 1}, topo_loaded.cells[0].cpuset)
+        self.assertEqual({2, 3}, topo_loaded.cells[0].pcpuset)
+        self.assertEqual(
+            objects.fields.CPUAllocationPolicy.MIXED,
+            topo_loaded.cells[0].cpu_policy)
+        # but the version is updated to 1.6
+        self.assertEqual('1.6', topo_loaded.cells[0].VERSION)
 
 
 class TestInstanceNUMATopology(
