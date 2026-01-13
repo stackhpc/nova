@@ -296,9 +296,9 @@ class FakePCIDevice(object):
 
     def __init__(
         self, dev_type, bus, slot, function, iommu_group, numa_node, *,
-        vf_ratio=None, multiple_gpu_types=False, parent=None,
-        vend_id=None, vend_name=None, prod_id=None, prod_name=None,
-        driver_name=None,
+        vf_ratio=None, multiple_gpu_types=False,
+        parent=None, vend_id=None, vend_name=None, prod_id=None,
+        prod_name=None, driver_name=None, mac_address=None,
     ):
         """Populate pci devices
 
@@ -319,6 +319,8 @@ class FakePCIDevice(object):
         :param prod_id: (str) The product ID.
         :param prod_name: (str) The product name.
         :param driver_name: (str) The driver name.
+        :param mac_address: (str) The MAC of the device.
+            Used in case of SRIOV PFs
         """
 
         self.dev_type = dev_type
@@ -336,6 +338,7 @@ class FakePCIDevice(object):
         self.prod_id = prod_id
         self.prod_name = prod_name
         self.driver_name = driver_name
+        self.mac_address = mac_address
 
         self.generate_xml()
 
@@ -349,7 +352,9 @@ class FakePCIDevice(object):
             assert not self.vf_ratio, 'vf_ratio does not apply for PCI devices'
 
         if self.dev_type in ('PF', 'VF'):
-            assert self.vf_ratio, 'require vf_ratio for PFs and VFs'
+            assert (
+                self.vf_ratio is not None
+            ), 'require vf_ratio for PFs and VFs'
 
         if self.dev_type == 'VF':
             assert self.parent, 'require parent for VFs'
@@ -447,6 +452,10 @@ class FakePCIDevice(object):
 
     def XMLDesc(self, flags):
         return self.pci_device
+
+    @property
+    def address(self):
+        return "0000:%02x:%02x.%1x" % (self.bus, self.slot, self.function)
 
 
 # TODO(stephenfin): Remove all of these HostFooDevicesInfo objects in favour of
@@ -555,9 +564,9 @@ class HostPCIDevicesInfo(object):
 
     def add_device(
         self, dev_type, bus, slot, function, iommu_group, numa_node,
-        vf_ratio=None, multiple_gpu_types=False, parent=None,
-        vend_id=None, vend_name=None, prod_id=None, prod_name=None,
-        driver_name=None,
+        vf_ratio=None, multiple_gpu_types=False,
+        parent=None, vend_id=None, vend_name=None, prod_id=None,
+        prod_name=None, driver_name=None, mac_address=None,
     ):
         pci_dev_name = _get_libvirt_nodedev_name(bus, slot, function)
 
@@ -577,7 +586,9 @@ class HostPCIDevicesInfo(object):
             vend_name=vend_name,
             prod_id=prod_id,
             prod_name=prod_name,
-            driver_name=driver_name)
+            driver_name=driver_name,
+            mac_address=mac_address,
+        )
         self.devices[pci_dev_name] = dev
         return dev
 
@@ -595,6 +606,13 @@ class HostPCIDevicesInfo(object):
     def get_all_mdev_capable_devices(self):
         return [dev for dev in self.devices
                 if self.devices[dev].is_capable_of_mdevs]
+
+    def get_pci_address_mac_mapping(self):
+        return {
+            device.address: device.mac_address
+            for dev_addr, device in self.devices.items()
+            if device.mac_address
+        }
 
 
 class FakeMdevDevice(object):
@@ -2125,6 +2143,15 @@ class FakeLibvirtFixture(fixtures.Fixture):
     """
     def __init__(self, stub_os_vif=True):
         self.stub_os_vif = stub_os_vif
+        self.pci_address_to_mac_map = collections.defaultdict(
+            lambda: '52:54:00:1e:59:c6')
+
+    def update_sriov_mac_address_mapping(self, pci_address_to_mac_map):
+        self.pci_address_to_mac_map.update(pci_address_to_mac_map)
+
+    def fake_get_mac_by_pci_address(self, pci_addr, pf_interface=False):
+        res = self.pci_address_to_mac_map[pci_addr]
+        return res
 
     def setUp(self):
         super(FakeLibvirtFixture, self).setUp()
@@ -2145,6 +2172,10 @@ class FakeLibvirtFixture(fixtures.Fixture):
         self.useFixture(fixtures.MockPatch(
             'nova.pci.utils.get_ifname_by_pci_address',
             return_value='fake_pf_interface_name'))
+
+        self.useFixture(fixtures.MockPatch(
+            'nova.pci.utils.get_mac_by_pci_address',
+            new=self.fake_get_mac_by_pci_address))
 
         # libvirt calls out to sysfs to get the vfs ID during macvtap plug
         self.useFixture(fixtures.MockPatch(

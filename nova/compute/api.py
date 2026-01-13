@@ -3969,9 +3969,6 @@ class API(base.Base):
 
     # TODO(stephenfin): This logic would be so much easier to grok if we
     # finally split resize and cold migration into separate code paths
-    # FIXME(sean-k-mooney): Cold migrate and resize to different hosts
-    # probably works but they have not been tested so block them for now
-    @reject_vdpa_instances(instance_actions.RESIZE)
     @block_accelerators()
     @check_instance_lock
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED])
@@ -4190,9 +4187,6 @@ class API(base.Base):
             allow_same_host = CONF.allow_resize_to_same_host
         return allow_same_host
 
-    # FIXME(sean-k-mooney): Shelve works but unshelve does not due to bug
-    # #1851545, so block it for now
-    @reject_vdpa_instances(instance_actions.SHELVE)
     @reject_vtpm_instances(instance_actions.SHELVE)
     @block_accelerators(until_service=54)
     @check_instance_lock
@@ -5273,8 +5267,6 @@ class API(base.Base):
         self.compute_rpcapi.live_migration_abort(context,
                 instance, migration.id)
 
-    # FIXME(sean-k-mooney): rebuild works but we have not tested evacuate yet
-    @reject_vdpa_instances(instance_actions.EVACUATE)
     @reject_vtpm_instances(instance_actions.EVACUATE)
     @block_accelerators(until_service=SUPPORT_ACCELERATOR_SERVICE_FOR_REBUILD)
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.STOPPED,
