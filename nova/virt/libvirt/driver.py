@@ -271,6 +271,9 @@ MIN_IGB_QEMU_VERSION = (8, 0, 0)
 MIN_VFIO_PCI_VARIANT_LIBVIRT_VERSION = (10, 0, 0)
 MIN_VFIO_PCI_VARIANT_QEMU_VERSION = (8, 2, 2)
 
+# Minimum version to preserve vTPM data
+MIN_VERSION_INT_FOR_KEEP_TPM = (8, 9, 0)
+
 REGISTER_IMAGE_PROPERTY_DEFAULTS = [
     'hw_machine_type',
     'hw_cdrom_bus',
@@ -583,6 +586,10 @@ class LibvirtDriver(driver.ComputeDriver):
         # distinguish between cores on the source and destination hosts.
         # See also nova.virt.libvirt.cpu.api.API.core().
         self.cpu_api = libvirt_cpu.API()
+
+        # Cache the availability of the VIR_DOMAIN_UNDEFINE_KEEP_TPM flag in
+        # this libvirt version. This is set in init_host.
+        self._may_keep_vtpm = False
 
     def _discover_vpmems(self, vpmem_conf=None):
         """Discover vpmems on host and configuration.
@@ -905,6 +912,12 @@ class LibvirtDriver(driver.ComputeDriver):
         self._check_cpu_compatibility()
 
         self._check_vtpm_support()
+
+        # Cache the availability of the VIR_DOMAIN_UNDEFINE_KEEP_TPM flag in
+        # this libvirt version.
+        self._may_keep_vtpm = self._host.has_min_version(
+            MIN_VERSION_INT_FOR_KEEP_TPM,
+        )
 
         self._check_multipath()
 
@@ -1675,11 +1688,32 @@ class LibvirtDriver(driver.ComputeDriver):
         self.cleanup(context, instance, network_info, block_device_info,
                      destroy_disks, destroy_secrets=destroy_secrets)
 
-    def _undefine_domain(self, instance):
+    def _delete_guest_configuration(self, guest, keep_vtpm):
+        """Wrapper around guest.delete_configuration which incorporates version
+        checks for the additional arguments.
+
+        :param guest: The domain to undefine.
+        :param keep_vtpm: If set, the vTPM data (if any) is not deleted during
+            undefine.
+
+            This flag may be ignored if libvirt is too old to support
+            preserving vTPM data (see bug #2118888).
+        """
+        if keep_vtpm and not self._may_keep_vtpm:
+            LOG.warning(
+                "Temporary undefine operation is deleting vTPM contents. "
+                "Please upgrade libvirt to >= 8.9.0 to avoid this.",
+                instance=guest.uuid,
+            )
+            keep_vtpm = False
+
+        guest.delete_configuration(keep_vtpm=keep_vtpm)
+
+    def _undefine_domain(self, instance, keep_vtpm=False):
         try:
             guest = self._host.get_guest(instance)
             try:
-                guest.delete_configuration()
+                self._delete_guest_configuration(guest, keep_vtpm=keep_vtpm)
             except libvirt.libvirtError as e:
                 with excutils.save_and_reraise_exception() as ctxt:
                     errcode = e.get_error_code()
@@ -1712,7 +1746,8 @@ class LibvirtDriver(driver.ComputeDriver):
         :param destroy_disks: if local ephemeral disks should be destroyed
         :param migrate_data: optional migrate_data object
         :param destroy_vifs: if plugged vifs should be unplugged
-        :param destroy_secrets: Indicates if secrets should be destroyed
+        :param destroy_secrets: Indicates if libvirt secrets for Cinder volume
+                   encryption should be destroyed
         """
         cleanup_instance_dir = False
         cleanup_instance_disks = False
@@ -1766,8 +1801,8 @@ class LibvirtDriver(driver.ComputeDriver):
         :param cleanup_instance_dir: If the instance dir should be removed
         :param cleanup_instance_disks: If the instance disks should be removed.
             Also removes ephemeral encryption secrets, if present.
-        :param destroy_secrets: If the cinder volume encryption secrets should
-            be deleted.
+        :param destroy_secrets: If the cinder volume encryption libvirt secrets
+                   should be deleted.
         """
         # zero the data on backend pmem device
         vpmems = self._get_vpmems(instance)
@@ -1832,7 +1867,6 @@ class LibvirtDriver(driver.ComputeDriver):
                 pass
 
         if cleanup_instance_disks:
-            crypto.delete_vtpm_secret(context, instance)
             # Make sure that the instance directory files were successfully
             # deleted before destroying the encryption secrets in the case of
             # image backends that are not 'lvm' or 'rbd'. We don't want to
@@ -1842,7 +1876,7 @@ class LibvirtDriver(driver.ComputeDriver):
                 self._cleanup_ephemeral_encryption_secrets(
                     context, instance, block_device_info)
 
-        self._undefine_domain(instance)
+        self._undefine_domain(instance, keep_vtpm=not cleanup_instance_disks)
 
     def _cleanup_ephemeral_encryption_secrets(
         self, context, instance, block_device_info
@@ -2416,7 +2450,7 @@ class LibvirtDriver(driver.ComputeDriver):
             # undefine it. If any part of this block fails, the domain is
             # re-defined regardless.
             if guest.has_persistent_configuration():
-                guest.delete_configuration()
+                self._delete_guest_configuration(guest, keep_vtpm=True)
 
             try:
                 dev.copy(conf.to_xml(), reuse_ext=True)
@@ -3545,7 +3579,7 @@ class LibvirtDriver(driver.ComputeDriver):
             #             If any part of this block fails, the domain is
             #             re-defined regardless.
             if guest.has_persistent_configuration():
-                guest.delete_configuration()
+                self._delete_guest_configuration(guest, keep_vtpm=True)
 
             # NOTE (rmk): Establish a temporary mirror of our root disk and
             #             issue an abort once we have a complete copy.
@@ -5160,6 +5194,13 @@ class LibvirtDriver(driver.ComputeDriver):
                               {'img_id': img_id, 'e': e},
                               instance=instance)
 
+    @staticmethod
+    def _get_fs_label_ephemeral(index: int) -> str:
+        # Use a consistent naming convention for FS labels. We need to be
+        # mindful of various filesystems label name length limitations.
+        # See for example: https://bugs.launchpad.net/nova/+bug/2061701
+        return f'ephemeral{index}'
+
     # NOTE(sileht): many callers of this method assume that this
     # method doesn't fail if an image already exists but instead
     # think that it will be reused (ie: (live)-migration/resize)
@@ -5275,7 +5316,7 @@ class LibvirtDriver(driver.ComputeDriver):
             created_disks = created_disks or not disk_image.exists()
 
             fn = functools.partial(self._create_ephemeral,
-                                   fs_label='ephemeral0',
+                                   fs_label=self._get_fs_label_ephemeral(0),
                                    os_type=instance.os_type,
                                    is_block_dev=disk_image.is_block_dev,
                                    vm_mode=vm_mode)
@@ -5299,7 +5340,7 @@ class LibvirtDriver(driver.ComputeDriver):
                 raise exception.InvalidBDMFormat(details=msg)
 
             fn = functools.partial(self._create_ephemeral,
-                                   fs_label='ephemeral%d' % idx,
+                                   fs_label=self._get_fs_label_ephemeral(idx),
                                    os_type=instance.os_type,
                                    is_block_dev=disk_image.is_block_dev,
                                    vm_mode=vm_mode)
@@ -11761,7 +11802,7 @@ class LibvirtDriver(driver.ComputeDriver):
                     # cached.
                     disk.cache(
                         fetch_func=self._create_ephemeral,
-                        fs_label=cache_name,
+                        fs_label=self._get_fs_label_ephemeral(0),
                         os_type=instance.os_type,
                         filename=cache_name,
                         size=info['virt_disk_size'],
