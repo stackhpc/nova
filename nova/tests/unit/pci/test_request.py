@@ -81,7 +81,7 @@ class PciRequestTestCase(test.NoDBTestCase):
 
     def test_get_alias_from_config_valid(self):
         self.flags(alias=[_fake_alias1], group='pci')
-        result = request._get_alias_from_config()
+        result = request.get_alias_from_config()
         expected_result = (
             'legacy',
             [{
@@ -103,7 +103,7 @@ class PciRequestTestCase(test.NoDBTestCase):
         })
 
         self.flags(alias=[_fake_alias1, _fake_alias], group='pci')
-        result = request._get_alias_from_config()
+        result = request.get_alias_from_config()
         expected_result = (
             'legacy',
             [{
@@ -120,11 +120,33 @@ class PciRequestTestCase(test.NoDBTestCase):
             }])
         self.assertEqual(expected_result, result['QuickAssist'])
 
+    def test_get_alias_from_config_multispec_rejected_pci_in_placement(self):
+        _fake_alias = jsonutils.dumps({
+            "name": "QuickAssist",
+            "capability_type": "pci",
+            "product_id": "4444",
+            "vendor_id": "8086",
+            "device_type": "type-PCI",
+        })
+
+        self.flags(pci_in_placement=True, group='filter_scheduler')
+        self.flags(alias=[_fake_alias1, _fake_alias], group='pci')
+
+        ex = self.assertRaises(
+            exception.PciInvalidAlias, request.get_alias_from_config)
+        self.assertEqual(
+            "The PCI alias(es) QuickAssist have multiple specs but "
+            "[filter_scheduler]pci_in_placement is True. The PCI in Placement "
+            "feature only supports one spec per alias. You can assign the "
+            "same resource_class to multiple [pci]device_spec matchers to "
+            "allow using different devices for the same alias.",
+            str(ex))
+
     def _test_get_alias_from_config_invalid(self, alias):
         self.flags(alias=[alias], group='pci')
         self.assertRaises(
             exception.PciInvalidAlias,
-            request._get_alias_from_config)
+            request.get_alias_from_config)
 
     def test_get_alias_from_config_invalid_device_type(self):
         fake_alias = jsonutils.dumps({
@@ -193,7 +215,7 @@ class PciRequestTestCase(test.NoDBTestCase):
                 "numa_policy": policy,
             })
             self.flags(alias=[fake_alias], group='pci')
-            aliases = request._get_alias_from_config()
+            aliases = request.get_alias_from_config()
             self.assertIsNotNone(aliases)
             self.assertIn("xxx", aliases)
             self.assertEqual(policy, aliases["xxx"][0])
@@ -204,8 +226,9 @@ class PciRequestTestCase(test.NoDBTestCase):
             "resource_class": "foo",
             "traits": "bar,baz",
         })
+        self.flags(pci_in_placement=True, group='filter_scheduler')
         self.flags(alias=[fake_alias], group='pci')
-        aliases = request._get_alias_from_config()
+        aliases = request.get_alias_from_config()
         self.assertIsNotNone(aliases)
         self.assertIn("xxx", aliases)
         self.assertEqual(
@@ -233,7 +256,7 @@ class PciRequestTestCase(test.NoDBTestCase):
         self.flags(alias=[fake_alias_a, fake_alias_b], group='pci')
         self.assertRaises(
             exception.PciInvalidAlias,
-            request._get_alias_from_config)
+            request.get_alias_from_config)
 
     def test_get_alias_from_config_conflicting_numa_policy(self):
         """Check behavior when numa_policy conflicts occur."""
@@ -254,7 +277,87 @@ class PciRequestTestCase(test.NoDBTestCase):
         self.flags(alias=[fake_alias_a, fake_alias_b], group='pci')
         self.assertRaises(
             exception.PciInvalidAlias,
-            request._get_alias_from_config)
+            request.get_alias_from_config)
+
+    def test_get_alias_from_config_missing_ids(self):
+        a1 = jsonutils.dumps({
+            "name": "a1",
+            "product_id": "4444",
+        })
+        a2 = jsonutils.dumps({
+            "name": "a2",
+            "vendor_id": "4444",
+        })
+        a3 = jsonutils.dumps({
+            "name": "a3",
+        })
+        a4 = jsonutils.dumps({
+            "name": "a4",
+            # ignored as PCI in Placement is not enabled
+            "resource_class": "foo",
+        })
+        a5 = jsonutils.dumps({
+            "name": "a5",
+            "vendor_id": "4444",
+            "product_id": "4444",
+        })
+        self.flags(alias=[a1, a2, a3, a4, a5], group='pci')
+
+        ex = self.assertRaises(
+            exception.PciInvalidAlias, request.get_alias_from_config)
+        self.assertEqual(
+            "The PCI alias(es) a1,a2,a3,a4 does not have vendor_id and "
+            "product_id fields set.",
+            str(ex))
+
+    def test_get_alias_from_config_missing_ids_or_rc_pci_in_placement(self):
+        a1 = jsonutils.dumps({
+            "name": "a1",
+            "product_id": "4444",
+        })
+        a2 = jsonutils.dumps({
+            "name": "a2",
+            "vendor_id": "4444",
+        })
+        a3 = jsonutils.dumps({
+            "name": "a3",
+        })
+        a4 = jsonutils.dumps({
+            "name": "a4",
+            "resource_class": "foo",
+        })
+        a5 = jsonutils.dumps({
+            "name": "a5",
+            "vendor_id": "4444",
+            "product_id": "4444",
+        })
+
+        self.flags(pci_in_placement=True, group='filter_scheduler')
+        self.flags(alias=[a1, a2, a3, a4, a5], group='pci')
+
+        ex = self.assertRaises(
+            exception.PciInvalidAlias, request.get_alias_from_config)
+        self.assertEqual(
+            "The PCI alias(es) a1,a2,a3 does not have vendor_id and "
+            "product_id fields set or resource_class field set.",
+            str(ex))
+
+    def test_get_alias_from_config_cached(self):
+        alias = jsonutils.dumps({
+            "name": "a5",
+            "vendor_id": "4444",
+            "product_id": "4444",
+        })
+        self.flags(alias=[alias], group='pci')
+
+        origi_loads = jsonutils.loads
+
+        with mock.patch('oslo_serialization.jsonutils.loads') as mock_loads:
+            mock_loads.side_effect = origi_loads
+            request.get_alias_from_config()
+            request.get_alias_from_config()
+
+        mock_loads.assert_called_once()
 
     def _verify_result(self, expected, real):
         exp_real = zip(expected, real)

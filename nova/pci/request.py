@@ -37,7 +37,7 @@
     These two aliases define a device request meaning: vendor_id is "8086" and
     product_id is "0442" or "0443".
     """
-
+import functools
 import typing as ty
 
 import jsonschema
@@ -121,7 +121,60 @@ _ALIAS_SCHEMA = {
 }
 
 
-def _get_alias_from_config() -> Alias:
+def _validate_multispec(aliases):
+    if CONF.filter_scheduler.pci_in_placement:
+        alias_with_multiple_specs = [
+            name for name, spec in aliases.items() if len(spec[1]) > 1]
+        if alias_with_multiple_specs:
+            raise exception.PciInvalidAlias(
+                "The PCI alias(es) %s have multiple specs but "
+                "[filter_scheduler]pci_in_placement is True. The PCI in "
+                "Placement feature only supports one spec per alias. You can "
+                "assign the same resource_class to multiple [pci]device_spec "
+                "matchers to allow using different devices for the same alias."
+                % ",".join(alias_with_multiple_specs))
+
+
+def _validate_required_ids(aliases):
+    if CONF.filter_scheduler.pci_in_placement:
+        alias_without_ids_or_rc = set()
+        for name, alias in aliases.items():
+            for spec in alias[1]:
+                ids = "vendor_id" in spec and "product_id" in spec
+                rc = "resource_class" in spec
+                if not ids and not rc:
+                    alias_without_ids_or_rc.add(name)
+
+        if alias_without_ids_or_rc:
+            raise exception.PciInvalidAlias(
+                "The PCI alias(es) %s does not have vendor_id and product_id "
+                "fields set or resource_class field set."
+                % ",".join(sorted(alias_without_ids_or_rc)))
+    else:
+        alias_without_ids = set()
+        for name, alias in aliases.items():
+            for spec in alias[1]:
+                ids = "vendor_id" in spec and "product_id" in spec
+                if not ids:
+                    alias_without_ids.add(name)
+
+        if alias_without_ids:
+            raise exception.PciInvalidAlias(
+                "The PCI alias(es) %s does not have vendor_id and product_id "
+                "fields set."
+                % ",".join(sorted(alias_without_ids)))
+
+
+def _validate_aliases(aliases):
+    """Checks the parsed aliases for common mistakes and raise easy to parse
+    error messages
+    """
+    _validate_multispec(aliases)
+    _validate_required_ids(aliases)
+
+
+@functools.cache
+def get_alias_from_config() -> Alias:
     """Parse and validate PCI aliases from the nova config.
 
     :returns: A dictionary where the keys are alias names and the values are
@@ -177,6 +230,7 @@ def _get_alias_from_config() -> Alias:
     except Exception as exc:
         raise exception.PciInvalidAlias(reason=str(exc))
 
+    _validate_aliases(aliases)
     return aliases
 
 
@@ -184,7 +238,7 @@ def _translate_alias_to_requests(
     alias_spec: str, affinity_policy: ty.Optional[str] = None,
 ) -> ty.List['objects.InstancePCIRequest']:
     """Generate complete pci requests from pci aliases in extra_spec."""
-    pci_aliases = _get_alias_from_config()
+    pci_aliases = get_alias_from_config()
 
     pci_requests: ty.List[objects.InstancePCIRequest] = []
     for name, count in [spec.split(':') for spec in alias_spec.split(',')]:
