@@ -859,13 +859,6 @@
             irrelevant-files: *nova-base-irrelevant-files
         - nova-ceph-multistore:
             irrelevant-files: *nova-base-irrelevant-files
-        - neutron-linuxbridge-tempest:
-            files:
-              # NOTE(mriedem): This job has its own irrelevant-files section
-              # so that we only run it on changes to networking and libvirt/vif
-              # code; we don't need to run this on all changes.
-              - ^nova/network/.*$
-              - nova/virt/libvirt/vif.py
         - nova-live-migration
         # NOTE(gmaan): We will be running the graceful shutdown testing in
         # check pipeline only and not required to test in gate as such.
@@ -913,13 +906,6 @@
         - nova-tox-validate-backport
         - nova-ceph-multistore:
             irrelevant-files: *nova-base-irrelevant-files
-        - neutron-linuxbridge-tempest:
-            files:
-              # NOTE(mriedem): This job has its own irrelevant-files section
-              # so that we only run it on changes to networking and libvirt/vif
-              # code; we don't need to run this on all changes.
-              - ^nova/network/.*$
-              - nova/virt/libvirt/vif.py
         - tempest-integrated-compute:
             irrelevant-files: *policies-irrelevant-files
         - grenade-skip-level-always:
