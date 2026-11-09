@@ -120,7 +120,6 @@ class VolumeAttachmentController(wsgi.Controller):
 
         bdms = objects.BlockDeviceMappingList.get_by_instance_uuid(
                 context, instance.uuid)
-        limited_list = common.limited(bdms, req)
 
         results = []
         show_tag = api_version_request.is_supported(req, '2.70')
@@ -128,17 +127,21 @@ class VolumeAttachmentController(wsgi.Controller):
             req, '2.79')
         show_attachment_id_bdm_uuid = api_version_request.is_supported(
             req, '2.89')
-        for bdm in limited_list:
-            if bdm.volume_id:
-                va = _translate_attachment_detail_view(
-                    bdm,
-                    show_tag=show_tag,
-                    show_delete_on_termination=show_delete_on_termination,
-                    show_attachment_id_bdm_uuid=show_attachment_id_bdm_uuid,
-                )
-                results.append(va)
+        for bdm in bdms:
+            if not bdm.volume_id:
+                continue
+            if show_attachment_id_bdm_uuid and bdm.attachment_id is None:
+                continue
 
-        return {'volumeAttachments': results}
+            va = _translate_attachment_detail_view(
+                bdm,
+                show_tag=show_tag,
+                show_delete_on_termination=show_delete_on_termination,
+                show_attachment_id_bdm_uuid=show_attachment_id_bdm_uuid,
+            )
+            results.append(va)
+
+        return {'volumeAttachments': common.limited(results, req)}
 
     @wsgi.expected_errors(404)
     @validation.query_schema(schema.show_query)
@@ -171,6 +174,16 @@ class VolumeAttachmentController(wsgi.Controller):
             req, '2.79')
         show_attachment_id_bdm_uuid = api_version_request.is_supported(
             req, '2.89')
+
+        if show_attachment_id_bdm_uuid and bdm.attachment_id is None:
+            # The response schema needs attachment_id, but we don't have it
+            # yet.
+            msg = _(
+                "Instance %(instance)s is not attached "
+                "to volume %(volume)s"
+            ) % {'instance': server_id, 'volume': volume_id}
+            raise exc.HTTPNotFound(explanation=msg)
+
         return {
             'volumeAttachment': _translate_attachment_detail_view(
                 bdm,
