@@ -24,6 +24,8 @@ import inspect
 import time
 import typing as ty
 
+from collections import defaultdict
+
 from keystoneauth1 import loading as ks_loading
 from neutronclient.common import exceptions as neutron_client_exc
 from neutronclient.v2_0 import client as clientv20
@@ -817,6 +819,60 @@ class API:
             security_groups = []
         return security_groups
 
+    def _get_security_group_ids(self, security_groups, user_security_groups):
+        """Processes requested security groups based on existing user groups
+
+        :param security_groups: list of security group names or IDs
+        :param user_security_groups: list of Neutron security groups found
+        :return: list of security group IDs
+        :raises nova.exception.NoUniqueMatch: If multiple security groups
+            are requested with the same name.
+        :raises nova.exception.SecurityGroupNotFound: If a given security group
+            is not found.
+        """
+        # Map security group names to their IDs (a name can have
+        # multiple IDs since Neutron does not enforce uniqueness)
+        name_to_id = defaultdict(list)
+        # NOTE(sean-k-mooney): using a dict here instead of a set is faster
+        # probably due to l1 code cache misses due to the introduction
+        # of set lookups in addition to dict lookups making the branch
+        # prediction for the second for loop less reliable.
+        id_to_id = {}
+
+        # Populate the dictionaries with user security groups
+        for user_security_group in user_security_groups:
+            name = user_security_group['name']
+            sg_id = user_security_group['id']
+            # Append the ID to the list for this name
+            name_to_id[name].append(sg_id)
+            # Map the ID to itself for easy lookup
+            id_to_id[sg_id] = sg_id
+
+        # Initialize an empty list to store the resulting security group IDs
+        security_group_ids = []
+
+        # Iterate over the requested security groups
+        for security_group in security_groups:
+            # Check UUID first since it is always unique
+            if security_group in id_to_id:
+                security_group_ids.append(id_to_id[security_group])
+            # Then check by name
+            elif security_group in name_to_id:
+                # If there are multiple IDs for this name, raise exception
+                if len(name_to_id[security_group]) > 1:
+                    raise exception.NoUniqueMatch(
+                        _("Multiple security groups found matching"
+                          " '%s'. Use an ID to be more specific.")
+                        % security_group)
+                security_group_ids.append(name_to_id[security_group][0])
+            # Raise an exception if the security group is not found
+            else:
+                raise exception.SecurityGroupNotFound(
+                    security_group_id=security_group)
+
+        # Return the list of security group IDs
+        return security_group_ids
+
     def _process_security_groups(self, instance, neutron, security_groups):
         """Processes and validates requested security groups for allocation.
 
@@ -848,36 +904,28 @@ class API:
             # got many security groups
             sg_fields = ['id', 'name']
             search_opts = {'tenant_id': instance.project_id}
+            sg_filter_ext = self.has_sg_shared_filter_extension(client=neutron)
             user_security_groups = neutron.list_security_groups(
                 fields=sg_fields, **search_opts).get('security_groups')
 
-            for security_group in security_groups:
-                name_match = None
-                uuid_match = None
-                for user_security_group in user_security_groups:
-                    if user_security_group['name'] == security_group:
-                        # If there was a name match in a previous iteration
-                        # of the loop, we have a conflict.
-                        if name_match:
-                            raise exception.NoUniqueMatch(
-                                _("Multiple security groups found matching"
-                                  " '%s'. Use an ID to be more specific.") %
-                                   security_group)
+            try:
+                security_group_ids = self._get_security_group_ids(
+                    security_groups, user_security_groups)
+            except exception.SecurityGroupNotFound:
+                # Trigger a raise if the shared filter extension is not loaded,
+                # else we will trigger on the second call below when we pass
+                # any shared security groups.
+                if not sg_filter_ext:
+                    raise
 
-                        name_match = user_security_group['id']
+                # NOTE(hangyang): Make another request to get the RBAC shared
+                # SGs accessible to the tenant
+                search_opts = {'shared': True}
+                user_security_groups += neutron.list_security_groups(
+                    fields=sg_fields, **search_opts).get('security_groups')
 
-                    if user_security_group['id'] == security_group:
-                        uuid_match = user_security_group['id']
-
-                # If a user names the security group the same as
-                # another's security groups uuid, the name takes priority.
-                if name_match:
-                    security_group_ids.append(name_match)
-                elif uuid_match:
-                    security_group_ids.append(uuid_match)
-                else:
-                    raise exception.SecurityGroupNotFound(
-                        security_group_id=security_group)
+                security_group_ids = self._get_security_group_ids(
+                    security_groups, user_security_groups)
 
         return security_group_ids
 
@@ -1412,6 +1460,14 @@ class API:
         port resources.
         """
         return self._has_extension(constants.DNS_INTEGRATION, context, client)
+
+    def has_sg_shared_filter_extension(self, context=None, client=None):
+        """Check if the 'security-groups-shared-filtering' extension is
+        enabled.
+
+        This extension adds a 'shared' filter to security group APIs.
+        """
+        return self._has_extension(constants.SG_SHARED_FILTER, context, client)
 
     # TODO(gibi): Remove all branches where this is False after Neutron made
     # the this extension mandatory. In Xena this extension will be optional to
